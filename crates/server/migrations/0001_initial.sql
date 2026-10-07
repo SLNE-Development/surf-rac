@@ -37,7 +37,7 @@ CREATE TABLE devices (
     last_seen_at     TIMESTAMPTZ
 );
 
-CREATE INDEX devices_user_fingerprint ON devices (user_id, fingerprint_hash);
+CREATE UNIQUE INDEX devices_user_fingerprint ON devices (user_id, fingerprint_hash);
 
 CREATE TABLE contacts (
     user_id   BIGINT NOT NULL REFERENCES users (id) ON DELETE CASCADE,

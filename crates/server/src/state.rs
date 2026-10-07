@@ -5,6 +5,7 @@ use std::sync::Arc;
 use sqlx::PgPool;
 
 use crate::config::Config;
+use crate::hub::Hub;
 use crate::limits::Limits;
 
 /// Handles to everything a request handler needs; cheap to clone.
@@ -16,6 +17,8 @@ pub struct AppState {
     pub config: Arc<Config>,
     /// Rate limiters and login lockout.
     pub limits: Arc<Limits>,
+    /// Online devices and their connections.
+    pub hub: Hub,
 }
 
 impl AppState {
@@ -25,6 +28,7 @@ impl AppState {
             db,
             config,
             limits: Arc::new(Limits::default()),
+            hub: Hub::default(),
         }
     }
 }

@@ -62,6 +62,11 @@ pub async fn spawn(pool: PgPool) -> TestApp {
 /// Password used for every test account.
 pub const PASSWORD: &str = "correct horse battery";
 
+/// Returns a valid 64-character lowercase hex fingerprint derived from `n`.
+pub fn fingerprint(n: u32) -> String {
+    format!("{n:064x}")
+}
+
 /// Source of distinct fake client IPs, so helpers never hit per-IP limits.
 static NEXT_IP: AtomicU32 = AtomicU32::new(1);
 
@@ -115,6 +120,38 @@ impl TestApp {
             .send()
             .await
             .unwrap()
+    }
+
+    /// Calls `POST /v1/devices` for `token`.
+    pub async fn register_device(
+        &self,
+        token: &str,
+        fingerprint_hash: &str,
+        name: &str,
+        device_id: Option<&str>,
+    ) -> reqwest::Response {
+        let mut body = json!({"fingerprint_hash": fingerprint_hash, "name": name});
+        if let Some(id) = device_id {
+            body["device_id"] = json!(id);
+        }
+        self.client
+            .post(self.url("/v1/devices"))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// Registers a device for `token` and returns `(device_id, device_secret)`.
+    pub async fn new_device(&self, token: &str, fingerprint_hash: &str) -> (String, String) {
+        let res = self.register_device(token, fingerprint_hash, "pc", None).await;
+        assert_eq!(res.status(), 200);
+        let body: serde_json::Value = res.json().await.unwrap();
+        (
+            body["device_id"].as_str().unwrap().to_owned(),
+            body["device_secret"].as_str().unwrap().to_owned(),
+        )
     }
 
     /// Registers `username` with [`PASSWORD`] and returns a session token.

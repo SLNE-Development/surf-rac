@@ -10,9 +10,15 @@ use surf_rac_protocol::DeviceId;
 ///
 /// The username is `<expiry_unix>:<device_id>`; the password is the
 /// standard base64 of HMAC-SHA1 over the username keyed with `secret`.
-pub fn credentials(secret: &str, device: DeviceId, ttl_secs: u64, now_unix: u64) -> (String, String) {
+pub fn credentials(
+    secret: &str,
+    device: DeviceId,
+    ttl_secs: u64,
+    now_unix: u64,
+) -> (String, String) {
     let username = format!("{}:{}", now_unix + ttl_secs, device);
-    let mut mac = Hmac::<Sha1>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    let mut mac =
+        Hmac::<Sha1>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
     mac.update(username.as_bytes());
     let password = STANDARD.encode(mac.finalize().into_bytes());
     (username, password)

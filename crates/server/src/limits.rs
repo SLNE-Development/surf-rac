@@ -189,8 +189,9 @@ impl Lockout {
     fn fail(&self, entries: &mut BoundedMap<LockState>, key: &str, now: Instant) {
         let lock_for = self.lock_for;
         let stale = |s: &LockState| {
-            !s.locked_until.is_some_and(|u| u > now)
-                && !s.last_failure.is_some_and(|t| now.duration_since(t) < lock_for)
+            s.locked_until.is_none_or(|u| u <= now)
+                && s.last_failure
+                    .is_none_or(|t| now.duration_since(t) >= lock_for)
         };
         let state = entries.get_or_insert(key, now, stale);
         if state.locked_until.is_some_and(|u| u <= now) {

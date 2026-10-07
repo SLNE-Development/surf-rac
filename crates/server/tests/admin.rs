@@ -26,7 +26,9 @@ async fn probe(app: &TestApp, token: &str) -> u16 {
 #[sqlx::test(migrations = "./migrations")]
 async fn create_admin_then_login(pool: PgPool) {
     let app = common::spawn(pool).await;
-    admin::create_admin(&app.pool, "root", PASSWORD).await.unwrap();
+    admin::create_admin(&app.pool, "root", PASSWORD)
+        .await
+        .unwrap();
     assert_eq!(app.login("root", PASSWORD, "10.9.0.1").await.status(), 200);
     let is_admin: bool = sqlx::query_scalar("select is_admin from users where username = 'root'")
         .fetch_one(&app.pool)
@@ -47,7 +49,12 @@ async fn create_admin_validates_input(pool: PgPool) {
 async fn create_invite_is_redeemable(pool: PgPool) {
     let app = common::spawn(pool).await;
     let out = admin::create_invite(&app.pool, 1).await.unwrap();
-    assert_eq!(app.register(&code_from(&out), "alice", PASSWORD).await.status(), 201);
+    assert_eq!(
+        app.register(&code_from(&out), "alice", PASSWORD)
+            .await
+            .status(),
+        201
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -79,7 +86,9 @@ async fn list_invites_never_prints_code(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn list_users_shows_flags(pool: PgPool) {
     let app = common::spawn(pool).await;
-    admin::create_admin(&app.pool, "root", PASSWORD).await.unwrap();
+    admin::create_admin(&app.pool, "root", PASSWORD)
+        .await
+        .unwrap();
     app.register_and_login("alice").await;
     let listing = admin::list_users(&app.pool).await.unwrap();
     assert!(listing.contains("root") && listing.contains("admin"));
@@ -105,7 +114,9 @@ async fn enable_user_restores_login(pool: PgPool) {
     let app = common::spawn(pool).await;
     app.register_and_login("alice").await;
     admin::set_disabled(&app.pool, "alice", true).await.unwrap();
-    admin::set_disabled(&app.pool, "alice", false).await.unwrap();
+    admin::set_disabled(&app.pool, "alice", false)
+        .await
+        .unwrap();
     assert_eq!(app.login("alice", PASSWORD, "10.9.2.1").await.status(), 200);
 }
 
@@ -113,14 +124,22 @@ async fn enable_user_restores_login(pool: PgPool) {
 async fn reset_password_revokes_sessions(pool: PgPool) {
     let app = common::spawn(pool).await;
     let token = app.register_and_login("alice").await;
-    admin::reset_password(&app.pool, "alice", "a brand new password").await.unwrap();
+    admin::reset_password(&app.pool, "alice", "a brand new password")
+        .await
+        .unwrap();
     assert_eq!(probe(&app, &token).await, 401);
     assert_eq!(app.login("alice", PASSWORD, "10.9.3.1").await.status(), 401);
     assert_eq!(
-        app.login("alice", "a brand new password", "10.9.3.2").await.status(),
+        app.login("alice", "a brand new password", "10.9.3.2")
+            .await
+            .status(),
         200
     );
-    assert!(admin::reset_password(&app.pool, "alice", "short").await.is_err());
+    assert!(
+        admin::reset_password(&app.pool, "alice", "short")
+            .await
+            .is_err()
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -135,6 +154,10 @@ async fn revoke_sessions_logs_out_everywhere(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn unknown_user_errors(pool: PgPool) {
     assert!(admin::set_disabled(&pool, "ghost", true).await.is_err());
-    assert!(admin::reset_password(&pool, "ghost", PASSWORD).await.is_err());
+    assert!(
+        admin::reset_password(&pool, "ghost", PASSWORD)
+            .await
+            .is_err()
+    );
     assert!(admin::revoke_sessions(&pool, "ghost").await.is_err());
 }

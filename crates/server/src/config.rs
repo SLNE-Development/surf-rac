@@ -48,7 +48,11 @@ impl Config {
 
     /// Reads the configuration through `get`, which returns a variable's value by name.
     pub fn from_vars(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
-        let get = |k: &str| get(k).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+        let get = |k: &str| {
+            get(k)
+                .map(|v| v.trim().to_owned())
+                .filter(|v| !v.is_empty())
+        };
         let required = |k: &'static str| get(k).ok_or(ConfigError::Missing(k));
 
         let database_url = required("DATABASE_URL")?;
@@ -140,7 +144,13 @@ mod tests {
         let mut v = BASE.to_vec();
         v[1] = ("TURN_SECRET", "short");
         let err = Config::from_vars(vars(&v)).unwrap_err();
-        assert!(matches!(err, ConfigError::Invalid { name: "TURN_SECRET", .. }));
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                name: "TURN_SECRET",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -148,7 +158,13 @@ mod tests {
         let mut v = BASE.to_vec();
         v[2] = ("TURN_URLS", " , ");
         let err = Config::from_vars(vars(&v)).unwrap_err();
-        assert!(matches!(err, ConfigError::Invalid { name: "TURN_URLS", .. }));
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                name: "TURN_URLS",
+                ..
+            }
+        ));
     }
 
     #[test]

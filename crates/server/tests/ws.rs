@@ -15,7 +15,10 @@ async fn ws_rejects_missing_token(pool: PgPool) {
     let token = app.register_and_login("alice").await;
     let (id, secret) = app.new_device(&token, &fingerprint(1)).await;
     assert_eq!(app.ws_connect(None, &id, &secret).await.err(), Some(401));
-    assert_eq!(app.ws_connect(Some("garbage"), &id, &secret).await.err(), Some(401));
+    assert_eq!(
+        app.ws_connect(Some("garbage"), &id, &secret).await.err(),
+        Some(401)
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -23,8 +26,14 @@ async fn ws_rejects_wrong_secret(pool: PgPool) {
     let app = common::spawn(pool).await;
     let token = app.register_and_login("alice").await;
     let (id, _) = app.new_device(&token, &fingerprint(1)).await;
-    assert_eq!(app.ws_connect(Some(&token), &id, "wrong").await.err(), Some(401));
-    assert_eq!(app.ws_connect(Some(&token), "abc", "wrong").await.err(), Some(401));
+    assert_eq!(
+        app.ws_connect(Some(&token), &id, "wrong").await.err(),
+        Some(401)
+    );
+    assert_eq!(
+        app.ws_connect(Some(&token), "abc", "wrong").await.err(),
+        Some(401)
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -33,7 +42,10 @@ async fn ws_rejects_device_of_other_account(pool: PgPool) {
     let alice = app.register_and_login("alice").await;
     let bob = app.register_and_login("bob").await;
     let (id, secret) = app.new_device(&alice, &fingerprint(1)).await;
-    assert_eq!(app.ws_connect(Some(&bob), &id, &secret).await.err(), Some(401));
+    assert_eq!(
+        app.ws_connect(Some(&bob), &id, &secret).await.err(),
+        Some(401)
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -66,15 +78,26 @@ async fn offer_answer_ice_hangup_relayed(pool: PgPool) {
         ("offer", json!({"sdp": "v=0 offer"})),
         ("ice", json!({"candidate": "c1"})),
     ] {
-        send(&mut a.ws, json!({"type":"signal","to":b.id,"session_id":"s1","kind":kind,"data":data})).await;
+        send(
+            &mut a.ws,
+            json!({"type":"signal","to":b.id,"session_id":"s1","kind":kind,"data":data}),
+        )
+        .await;
         let got = recv(&mut b.ws).await;
         assert_eq!(
             got,
             json!({"type":"signal","from":a.id,"session_id":"s1","kind":kind,"data":data})
         );
     }
-    for (kind, data) in [("answer", json!({"sdp": "v=0 answer"})), ("hangup", json!(null))] {
-        send(&mut b.ws, json!({"type":"signal","to":a.id,"session_id":"s1","kind":kind,"data":data})).await;
+    for (kind, data) in [
+        ("answer", json!({"sdp": "v=0 answer"})),
+        ("hangup", json!(null)),
+    ] {
+        send(
+            &mut b.ws,
+            json!({"type":"signal","to":a.id,"session_id":"s1","kind":kind,"data":data}),
+        )
+        .await;
         let got = recv(&mut a.ws).await;
         assert_eq!(got["from"], b.id.as_str());
         assert_eq!(got["kind"], kind);
@@ -103,7 +126,11 @@ async fn target_offline_error(pool: PgPool) {
     let bob = app.register_and_login("bob").await;
     let (offline_id, _) = app.new_device(&bob, &fingerprint(2)).await;
     for to in [offline_id.as_str(), "123456789"] {
-        send(&mut a.ws, json!({"type":"signal","to":to,"session_id":"s","kind":"offer","data":{}})).await;
+        send(
+            &mut a.ws,
+            json!({"type":"signal","to":to,"session_id":"s","kind":"offer","data":{}}),
+        )
+        .await;
         let got = recv(&mut a.ws).await;
         assert_eq!(got["type"], "error");
         assert_eq!(got["code"], "target_offline");
@@ -162,7 +189,11 @@ async fn replaced_connection_cleanup_keeps_new(pool: PgPool) {
     expect_closed(&mut first.ws).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     let mut b = app.online_device("bob", 2).await;
-    send(&mut b.ws, json!({"type":"signal","to":first.id,"session_id":"s","kind":"offer","data":{}})).await;
+    send(
+        &mut b.ws,
+        json!({"type":"signal","to":first.id,"session_id":"s","kind":"offer","data":{}}),
+    )
+    .await;
     let got = recv(&mut second).await;
     assert_eq!(got["from"], b.id.as_str());
 }
@@ -175,8 +206,15 @@ async fn rebind_closes_live_socket(pool: PgPool) {
     assert_eq!(id, a.id);
     assert_eq!(recv(&mut a.ws).await["type"], "replaced");
     expect_closed(&mut a.ws).await;
-    assert_eq!(app.ws_connect(Some(&a.token), &id, &a.secret).await.err(), Some(401));
-    assert!(app.ws_connect(Some(&a.token), &id, &new_secret).await.is_ok());
+    assert_eq!(
+        app.ws_connect(Some(&a.token), &id, &a.secret).await.err(),
+        Some(401)
+    );
+    assert!(
+        app.ws_connect(Some(&a.token), &id, &new_secret)
+            .await
+            .is_ok()
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -202,7 +240,9 @@ async fn revoked_session_closes_socket(pool: PgPool) {
     .await;
     let mut a = app.online_device("alice", 1).await;
     let mut b = app.online_device("bob", 2).await;
-    surf_rac_server::admin::revoke_sessions(&app.pool, "alice").await.unwrap();
+    surf_rac_server::admin::revoke_sessions(&app.pool, "alice")
+        .await
+        .unwrap();
     expect_closed(&mut a.ws).await;
     send(&mut b.ws, json!({"type":"ping"})).await;
     assert_eq!(recv(&mut b.ws).await["type"], "pong");

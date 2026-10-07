@@ -9,10 +9,10 @@ use surf_rac_protocol::{
 };
 
 use crate::contacts;
-use crate::presence;
 use crate::devices::{self, DeviceError, device_id};
 use crate::error::ApiError;
 use crate::extract::JsonBody;
+use crate::presence;
 use crate::sessions::AuthUser;
 use crate::state::AppState;
 

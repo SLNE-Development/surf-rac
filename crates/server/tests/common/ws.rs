@@ -77,12 +77,16 @@ impl TestApp {
 
 /// Sends `msg` as a JSON text frame.
 pub async fn send(ws: &mut Ws, msg: Value) {
-    ws.send(Message::Text(msg.to_string().into())).await.unwrap();
+    ws.send(Message::Text(msg.to_string().into()))
+        .await
+        .unwrap();
 }
 
 /// Sends a raw text frame.
 pub async fn send_raw(ws: &mut Ws, text: &str) {
-    ws.send(Message::Text(text.to_owned().into())).await.unwrap();
+    ws.send(Message::Text(text.to_owned().into()))
+        .await
+        .unwrap();
 }
 
 /// Receives the next JSON message, skipping control frames; panics on timeout or close.

@@ -87,7 +87,13 @@ fn frame(msg: &ServerMessage) -> Message {
 }
 
 /// Runs the connection of `device`, authenticated as `user` with device `secret`, until it ends.
-pub async fn run(state: AppState, socket: WebSocket, user: AuthUser, device: DeviceId, secret: String) {
+pub async fn run(
+    state: AppState,
+    socket: WebSocket,
+    user: AuthUser,
+    device: DeviceId,
+    secret: String,
+) {
     let (conn_id, mut outbound, was_offline) = state.hub.register(device);
     tracing::info!(device_id = %device, username = %user.username, "device connected");
     if let Err(err) = devices::touch_last_seen(&state.db, device).await {
@@ -105,7 +111,11 @@ pub async fn run(state: AppState, socket: WebSocket, user: AuthUser, device: Dev
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.tick().await;
 
-    if sink.send(frame(&ServerMessage::Hello { device_id: device })).await.is_ok() {
+    if sink
+        .send(frame(&ServerMessage::Hello { device_id: device }))
+        .await
+        .is_ok()
+    {
         loop {
             tokio::select! {
                 out = outbound.recv() => match out {

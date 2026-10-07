@@ -102,7 +102,11 @@ async fn invalid_username_and_short_password_rejected(pool: PgPool) {
     let app = common::spawn(pool).await;
     let code = app.invite().await;
     for name in ["al", "Alice", "a b c", "x".repeat(33).as_str(), "élan"] {
-        assert_eq!(app.register(&code, name, PASSWORD).await.status(), 400, "{name}");
+        assert_eq!(
+            app.register(&code, name, PASSWORD).await.status(),
+            400,
+            "{name}"
+        );
     }
     assert_eq!(app.register(&code, "alice", "short").await.status(), 400);
     let long = "p".repeat(257);
@@ -145,7 +149,10 @@ async fn account_locks_after_five_failures(pool: PgPool) {
     app.register_and_login("alice").await;
     for i in 0..5 {
         let ip = format!("10.1.0.{i}");
-        assert_eq!(app.login("alice", "wrong password!", &ip).await.status(), 401);
+        assert_eq!(
+            app.login("alice", "wrong password!", &ip).await.status(),
+            401
+        );
     }
     let res = app.login("alice", PASSWORD, "10.1.1.1").await;
     assert_eq!(res.status(), 429);
@@ -160,12 +167,20 @@ async fn concurrent_failures_cannot_exceed_lockout(pool: PgPool) {
     let attempts = (0..10).map(|i| {
         let ip = format!("10.6.0.{i}");
         let app = &app;
-        async move { app.login("alice", "wrong password!", &ip).await.status().as_u16() }
+        async move {
+            app.login("alice", "wrong password!", &ip)
+                .await
+                .status()
+                .as_u16()
+        }
     });
     let statuses = futures_util::future::join_all(attempts).await;
     let verified = statuses.iter().filter(|s| **s == 401).count();
     assert!(verified <= 5, "{statuses:?}");
-    assert_eq!(statuses.iter().filter(|s| **s == 429).count(), 10 - verified);
+    assert_eq!(
+        statuses.iter().filter(|s| **s == 429).count(),
+        10 - verified
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -254,7 +269,9 @@ async fn register_ip_rate_limited(pool: PgPool) {
             .await;
         assert_eq!(res.status(), 400);
     }
-    let res = app.register_from("nope", "alice", PASSWORD, "10.4.0.1").await;
+    let res = app
+        .register_from("nope", "alice", PASSWORD, "10.4.0.1")
+        .await;
     assert_eq!(res.status(), 429);
 }
 

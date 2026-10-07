@@ -36,7 +36,11 @@ impl ApiError {
 
     /// 401: credentials or session token are missing or invalid.
     pub fn unauthorized() -> Self {
-        Self::new(StatusCode::UNAUTHORIZED, ErrorCode::Unauthorized, "unauthorized")
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            ErrorCode::Unauthorized,
+            "unauthorized",
+        )
     }
 
     /// 401 for a failed login, without revealing which part was wrong.

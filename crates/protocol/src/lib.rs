@@ -358,7 +358,12 @@ mod tests {
         let raw = json!({"type":"signal","to":"123456789","session_id":"s1","kind":"offer","data":{"sdp":"x"}});
         let msg: ClientMessage = serde_json::from_value(raw.clone()).unwrap();
         match &msg {
-            ClientMessage::Signal { to, session_id, kind, data } => {
+            ClientMessage::Signal {
+                to,
+                session_id,
+                kind,
+                data,
+            } => {
                 assert_eq!(to.get(), 123_456_789);
                 assert_eq!(session_id, "s1");
                 assert_eq!(*kind, SignalKind::Offer);

@@ -2,9 +2,9 @@
 
 use std::sync::LazyLock;
 
+use argon2::Argon2;
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use argon2::Argon2;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand::RngCore;
@@ -61,7 +61,10 @@ mod tests {
     fn random_token_length_and_charset() {
         let t = random_token(32);
         assert_eq!(t.len(), 43);
-        assert!(t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+        assert!(
+            t.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        );
         assert_ne!(random_token(32), t);
     }
 

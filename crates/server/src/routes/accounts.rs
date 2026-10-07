@@ -12,8 +12,8 @@ use crate::accounts::{self, RegisterError};
 use crate::client_ip::client_ip;
 use crate::crypto;
 use crate::error::ApiError;
-use crate::limits::rate_key;
 use crate::extract::JsonBody;
+use crate::limits::rate_key;
 use crate::sessions::{self, AuthUser};
 use crate::state::AppState;
 
@@ -25,7 +25,11 @@ pub async fn register(
     JsonBody(req): JsonBody<RegisterRequest>,
 ) -> Result<(StatusCode, Json<RegisterResponse>), ApiError> {
     let ip = client_ip(&headers, peer, state.config.trust_forwarded_for);
-    if !state.limits.register_ip.check(&rate_key(ip), Instant::now()) {
+    if !state
+        .limits
+        .register_ip
+        .check(&rate_key(ip), Instant::now())
+    {
         return Err(ApiError::rate_limited());
     }
     if !accounts::valid_username(&req.username) {
@@ -34,7 +38,9 @@ pub async fn register(
         ));
     }
     if !accounts::valid_password(&req.password) {
-        return Err(ApiError::bad_request("password must be 10 to 256 characters"));
+        return Err(ApiError::bad_request(
+            "password must be 10 to 256 characters",
+        ));
     }
     if req.invite_code.is_empty() {
         return Err(ApiError::bad_request("invalid or expired invite"));
@@ -57,7 +63,9 @@ pub async fn register(
                 }),
             ))
         }
-        Err(RegisterError::InvalidInvite) => Err(ApiError::bad_request("invalid or expired invite")),
+        Err(RegisterError::InvalidInvite) => {
+            Err(ApiError::bad_request("invalid or expired invite"))
+        }
         Err(RegisterError::UsernameTaken) => Err(ApiError::conflict("username already taken")),
         Err(RegisterError::Db(err)) => Err(err.into()),
     }

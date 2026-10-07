@@ -99,7 +99,8 @@ impl TestApp {
 
     /// Calls `POST /v1/register` from a fresh client IP.
     pub async fn register(&self, code: &str, username: &str, password: &str) -> reqwest::Response {
-        self.register_from(code, username, password, &fresh_ip()).await
+        self.register_from(code, username, password, &fresh_ip())
+            .await
     }
 
     /// Calls `POST /v1/register` with `ip` as the forwarded client address.
@@ -153,7 +154,9 @@ impl TestApp {
 
     /// Registers a device for `token` and returns `(device_id, device_secret)`.
     pub async fn new_device(&self, token: &str, fingerprint_hash: &str) -> (String, String) {
-        let res = self.register_device(token, fingerprint_hash, "pc", None).await;
+        let res = self
+            .register_device(token, fingerprint_hash, "pc", None)
+            .await;
         assert_eq!(res.status(), 200);
         let body: serde_json::Value = res.json().await.unwrap();
         (

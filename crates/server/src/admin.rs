@@ -134,7 +134,11 @@ pub async fn list_users(db: &PgPool) -> anyhow::Result<String> {
         if r.disabled {
             flags.push("disabled");
         }
-        let flags = if flags.is_empty() { "-".into() } else { flags.join(",") };
+        let flags = if flags.is_empty() {
+            "-".into()
+        } else {
+            flags.join(",")
+        };
         let _ = writeln!(
             out,
             "{}\t{}\t{}\t{}",
@@ -176,7 +180,9 @@ pub async fn reset_password(db: &PgPool, username: &str, password: &str) -> anyh
         .execute(db)
         .await?;
     let n = sessions::revoke_all_for_user(db, id).await?;
-    Ok(format!("password of {username} reset, revoked {n} sessions"))
+    Ok(format!(
+        "password of {username} reset, revoked {n} sessions"
+    ))
 }
 
 /// Revokes every session of `username`.

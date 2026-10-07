@@ -38,8 +38,14 @@ mod tests {
     #[test]
     fn client_ip_uses_rightmost_forwarded_when_trusted() {
         let mut h = HeaderMap::new();
-        h.append("x-forwarded-for", HeaderValue::from_static("1.1.1.1, 2.2.2.2"));
-        h.append("x-forwarded-for", HeaderValue::from_static("3.3.3.3 , 4.4.4.4"));
+        h.append(
+            "x-forwarded-for",
+            HeaderValue::from_static("1.1.1.1, 2.2.2.2"),
+        );
+        h.append(
+            "x-forwarded-for",
+            HeaderValue::from_static("3.3.3.3 , 4.4.4.4"),
+        );
         assert_eq!(client_ip(&h, peer(), true).to_string(), "4.4.4.4");
     }
 
@@ -48,7 +54,10 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("x-forwarded-for", HeaderValue::from_static("nonsense"));
         assert_eq!(client_ip(&h, peer(), true).to_string(), "192.0.2.1");
-        assert_eq!(client_ip(&HeaderMap::new(), peer(), true).to_string(), "192.0.2.1");
+        assert_eq!(
+            client_ip(&HeaderMap::new(), peer(), true).to_string(),
+            "192.0.2.1"
+        );
     }
 
     #[test]

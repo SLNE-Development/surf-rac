@@ -37,9 +37,9 @@ pub enum RegisterError {
 /// Returns true when `username` is 3 to 32 characters of `[a-z0-9._-]`.
 pub fn valid_username(username: &str) -> bool {
     (3..=32).contains(&username.len())
-        && username
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
+        && username.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+        })
 }
 
 /// Returns true when `password` has 10 to 256 characters.
@@ -133,7 +133,10 @@ async fn insert_user(
 }
 
 /// Looks up a user by username.
-pub async fn find_user_by_name(db: &PgPool, username: &str) -> Result<Option<UserRow>, sqlx::Error> {
+pub async fn find_user_by_name(
+    db: &PgPool,
+    username: &str,
+) -> Result<Option<UserRow>, sqlx::Error> {
     sqlx::query_as(
         "select id, username, password_hash, is_admin, disabled from users where username = $1",
     )

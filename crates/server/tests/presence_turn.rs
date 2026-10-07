@@ -53,13 +53,22 @@ async fn contact_sees_presence_online_and_offline(pool: PgPool) {
     let (bob_id, bob_secret) = app.new_device(&bob, &fingerprint(2)).await;
     add_contact(&app, &watcher.token, &bob_id).await;
 
-    let ws = app.ws_connect(Some(&bob), &bob_id, &bob_secret).await.unwrap();
+    let ws = app
+        .ws_connect(Some(&bob), &bob_id, &bob_secret)
+        .await
+        .unwrap();
     let online = recv_type(&mut watcher.ws, "presence").await;
-    assert_eq!(online, json!({"type":"presence","device_id":bob_id,"online":true}));
+    assert_eq!(
+        online,
+        json!({"type":"presence","device_id":bob_id,"online":true})
+    );
 
     drop(ws);
     let offline = recv_type(&mut watcher.ws, "presence").await;
-    assert_eq!(offline, json!({"type":"presence","device_id":bob_id,"online":false}));
+    assert_eq!(
+        offline,
+        json!({"type":"presence","device_id":bob_id,"online":false})
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -68,7 +77,10 @@ async fn owner_other_device_sees_presence(pool: PgPool) {
     let mut first = app.online_device("alice", 1).await;
     let second = app.connect_new_device(&first.token, 2).await;
     let got = recv_type(&mut first.ws, "presence").await;
-    assert_eq!(got, json!({"type":"presence","device_id":second.id,"online":true}));
+    assert_eq!(
+        got,
+        json!({"type":"presence","device_id":second.id,"online":true})
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -95,9 +107,15 @@ async fn replacement_does_not_broadcast_offline(pool: PgPool) {
     let (bob_id, bob_secret) = app.new_device(&bob, &fingerprint(2)).await;
     add_contact(&app, &watcher.token, &bob_id).await;
 
-    let _first = app.ws_connect(Some(&bob), &bob_id, &bob_secret).await.unwrap();
+    let _first = app
+        .ws_connect(Some(&bob), &bob_id, &bob_secret)
+        .await
+        .unwrap();
     assert_eq!(recv_type(&mut watcher.ws, "presence").await["online"], true);
-    let _second = app.ws_connect(Some(&bob), &bob_id, &bob_secret).await.unwrap();
+    let _second = app
+        .ws_connect(Some(&bob), &bob_id, &bob_secret)
+        .await
+        .unwrap();
     expect_silence(&mut watcher.ws, Duration::from_millis(400)).await;
 }
 
@@ -124,6 +142,9 @@ async fn rebind_and_delete_broadcast_offline(pool: PgPool) {
             assert_eq!(res.status(), 204);
         }
         let offline = recv_type(&mut watcher.ws, "presence").await;
-        assert_eq!(offline, json!({"type":"presence","device_id":id,"online":false}));
+        assert_eq!(
+            offline,
+            json!({"type":"presence","device_id":id,"online":false})
+        );
     }
 }

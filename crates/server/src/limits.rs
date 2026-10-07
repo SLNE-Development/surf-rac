@@ -55,6 +55,8 @@ struct LockState {
     failures: u32,
     /// When the current lock ends, if locked.
     locked_until: Option<Instant>,
+    /// When the last failure was recorded.
+    last_failure: Option<Instant>,
 }
 
 /// Locks a key for a fixed time after too many consecutive failures.
@@ -94,18 +96,52 @@ impl Lockout {
     /// Records a failed attempt for `key` at `now`, locking it once the limit is reached.
     pub fn record_failure(&self, key: &str, now: Instant) {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        self.fail(&mut entries, key, now);
+    }
+
+    /// Counts a failure for `key` in the already locked `entries`, pruning stale keys first.
+    fn fail(&self, entries: &mut HashMap<String, LockState>, key: &str, now: Instant) {
         if entries.len() > PRUNE_THRESHOLD {
-            entries.retain(|_, s| s.locked_until.is_some_and(|u| u > now));
+            let lock_for = self.lock_for;
+            entries.retain(|_, s| {
+                s.locked_until.is_some_and(|u| u > now)
+                    || s.last_failure.is_some_and(|t| now.duration_since(t) < lock_for)
+            });
         }
         let state = entries.entry(key.to_owned()).or_default();
         if state.locked_until.is_some_and(|u| u <= now) {
             *state = LockState::default();
         }
+        state.last_failure = Some(now);
         state.failures += 1;
         if state.failures >= self.max_failures {
             state.failures = 0;
             state.locked_until = Some(now + self.lock_for);
         }
+    }
+
+    /// Reserves an attempt for `key` at `now`, counting it as a failure up front.
+    ///
+    /// Returns the remaining lock time when `key` is locked. The check and the
+    /// count happen back to back on every call, so concurrent attempts cannot
+    /// exceed the failure limit. A successful attempt must call
+    /// [`Lockout::record_success`], which also lifts a lock that this attempt
+    /// itself triggered.
+    pub fn try_attempt(&self, key: &str, now: Instant) -> Result<(), Duration> {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(until) = entries.get(key).and_then(|s| s.locked_until)
+            && until > now
+        {
+            return Err(until - now);
+        }
+        self.fail(&mut entries, key, now);
+        Ok(())
+    }
+
+    /// Returns the number of tracked keys.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.lock().unwrap().len()
     }
 
     /// Clears the failure count of `key` after a successful attempt.
@@ -172,5 +208,42 @@ mod tests {
         assert!(lo.is_locked("u", t0 + Duration::from_secs(900)).is_none());
         lo.record_failure("u", t0 + Duration::from_secs(901));
         assert!(lo.is_locked("u", t0 + Duration::from_secs(901)).is_none());
+    }
+
+    #[test]
+    fn try_attempt_counts_up_front() {
+        let lo = Lockout::new(5, Duration::from_secs(900));
+        let t0 = Instant::now();
+        for _ in 0..5 {
+            assert!(lo.try_attempt("u", t0).is_ok());
+        }
+        assert_eq!(lo.try_attempt("u", t0), Err(Duration::from_secs(900)));
+        lo.record_success("u");
+        assert!(lo.try_attempt("u", t0).is_ok());
+    }
+
+    #[test]
+    fn lockout_survives_pruning_flood() {
+        let lo = Lockout::new(5, Duration::from_secs(900));
+        let t0 = Instant::now();
+        for _ in 0..4 {
+            lo.record_failure("victim", t0);
+        }
+        for i in 0..(PRUNE_THRESHOLD + 10) {
+            lo.record_failure(&format!("noise{i}"), t0);
+        }
+        lo.record_failure("victim", t0);
+        assert!(lo.is_locked("victim", t0).is_some());
+    }
+
+    #[test]
+    fn lockout_prunes_stale_entries() {
+        let lo = Lockout::new(5, Duration::from_secs(900));
+        let t0 = Instant::now();
+        for i in 0..(PRUNE_THRESHOLD + 10) {
+            lo.record_failure(&format!("noise{i}"), t0);
+        }
+        lo.record_failure("late", t0 + Duration::from_secs(901));
+        assert!(lo.len() <= 1);
     }
 }

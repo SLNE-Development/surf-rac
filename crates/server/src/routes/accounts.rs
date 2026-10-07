@@ -64,9 +64,9 @@ pub async fn register(
 
 /// `POST /v1/login`: checks credentials and issues a session token.
 ///
-/// Applies the per-IP limit first, then the per-account lockout. Wrong
-/// usernames and wrong passwords produce the same response and cost the same
-/// time.
+/// Applies the per-IP limit first, then reserves an attempt against the
+/// per-account lockout. Wrong usernames, wrong passwords and disabled
+/// accounts produce the same response, and each runs one password check.
 pub async fn login(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -78,14 +78,16 @@ pub async fn login(
     if !state.limits.login_ip.check(&ip.to_string(), now) {
         return Err(ApiError::rate_limited());
     }
-    if let Some(remaining) = state.limits.lockout.is_locked(&req.username, now) {
+    if let Err(remaining) = state.limits.lockout.try_attempt(&req.username, now) {
         return Err(ApiError::locked(remaining.as_secs()));
     }
     let user = accounts::find_user_by_name(&state.db, &req.username).await?;
     let password = req.password;
     let user = tokio::task::spawn_blocking(move || match user {
-        Some(u) if !u.disabled && crypto::verify_password(&password, &u.password_hash) => Some(u),
-        Some(_) => None,
+        Some(u) => {
+            let matches = crypto::verify_password(&password, &u.password_hash);
+            (matches && !u.disabled).then_some(u)
+        }
         None => {
             crypto::verify_dummy(&password);
             None
@@ -94,7 +96,6 @@ pub async fn login(
     .await
     .map_err(ApiError::internal)?;
     let Some(user) = user else {
-        state.limits.lockout.record_failure(&req.username, Instant::now());
         tracing::info!(username = %req.username, %ip, "login failed");
         return Err(ApiError::invalid_credentials());
     };

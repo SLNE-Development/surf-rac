@@ -154,6 +154,48 @@ async fn account_locks_after_five_failures(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn concurrent_failures_cannot_exceed_lockout(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    app.register_and_login("alice").await;
+    let attempts = (0..10).map(|i| {
+        let ip = format!("10.6.0.{i}");
+        let app = &app;
+        async move { app.login("alice", "wrong password!", &ip).await.status().as_u16() }
+    });
+    let statuses = futures_util::future::join_all(attempts).await;
+    let verified = statuses.iter().filter(|s| **s == 401).count();
+    assert!(verified <= 5, "{statuses:?}");
+    assert_eq!(statuses.iter().filter(|s| **s == 429).count(), 10 - verified);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn disabled_account_login_costs_a_password_check(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    app.register_and_login("alice").await;
+    app.register_and_login("bob").await;
+    sqlx::query("update users set disabled = true where username = 'bob'")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let time = |name: &'static str, ip: &'static str| {
+        let app = &app;
+        async move {
+            let start = std::time::Instant::now();
+            for _ in 0..3 {
+                app.login(name, "wrong password!", ip).await;
+            }
+            start.elapsed()
+        }
+    };
+    let wrong = time("alice", "10.7.0.1").await;
+    let disabled = time("bob", "10.7.0.2").await;
+    assert!(
+        disabled.as_secs_f64() >= wrong.as_secs_f64() * 0.3,
+        "disabled {disabled:?} vs wrong password {wrong:?}"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn successful_login_resets_failures(pool: PgPool) {
     let app = common::spawn(pool).await;
     app.register_and_login("alice").await;

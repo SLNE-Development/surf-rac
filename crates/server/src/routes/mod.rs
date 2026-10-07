@@ -3,6 +3,7 @@
 mod accounts;
 mod devices;
 mod health;
+mod ws;
 
 use axum::Router;
 use axum::routing::{get, post, put};
@@ -24,5 +25,6 @@ pub fn router(state: AppState) -> Router {
             put(devices::put_contact).delete(devices::delete_contact),
         )
         .route("/v1/presence/{id}", get(devices::presence))
+        .route("/v1/ws", get(ws::upgrade))
         .with_state(state)
 }

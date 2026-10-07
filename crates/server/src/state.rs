@@ -1,6 +1,7 @@
 //! State shared by all request handlers.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use sqlx::PgPool;
 
@@ -19,6 +20,8 @@ pub struct AppState {
     pub limits: Arc<Limits>,
     /// Online devices and their connections.
     pub hub: Hub,
+    /// How often a WebSocket re-checks its session, user and device secret.
+    pub ws_revalidate_interval: Duration,
 }
 
 impl AppState {
@@ -29,6 +32,7 @@ impl AppState {
             config,
             limits: Arc::new(Limits::default()),
             hub: Hub::default(),
+            ws_revalidate_interval: Duration::from_secs(60),
         }
     }
 }

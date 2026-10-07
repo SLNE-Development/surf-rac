@@ -16,6 +16,7 @@ pub mod sessions;
 pub mod routes;
 pub mod state;
 pub mod telemetry;
+pub mod ws;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

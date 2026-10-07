@@ -1,6 +1,7 @@
 //! Bearer-token authentication of HTTP requests.
 
 use axum::extract::FromRequestParts;
+use axum::http::HeaderMap;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 
@@ -9,9 +10,8 @@ use crate::sessions::{self, AuthUser};
 use crate::state::AppState;
 
 /// Returns the token of an `Authorization: Bearer <token>` header, if present.
-pub fn bearer_token(parts: &Parts) -> Option<&str> {
-    parts
-        .headers
+pub fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
         .get(AUTHORIZATION)?
         .to_str()
         .ok()?
@@ -25,7 +25,7 @@ impl FromRequestParts<AppState> for AuthUser {
 
     /// Authenticates the request's bearer token; rejects with 401 when missing or invalid.
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
-        let token = bearer_token(parts).ok_or_else(ApiError::unauthorized)?;
+        let token = bearer_token(&parts.headers).ok_or_else(ApiError::unauthorized)?;
         sessions::authenticate(&state.db, token)
             .await?
             .ok_or_else(ApiError::unauthorized)

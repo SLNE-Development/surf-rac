@@ -2,6 +2,8 @@
 
 #![allow(dead_code)]
 
+pub mod ws;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -43,7 +45,13 @@ pub fn test_config() -> Config {
 
 /// Starts a server on a random port backed by `pool`.
 pub async fn spawn(pool: PgPool) -> TestApp {
-    let state = AppState::new(pool.clone(), Arc::new(test_config()));
+    spawn_with(pool, |_| {}).await
+}
+
+/// Starts a server like [`spawn`], letting `adjust` change the state first.
+pub async fn spawn_with(pool: PgPool, adjust: impl FnOnce(&mut AppState)) -> TestApp {
+    let mut state = AppState::new(pool.clone(), Arc::new(test_config()));
+    adjust(&mut state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let served = state.clone();

@@ -82,6 +82,17 @@ pub async fn authenticate(db: &PgPool, token: &str) -> Result<Option<AuthUser>, 
     }))
 }
 
+/// Returns whether the session `token_hash` is unexpired and its user enabled.
+pub async fn is_valid(db: &PgPool, token_hash: &[u8]) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "select exists(select 1 from sessions s join users u on u.id = s.user_id \
+         where s.token_hash = $1 and s.expires_at > now() and not u.disabled)",
+    )
+    .bind(token_hash)
+    .fetch_one(db)
+    .await
+}
+
 /// Deletes the session identified by `token_hash`.
 pub async fn revoke(db: &PgPool, token_hash: &[u8]) -> Result<(), sqlx::Error> {
     sqlx::query("delete from sessions where token_hash = $1")

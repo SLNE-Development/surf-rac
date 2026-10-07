@@ -2,7 +2,8 @@
 //!
 //! A connection registers in the hub, sends `hello`, then relays signaling
 //! until the client leaves, the hub closes it (replacement, re-bind, delete)
-//! or a periodic re-validation finds its session, user or secret invalid.
+//! or a periodic re-validation finds its session, user or secret invalid or
+//! cannot reach the database several times in a row.
 
 use std::time::{Duration, Instant};
 
@@ -11,7 +12,6 @@ use futures_util::{SinkExt, StreamExt};
 use surf_rac_protocol::{ClientMessage, DeviceId, ServerMessage, WsErrorCode};
 
 use crate::devices;
-use crate::hub::Outbound;
 use crate::sessions::{self, AuthUser};
 use crate::state::AppState;
 
@@ -23,6 +23,9 @@ const BURST: f64 = 100.0;
 
 /// Interval between server pings.
 const PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Consecutive failed re-validations (database errors) after which a socket closes.
+const MAX_REVALIDATION_ERRORS: u32 = 3;
 
 /// Longest accepted `session_id`, in characters.
 const MAX_SESSION_ID_CHARS: usize = 64;
@@ -93,6 +96,7 @@ pub async fn run(state: AppState, socket: WebSocket, user: AuthUser, device: Dev
     let mut bucket = TokenBucket::new(RATE_PER_SEC, BURST, Instant::now());
     let mut revalidate = tokio::time::interval(state.ws_revalidate_interval);
     revalidate.tick().await;
+    let mut revalidation = Revalidation::default();
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.tick().await;
 
@@ -100,12 +104,12 @@ pub async fn run(state: AppState, socket: WebSocket, user: AuthUser, device: Dev
         loop {
             tokio::select! {
                 out = outbound.recv() => match out {
-                    Some(Outbound::Message(msg)) => {
+                    Some(msg) => {
                         if sink.send(frame(&msg)).await.is_err() {
                             break;
                         }
                     }
-                    Some(Outbound::Close) | None => {
+                    None => {
                         let _ = sink.send(Message::Close(None)).await;
                         break;
                     }
@@ -128,7 +132,8 @@ pub async fn run(state: AppState, socket: WebSocket, user: AuthUser, device: Dev
                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
                 },
                 _ = revalidate.tick() => {
-                    if !still_authorized(&state, &user, device, &secret).await {
+                    let verdict = check_authorized(&state, &user, device, &secret).await;
+                    if !revalidation.keep(verdict) {
                         tracing::info!(device_id = %device, "credentials no longer valid, closing");
                         let _ = sink.send(Message::Close(None)).await;
                         break;
@@ -199,16 +204,50 @@ fn handle_text(
     }
 }
 
-/// Returns false when the session expired or was revoked, the user was
-/// disabled, or the device secret changed. Database errors keep the connection.
-async fn still_authorized(state: &AppState, user: &AuthUser, device: DeviceId, secret: &str) -> bool {
+/// Tracks re-validation results of one connection.
+#[derive(Default)]
+struct Revalidation {
+    /// Consecutive checks that could not reach the database.
+    errors: u32,
+}
+
+impl Revalidation {
+    /// Returns whether the connection may stay open after a check.
+    ///
+    /// `verdict` is `Some(valid)` when the check completed, or `None` when the
+    /// database could not be reached. Invalid credentials close at once;
+    /// unreachable databases close after [`MAX_REVALIDATION_ERRORS`]
+    /// consecutive failures.
+    fn keep(&mut self, verdict: Option<bool>) -> bool {
+        match verdict {
+            Some(valid) => {
+                self.errors = 0;
+                valid
+            }
+            None => {
+                self.errors += 1;
+                self.errors < MAX_REVALIDATION_ERRORS
+            }
+        }
+    }
+}
+
+/// Checks that the session is unexpired, the user enabled and the device secret current.
+///
+/// Returns `None` when the database could not be reached.
+async fn check_authorized(
+    state: &AppState,
+    user: &AuthUser,
+    device: DeviceId,
+    secret: &str,
+) -> Option<bool> {
     let session = sessions::is_valid(&state.db, &user.token_hash).await;
     let device_ok = devices::authenticate(&state.db, user.user_id, device, secret).await;
     match (session, device_ok) {
-        (Ok(s), Ok(d)) => s && d,
+        (Ok(s), Ok(d)) => Some(s && d),
         (Err(err), _) | (_, Err(err)) => {
-            tracing::warn!(error = %err, "re-validation skipped, database unavailable");
-            true
+            tracing::warn!(error = %err, "re-validation failed, database unavailable");
+            None
         }
     }
 }
@@ -232,5 +271,29 @@ mod tests {
             assert!(b.try_take(later));
         }
         assert!(!b.try_take(later));
+    }
+}
+
+#[cfg(test)]
+mod revalidation_tests {
+    use super::*;
+
+    #[test]
+    fn revalidation_closes_after_repeated_errors() {
+        let mut r = Revalidation::default();
+        for _ in 0..(MAX_REVALIDATION_ERRORS - 1) {
+            assert!(r.keep(None));
+        }
+        assert!(r.keep(Some(true)));
+        for _ in 0..(MAX_REVALIDATION_ERRORS - 1) {
+            assert!(r.keep(None));
+        }
+        assert!(!r.keep(None));
+    }
+
+    #[test]
+    fn revalidation_closes_when_invalid() {
+        let mut r = Revalidation::default();
+        assert!(!r.keep(Some(false)));
     }
 }

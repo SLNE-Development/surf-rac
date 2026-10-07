@@ -134,7 +134,7 @@ pub async fn register(
         .await?;
         if let Some(id) = rebound {
             return Ok(Registered {
-                device_id: device_id(id),
+                device_id: self::device_id(id),
                 secret,
                 rebound: true,
             });
@@ -153,7 +153,7 @@ pub async fn register(
         .await?;
         if let Some(id) = inserted {
             return Ok(Registered {
-                device_id: device_id(id),
+                device_id: self::device_id(id),
                 secret,
                 rebound: false,
             });

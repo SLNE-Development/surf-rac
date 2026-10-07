@@ -196,6 +196,16 @@ async fn disabled_account_login_costs_a_password_check(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn invalid_username_login_is_not_tracked(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let huge = "x".repeat(10_000);
+    for name in [huge.as_str(), "UPPER", "a"] {
+        assert_eq!(app.login(name, PASSWORD, "10.8.0.1").await.status(), 401);
+    }
+    assert_eq!(app.state.limits.lockout.tracked_keys(), 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn successful_login_resets_failures(pool: PgPool) {
     let app = common::spawn(pool).await;
     app.register_and_login("alice").await;

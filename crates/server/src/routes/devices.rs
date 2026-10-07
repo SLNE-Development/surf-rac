@@ -9,6 +9,7 @@ use surf_rac_protocol::{
 };
 
 use crate::contacts;
+use crate::presence;
 use crate::devices::{self, DeviceError, device_id};
 use crate::error::ApiError;
 use crate::extract::JsonBody;
@@ -23,7 +24,8 @@ fn parse_id(raw: &str) -> Result<DeviceId, ApiError> {
 
 /// `POST /v1/devices`: registers a device or re-binds an existing one.
 ///
-/// A re-bind closes the device's live connection, which held the old secret.
+/// A re-bind closes the device's live connection, which held the old secret,
+/// and tells the device's watchers it went offline.
 pub async fn register(
     State(state): State<AppState>,
     user: AuthUser,
@@ -52,8 +54,8 @@ pub async fn register(
         DeviceError::IdExhausted => ApiError::internal(err),
         DeviceError::Db(e) => e.into(),
     })?;
-    if registered.rebound {
-        state.hub.disconnect(registered.device_id);
+    if registered.rebound && state.hub.disconnect(registered.device_id) {
+        presence::spawn_broadcast(&state, registered.device_id, false);
     }
     tracing::info!(
         username = %user.username,
@@ -90,16 +92,21 @@ pub async fn list(
 }
 
 /// `DELETE /v1/devices/{id}`: deletes one of the caller's devices and closes its connection.
+///
+/// Watchers of a device that was online are told it went offline.
 pub async fn delete(
     State(state): State<AppState>,
     user: AuthUser,
     Path(raw): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let id = parse_id(&raw)?;
+    let watchers = contacts::watchers(&state.db, id).await?;
     if !devices::delete(&state.db, user.user_id, id).await? {
         return Err(ApiError::not_found());
     }
-    state.hub.disconnect(id);
+    if state.hub.disconnect(id) {
+        presence::broadcast_to(&state, &watchers, id, false).await;
+    }
     tracing::info!(username = %user.username, device_id = %id, "device deleted");
     Ok(StatusCode::NO_CONTENT)
 }

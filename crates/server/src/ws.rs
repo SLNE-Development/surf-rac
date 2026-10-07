@@ -12,8 +12,10 @@ use futures_util::{SinkExt, StreamExt};
 use surf_rac_protocol::{ClientMessage, DeviceId, ServerMessage, WsErrorCode};
 
 use crate::devices;
+use crate::presence;
 use crate::sessions::{self, AuthUser};
 use crate::state::AppState;
+use crate::turn;
 
 /// Sustained messages per second a connection may send.
 const RATE_PER_SEC: f64 = 50.0;
@@ -86,10 +88,13 @@ fn frame(msg: &ServerMessage) -> Message {
 
 /// Runs the connection of `device`, authenticated as `user` with device `secret`, until it ends.
 pub async fn run(state: AppState, socket: WebSocket, user: AuthUser, device: DeviceId, secret: String) {
-    let (conn_id, mut outbound, _was_offline) = state.hub.register(device);
+    let (conn_id, mut outbound, was_offline) = state.hub.register(device);
     tracing::info!(device_id = %device, username = %user.username, "device connected");
     if let Err(err) = devices::touch_last_seen(&state.db, device).await {
         tracing::warn!(error = %err, "recording last seen failed");
+    }
+    if was_offline {
+        presence::spawn_broadcast(&state, device, true);
     }
 
     let (mut sink, mut stream) = socket.split();
@@ -152,6 +157,7 @@ pub async fn run(state: AppState, socket: WebSocket, user: AuthUser, device: Dev
         if let Err(err) = devices::touch_last_seen(&state.db, device).await {
             tracing::warn!(error = %err, "recording last seen failed");
         }
+        presence::spawn_broadcast(&state, device, false);
     }
     tracing::info!(device_id = %device, "device disconnected");
 }
@@ -197,10 +203,18 @@ fn handle_text(
             (!delivered).then(|| error(WsErrorCode::TargetOffline, "target device is offline"))
         }
         ClientMessage::Ping => Some(ServerMessage::Pong),
-        ClientMessage::TurnRequest => Some(error(
-            WsErrorCode::BadMessage,
-            "turn credentials are not available",
-        )),
+        ClientMessage::TurnRequest => {
+            let config = &state.config;
+            let now = chrono::Utc::now().timestamp().max(0) as u64;
+            let (username, password) =
+                turn::credentials(&config.turn_secret, device, config.turn_ttl_secs, now);
+            Some(ServerMessage::TurnCredentials {
+                username,
+                password,
+                ttl_secs: config.turn_ttl_secs,
+                urls: config.turn_urls.clone(),
+            })
+        }
     }
 }
 

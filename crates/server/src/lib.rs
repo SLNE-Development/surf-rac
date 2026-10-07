@@ -1,7 +1,14 @@
 //! The surf-rac signaling and account server.
 
+pub mod accounts;
+pub mod auth;
+pub mod client_ip;
 pub mod config;
+pub mod crypto;
 pub mod error;
+pub mod extract;
+pub mod limits;
+pub mod sessions;
 pub mod routes;
 pub mod state;
 pub mod telemetry;

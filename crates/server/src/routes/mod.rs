@@ -1,9 +1,10 @@
 //! HTTP routes.
 
+mod accounts;
 mod health;
 
 use axum::Router;
-use axum::routing::get;
+use axum::routing::{get, post};
 
 use crate::state::AppState;
 
@@ -11,5 +12,8 @@ use crate::state::AppState;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(health::healthz))
+        .route("/v1/register", post(accounts::register))
+        .route("/v1/login", post(accounts::login))
+        .route("/v1/logout", post(accounts::logout))
         .with_state(state)
 }

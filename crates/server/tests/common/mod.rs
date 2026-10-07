@@ -4,7 +4,9 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
+use serde_json::json;
 use sqlx::PgPool;
 use surf_rac_server::config::Config;
 use surf_rac_server::state::AppState;
@@ -57,9 +59,72 @@ pub async fn spawn(pool: PgPool) -> TestApp {
     }
 }
 
+/// Password used for every test account.
+pub const PASSWORD: &str = "correct horse battery";
+
+/// Source of distinct fake client IPs, so helpers never hit per-IP limits.
+static NEXT_IP: AtomicU32 = AtomicU32::new(1);
+
+/// Returns a fresh fake client IP in 172.16.0.0/12.
+fn fresh_ip() -> String {
+    let n = NEXT_IP.fetch_add(1, Ordering::Relaxed);
+    format!("172.16.{}.{}", (n >> 8) & 0xff, n & 0xff)
+}
+
 impl TestApp {
     /// Builds a URL for `path` on this server.
     pub fn url(&self, path: &str) -> String {
         format!("{}{}", self.base, path)
+    }
+
+    /// Creates an invite code directly in the database.
+    pub async fn invite(&self) -> String {
+        surf_rac_server::accounts::create_invite(&self.pool, "test", chrono::Duration::hours(72))
+            .await
+            .unwrap()
+    }
+
+    /// Calls `POST /v1/register` from a fresh client IP.
+    pub async fn register(&self, code: &str, username: &str, password: &str) -> reqwest::Response {
+        self.register_from(code, username, password, &fresh_ip()).await
+    }
+
+    /// Calls `POST /v1/register` with `ip` as the forwarded client address.
+    pub async fn register_from(
+        &self,
+        code: &str,
+        username: &str,
+        password: &str,
+        ip: &str,
+    ) -> reqwest::Response {
+        self.client
+            .post(self.url("/v1/register"))
+            .header("x-forwarded-for", ip)
+            .json(&json!({"invite_code": code, "username": username, "password": password}))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// Calls `POST /v1/login` with `ip` as the forwarded client address.
+    pub async fn login(&self, username: &str, password: &str, ip: &str) -> reqwest::Response {
+        self.client
+            .post(self.url("/v1/login"))
+            .header("x-forwarded-for", ip)
+            .json(&json!({"username": username, "password": password}))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// Registers `username` with [`PASSWORD`] and returns a session token.
+    pub async fn register_and_login(&self, username: &str) -> String {
+        let code = self.invite().await;
+        let res = self.register(&code, username, PASSWORD).await;
+        assert_eq!(res.status(), 201, "register {username}");
+        let res = self.login(username, PASSWORD, &fresh_ip()).await;
+        assert_eq!(res.status(), 200, "login {username}");
+        let body: serde_json::Value = res.json().await.unwrap();
+        body["token"].as_str().unwrap().to_owned()
     }
 }

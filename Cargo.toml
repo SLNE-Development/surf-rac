@@ -30,3 +30,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal
 tokio-tungstenite = "0.26"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Optimise dependencies in debug builds so argon2 hashing stays fast in tests.
+[profile.dev.package."*"]
+opt-level = 2

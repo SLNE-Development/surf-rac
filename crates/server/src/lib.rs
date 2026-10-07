@@ -1,6 +1,7 @@
 //! The surf-rac signaling and account server.
 
 pub mod accounts;
+pub mod admin;
 pub mod auth;
 pub mod client_ip;
 pub mod config;

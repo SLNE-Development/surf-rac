@@ -1,6 +1,10 @@
 //! Command-line entry point of the surf-rac server.
 
+use std::io::BufRead;
+
+use anyhow::Context;
 use clap::{Parser, Subcommand};
+use surf_rac_server::admin;
 use surf_rac_server::config::Config;
 
 /// surf-rac signaling and account server.
@@ -17,17 +21,90 @@ struct Cli {
 enum Command {
     /// Run the HTTP and WebSocket server.
     Serve,
+    /// Create an admin account; the password comes from SURF_RAC_PASSWORD or stdin.
+    CreateAdmin {
+        /// Username of the new admin.
+        username: String,
+    },
+    /// Create a single-use invite code and print it.
+    CreateInvite {
+        /// Hours until the invite expires.
+        #[arg(long, default_value_t = 72)]
+        expires_hours: i64,
+    },
+    /// List invites and their status (codes are never shown).
+    ListInvites,
+    /// Revoke an unused invite by its ID.
+    RevokeInvite {
+        /// Invite ID from list-invites.
+        id: i64,
+    },
+    /// List users.
+    ListUsers,
+    /// Disable a user and revoke their sessions.
+    DisableUser {
+        /// Username to disable.
+        username: String,
+    },
+    /// Re-enable a disabled user.
+    EnableUser {
+        /// Username to enable.
+        username: String,
+    },
+    /// Set a new password; it comes from SURF_RAC_PASSWORD or stdin.
+    ResetPassword {
+        /// Username whose password is reset.
+        username: String,
+    },
+    /// Revoke all sessions of a user.
+    RevokeSessions {
+        /// Username whose sessions are revoked.
+        username: String,
+    },
 }
 
 /// Parses the command line and runs the chosen subcommand.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    match cli.command {
-        Command::Serve => {
-            let config = Config::from_env()?;
-            surf_rac_server::telemetry::init(config.log_json);
-            surf_rac_server::run(config).await
-        }
+    if let Command::Serve = cli.command {
+        let config = Config::from_env()?;
+        surf_rac_server::telemetry::init(config.log_json);
+        return surf_rac_server::run(config).await;
     }
+
+    let url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
+    let db = surf_rac_server::connect_and_migrate(&url).await?;
+    let output = match cli.command {
+        Command::Serve => unreachable!("handled above"),
+        Command::CreateAdmin { username } => {
+            admin::create_admin(&db, &username, &read_password()?).await?
+        }
+        Command::CreateInvite { expires_hours } => admin::create_invite(&db, expires_hours).await?,
+        Command::ListInvites => admin::list_invites(&db).await?,
+        Command::RevokeInvite { id } => admin::revoke_invite(&db, id).await?,
+        Command::ListUsers => admin::list_users(&db).await?,
+        Command::DisableUser { username } => admin::set_disabled(&db, &username, true).await?,
+        Command::EnableUser { username } => admin::set_disabled(&db, &username, false).await?,
+        Command::ResetPassword { username } => {
+            admin::reset_password(&db, &username, &read_password()?).await?
+        }
+        Command::RevokeSessions { username } => admin::revoke_sessions(&db, &username).await?,
+    };
+    println!("{}", output.trim_end());
+    Ok(())
+}
+
+/// Reads a password from `SURF_RAC_PASSWORD`, or else one line from stdin.
+fn read_password() -> anyhow::Result<String> {
+    if let Ok(p) = std::env::var("SURF_RAC_PASSWORD") {
+        return Ok(p);
+    }
+    eprint!("password: ");
+    let mut line = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .context("reading password from stdin")?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_owned())
 }

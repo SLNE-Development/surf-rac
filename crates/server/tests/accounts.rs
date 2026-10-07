@@ -202,7 +202,20 @@ async fn invalid_username_login_is_not_tracked(pool: PgPool) {
     for name in [huge.as_str(), "UPPER", "a"] {
         assert_eq!(app.login(name, PASSWORD, "10.8.0.1").await.status(), 401);
     }
-    assert_eq!(app.state.limits.lockout.tracked_keys(), 0);
+    assert_eq!(app.state.limits.account_lockout.tracked_keys(), 0);
+    assert_eq!(app.state.limits.unknown_lockout.tracked_keys(), 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn unknown_username_locks_like_a_real_one(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    for i in 0..5 {
+        let ip = format!("10.8.1.{i}");
+        assert_eq!(app.login("ghost", PASSWORD, &ip).await.status(), 401);
+    }
+    let res = app.login("ghost", PASSWORD, "10.8.2.1").await;
+    assert_eq!(res.status(), 429);
+    assert_eq!(error_code(res).await, "locked");
 }
 
 #[sqlx::test(migrations = "./migrations")]

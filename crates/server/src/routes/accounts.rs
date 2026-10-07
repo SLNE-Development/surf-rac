@@ -88,10 +88,15 @@ pub async fn login(
             .map_err(ApiError::internal)?;
         return Err(ApiError::invalid_credentials());
     }
-    if let Err(remaining) = state.limits.lockout.try_attempt(&req.username, now) {
+    let user = accounts::find_user_by_name(&state.db, &req.username).await?;
+    let lockout = if user.is_some() {
+        &state.limits.account_lockout
+    } else {
+        &state.limits.unknown_lockout
+    };
+    if let Err(remaining) = lockout.try_attempt(&req.username, now) {
         return Err(ApiError::locked(remaining.as_secs()));
     }
-    let user = accounts::find_user_by_name(&state.db, &req.username).await?;
     let user = tokio::task::spawn_blocking(move || match user {
         Some(u) => {
             let matches = crypto::verify_password(&password, &u.password_hash);
@@ -108,7 +113,7 @@ pub async fn login(
         tracing::info!(username = %req.username, %ip, "login failed");
         return Err(ApiError::invalid_credentials());
     };
-    state.limits.lockout.record_success(&req.username);
+    state.limits.account_lockout.record_success(&req.username);
     let (token, expires_at) = sessions::create(&state.db, user.id).await?;
     tracing::info!(username = %user.username, "login");
     Ok(Json(LoginResponse { token, expires_at }))

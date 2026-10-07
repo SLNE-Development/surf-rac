@@ -3,7 +3,7 @@
 //! State lives in process memory and resets when the server restarts. Each
 //! limiter tracks at most [`MAX_KEYS`] keys; stale keys are pruned at most
 //! once per [`PRUNE_INTERVAL`] once [`PRUNE_THRESHOLD`] keys are tracked.
-//! When the cap is reached, new keys are refused until pruning frees room.
+//! When the cap is still reached after pruning, an arbitrary key is evicted.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -54,17 +54,13 @@ impl<V: Default> BoundedMap<V> {
         }
     }
 
-    /// Returns the value for `key`, inserting a default if there is room.
+    /// Returns the value for `key`, inserting a default when it is new.
     ///
     /// Before inserting into a large map, removes the values for which
-    /// `is_stale` returns true, at most once per [`PRUNE_INTERVAL`]. Returns
-    /// `None` when `key` is new and the map holds [`MAX_KEYS`] values.
-    fn get_or_insert(
-        &mut self,
-        key: &str,
-        now: Instant,
-        is_stale: impl Fn(&V) -> bool,
-    ) -> Option<&mut V> {
+    /// `is_stale` returns true, at most once per [`PRUNE_INTERVAL`]. When the
+    /// map still holds [`MAX_KEYS`] values, one arbitrary value is evicted to
+    /// make room, so new keys are never refused.
+    fn get_or_insert(&mut self, key: &str, now: Instant, is_stale: impl Fn(&V) -> bool) -> &mut V {
         if !self.entries.contains_key(key) {
             let due = self
                 .last_prune
@@ -73,11 +69,13 @@ impl<V: Default> BoundedMap<V> {
                 self.entries.retain(|_, v| !is_stale(v));
                 self.last_prune = Some(now);
             }
-            if self.entries.len() >= MAX_KEYS {
-                return None;
+            if self.entries.len() >= MAX_KEYS
+                && let Some(victim) = self.entries.keys().next().cloned()
+            {
+                self.entries.remove(&victim);
             }
         }
-        Some(self.entries.entry(key.to_owned()).or_default())
+        self.entries.entry(key.to_owned()).or_default()
     }
 }
 
@@ -111,15 +109,11 @@ impl RateLimiter {
     }
 
     /// Counts a hit for `key` at `now` and returns whether it is within the limit.
-    ///
-    /// Returns false for a new key while the limiter is full.
     pub fn check(&self, key: &str, now: Instant) -> bool {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let window = self.window;
         let stale = |w: &Window| w.start.is_none_or(|s| now.duration_since(s) >= window);
-        let Some(w) = entries.get_or_insert(key, now, stale) else {
-            return false;
-        };
+        let w = entries.get_or_insert(key, now, stale);
         if stale(w) {
             *w = Window {
                 start: Some(now),
@@ -186,22 +180,19 @@ impl Lockout {
 
     /// Records a failed attempt for `key` at `now`, locking it once the limit is reached.
     ///
-    /// Returns false, recording nothing, when `key` is new and the lockout is full.
-    pub fn record_failure(&self, key: &str, now: Instant) -> bool {
+    pub fn record_failure(&self, key: &str, now: Instant) {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        self.fail(&mut entries, key, now)
+        self.fail(&mut entries, key, now);
     }
 
-    /// Counts a failure for `key` in the already locked `entries`; false when full.
-    fn fail(&self, entries: &mut BoundedMap<LockState>, key: &str, now: Instant) -> bool {
+    /// Counts a failure for `key` in the already locked `entries`.
+    fn fail(&self, entries: &mut BoundedMap<LockState>, key: &str, now: Instant) {
         let lock_for = self.lock_for;
         let stale = |s: &LockState| {
             !s.locked_until.is_some_and(|u| u > now)
                 && !s.last_failure.is_some_and(|t| now.duration_since(t) < lock_for)
         };
-        let Some(state) = entries.get_or_insert(key, now, stale) else {
-            return false;
-        };
+        let state = entries.get_or_insert(key, now, stale);
         if state.locked_until.is_some_and(|u| u <= now) {
             *state = LockState::default();
         }
@@ -211,13 +202,11 @@ impl Lockout {
             state.failures = 0;
             state.locked_until = Some(now + self.lock_for);
         }
-        true
     }
 
     /// Reserves an attempt for `key` at `now`, counting it as a failure up front.
     ///
-    /// Returns the remaining lock time when `key` is locked, or the full lock
-    /// duration when `key` is new and the lockout is full. The check and the
+    /// Returns the remaining lock time when `key` is locked. The check and the
     /// count happen under one lock, so concurrent attempts cannot exceed the
     /// failure limit. A successful attempt must call
     /// [`Lockout::record_success`], which also lifts a lock that this attempt
@@ -229,11 +218,8 @@ impl Lockout {
         {
             return Err(until - now);
         }
-        if self.fail(&mut entries, key, now) {
-            Ok(())
-        } else {
-            Err(self.lock_for)
-        }
+        self.fail(&mut entries, key, now);
+        Ok(())
     }
 
     /// Returns the number of tracked keys.
@@ -258,8 +244,14 @@ pub struct Limits {
     pub login_ip: RateLimiter,
     /// Registration attempts per client address: 5 per minute.
     pub register_ip: RateLimiter,
-    /// Account lock: 15 minutes after 5 consecutive failed logins.
-    pub lockout: Lockout,
+    /// Lock of existing accounts: 15 minutes after 5 consecutive failed logins.
+    ///
+    /// Keyed only by usernames that exist, so its size is bounded by the
+    /// number of accounts and flooding unknown names cannot evict its entries.
+    pub account_lockout: Lockout,
+    /// The same lock for well-formed usernames that do not exist, so their
+    /// responses look like those of real accounts.
+    pub unknown_lockout: Lockout,
 }
 
 impl Default for Limits {
@@ -268,7 +260,8 @@ impl Default for Limits {
         Self {
             login_ip: RateLimiter::new(10, Duration::from_secs(60)),
             register_ip: RateLimiter::new(5, Duration::from_secs(60)),
-            lockout: Lockout::new(5, Duration::from_secs(15 * 60)),
+            account_lockout: Lockout::new(5, Duration::from_secs(15 * 60)),
+            unknown_lockout: Lockout::new(5, Duration::from_secs(15 * 60)),
         }
     }
 }
@@ -312,28 +305,41 @@ mod tests {
     }
 
     #[test]
-    fn rate_limiter_caps_tracked_keys() {
+    fn rate_limiter_evicts_when_full() {
         let rl = RateLimiter::new(3, Duration::from_secs(60));
         let t0 = Instant::now();
         for i in 0..MAX_KEYS {
             assert!(rl.check(&format!("k{i}"), t0));
         }
-        assert!(!rl.check("one-too-many", t0));
-        assert!(rl.check("k0", t0));
+        assert!(rl.check("newcomer", t0));
+        assert_eq!(rl.tracked_keys(), MAX_KEYS);
         assert!(rl.check("fresh", t0 + Duration::from_secs(61)));
-        assert!(rl.tracked_keys() <= 1);
+        assert!(rl.tracked_keys() <= 2);
     }
 
     #[test]
-    fn lockout_caps_tracked_keys() {
+    fn lockout_evicts_when_full() {
         let lo = Lockout::new(5, Duration::from_secs(900));
         let t0 = Instant::now();
         for i in 0..MAX_KEYS {
             assert!(lo.try_attempt(&format!("u{i}"), t0).is_ok());
         }
-        assert!(lo.try_attempt("one-too-many", t0).is_err());
-        assert!(lo.try_attempt("u0", t0).is_ok());
+        assert!(lo.try_attempt("newcomer", t0).is_ok());
         assert_eq!(lo.tracked_keys(), MAX_KEYS);
+    }
+
+    #[test]
+    fn unknown_name_flood_keeps_account_failures() {
+        let limits = Limits::default();
+        let t0 = Instant::now();
+        for _ in 0..4 {
+            assert!(limits.account_lockout.try_attempt("victim", t0).is_ok());
+        }
+        for i in 0..(MAX_KEYS + 10) {
+            let _ = limits.unknown_lockout.try_attempt(&format!("noise{i}"), t0);
+        }
+        assert!(limits.account_lockout.try_attempt("victim", t0).is_ok());
+        assert!(limits.account_lockout.try_attempt("victim", t0).is_err());
     }
 
     #[test]

@@ -15,6 +15,7 @@ surf-rac-protocol.workspace = true
 surf-rac-session.workspace = true
 argon2.workspace = true
 base64.workspace = true
+png = "0.17"
 livekit.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -24,6 +25,7 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+arboard = { version = "3", default-features = false, features = ["image-data"] }
 windows = { workspace = true }
 
 [dev-dependencies]

@@ -3,6 +3,7 @@
 
 pub mod access;
 pub mod api;
+pub mod clipboard;
 pub mod dpapi;
 pub mod fingerprint;
 pub mod keys;

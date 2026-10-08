@@ -3225,6 +3225,7 @@ dependencies = [
  "chrono",
  "hmac",
  "livekit",
+ "rand 0.8.8",
  "reqwest",
  "serde_json",
  "sha2",

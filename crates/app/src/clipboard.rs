@@ -78,7 +78,17 @@ fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Returns whether a `width` x `height` RGBA bitmap stays within [`MAX_DECODED_BYTES`].
+fn rgba_fits(width: u32, height: u32) -> bool {
+    (u64::from(width) * u64::from(height))
+        .checked_mul(4)
+        .is_some_and(|bytes| bytes <= MAX_DECODED_BYTES as u64)
+}
+
 /// Decodes a PNG of any 8-bit-convertible colour type into an RGBA bitmap.
+///
+/// Images whose RGBA form would exceed [`MAX_DECODED_BYTES`] are refused
+/// before any pixel memory is allocated.
 fn decode_png(bytes: &[u8]) -> Option<Item> {
     let mut decoder = png::Decoder::new_with_limits(
         std::io::Cursor::new(bytes),
@@ -88,6 +98,11 @@ fn decode_png(bytes: &[u8]) -> Option<Item> {
     );
     decoder.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = decoder.read_info().ok()?;
+    let (width, height) = (reader.info().width, reader.info().height);
+    if !rgba_fits(width, height) {
+        tracing::info!(width, height, "clipboard image too large to decode");
+        return None;
+    }
     let mut buf = vec![0; reader.output_buffer_size()];
     let info = reader.next_frame(&mut buf).ok()?;
     buf.truncate(info.buffer_size());
@@ -353,5 +368,14 @@ mod tests {
             rgba: vec![0; 3],
         };
         assert!(encode(&item).is_none());
+    }
+
+    #[test]
+    fn rgba_size_is_capped_before_decoding() {
+        assert!(rgba_fits(4096, 4096));
+        // A 16000x16000 grayscale image passes the decoder's own limit but
+        // would take about 1 GiB once expanded to RGBA.
+        assert!(!rgba_fits(16_000, 16_000));
+        assert!(!rgba_fits(u32::MAX, u32::MAX));
     }
 }

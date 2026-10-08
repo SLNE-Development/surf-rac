@@ -85,6 +85,8 @@ pub struct ClientApp {
     viewers: HashMap<u64, ViewerUi>,
     /// Whether closing the connections window waits for confirmation.
     confirm_disconnect_all: bool,
+    /// When each pending request's prompt was first shown, by session ID.
+    prompt_shown: HashMap<String, std::time::Instant>,
     /// The keyboard hook, when it could be installed.
     _hook: Option<crate::keyhook::KeyHook>,
 }
@@ -107,6 +109,7 @@ impl ClientApp {
             forms: Forms::default(),
             viewers: HashMap::new(),
             confirm_disconnect_all: false,
+            prompt_shown: HashMap::new(),
             _hook: hook,
         }
     }

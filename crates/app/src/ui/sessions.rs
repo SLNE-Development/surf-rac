@@ -9,6 +9,15 @@ use crate::access::PromptNote;
 use crate::runtime::{Command, ViewerStatus, ViewerView};
 use crate::viewmap::{self, Rect};
 
+/// How long a request prompt is visible before its Accept button works, so a
+/// click meant for another window cannot accept a request that pops up under it.
+const ACCEPT_DELAY: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Returns whether a prompt first shown at `shown` may be accepted at `now`.
+fn accept_armed(shown: std::time::Instant, now: std::time::Instant) -> bool {
+    now.saturating_duration_since(shown) >= ACCEPT_DELAY
+}
+
 /// Wheel units per line of scrolling.
 const WHEEL_PER_LINE: f32 = 120.0;
 
@@ -17,8 +26,22 @@ const WHEEL_PER_POINT: f32 = 3.0;
 
 impl ClientApp {
     /// Shows one always-on-top window per pending request.
+    ///
+    /// Accept works only after the prompt has been visible for [`ACCEPT_DELAY`].
     pub(super) fn show_prompts(&mut self, ctx: &egui::Context) {
-        for prompt in self.snap.prompts.clone() {
+        let now = std::time::Instant::now();
+        let prompts = self.snap.prompts.clone();
+        self.prompt_shown
+            .retain(|id, _| prompts.iter().any(|p| &p.session_id == id));
+        for prompt in prompts {
+            let shown = *self
+                .prompt_shown
+                .entry(prompt.session_id.clone())
+                .or_insert(now);
+            let armed = accept_armed(shown, now);
+            if !armed {
+                ctx.request_repaint_after(ACCEPT_DELAY);
+            }
             let id = egui::ViewportId::from_hash_of(("prompt", &prompt.session_id));
             let builder = egui::ViewportBuilder::default()
                 .with_title("Connection request - surf-rac")
@@ -50,7 +73,7 @@ impl ClientApp {
                     }
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Accept").clicked() {
+                        if ui.add_enabled(armed, egui::Button::new("Accept")).clicked() {
                             self.send(Command::Accept(prompt.session_id.clone()));
                         }
                         if ui.button("Deny").clicked() {
@@ -440,6 +463,14 @@ mod tests {
             mouse_button(egui::PointerButton::Extra2),
             Some(MouseButton::Forward)
         );
+    }
+
+    #[test]
+    fn accept_is_armed_only_after_the_delay() {
+        let shown = std::time::Instant::now();
+        assert!(!accept_armed(shown, shown));
+        assert!(!accept_armed(shown, shown + ACCEPT_DELAY / 2));
+        assert!(accept_armed(shown, shown + ACCEPT_DELAY));
     }
 
     #[test]

@@ -18,6 +18,9 @@ pub enum EncodeError {
     /// The session's video track could not be switched to encoded input.
     #[error("switching the video track failed: {0}")]
     Track(String),
+    /// The encoding thread ended without reporting why.
+    #[error("hardware encoder thread ended")]
+    WorkerGone,
     /// The encoder did not ask for input in time.
     #[error("hardware encoder stalled")]
     Stalled,

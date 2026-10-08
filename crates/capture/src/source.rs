@@ -55,8 +55,8 @@ mod synthetic {
     pub struct SyntheticSource {
         /// Monitor sizes; the first one is primary.
         sizes: Vec<(u32, u32)>,
-        /// Index of the selected monitor.
-        selected: usize,
+        /// Index of the selected monitor; `None` until a selection succeeded.
+        selected: Option<usize>,
         /// Failures still to report.
         control: SyntheticControl,
     }
@@ -66,12 +66,19 @@ mod synthetic {
     pub struct SyntheticControl {
         /// Number of upcoming captures that fail temporarily.
         fail_next: Arc<AtomicU32>,
+        /// Number of upcoming monitor selections that fail temporarily.
+        fail_select: Arc<AtomicU32>,
     }
 
     impl SyntheticControl {
         /// Makes the next `n` captures fail with [`CaptureError::Temporary`].
         pub fn fail_next(&self, n: u32) {
             self.fail_next.store(n, Ordering::SeqCst);
+        }
+
+        /// Makes the next `n` monitor selections fail with [`CaptureError::Temporary`].
+        pub fn fail_select(&self, n: u32) {
+            self.fail_select.store(n, Ordering::SeqCst);
         }
     }
 
@@ -81,7 +88,7 @@ mod synthetic {
             let control = SyntheticControl::default();
             let source = SyntheticSource {
                 sizes,
-                selected: 0,
+                selected: None,
                 control: control.clone(),
             };
             (source, control)
@@ -104,26 +111,35 @@ mod synthetic {
                 .collect())
         }
 
-        /// Selects monitor `index`; fails when there is no such monitor.
+        /// Selects monitor `index`; fails when there is no such monitor or a failure is pending.
         fn select(&mut self, index: usize) -> Result<(), CaptureError> {
+            let fail = &self.control.fail_select;
+            if fail.load(Ordering::SeqCst) > 0 {
+                fail.fetch_sub(1, Ordering::SeqCst);
+                return Err(CaptureError::Temporary);
+            }
             if index >= self.sizes.len() {
                 return Err(CaptureError::Unavailable);
             }
-            self.selected = index;
+            self.selected = Some(index);
             Ok(())
         }
 
-        /// Returns a frame of the selected monitor, or a pending failure.
+        /// Returns a frame of the selected monitor, or a pending failure; fails
+        /// until a monitor has been selected.
         fn capture(&mut self) -> Result<Option<BgraFrame>, CaptureError> {
             let fail = &self.control.fail_next;
             if fail.load(Ordering::SeqCst) > 0 {
                 fail.fetch_sub(1, Ordering::SeqCst);
                 return Err(CaptureError::Temporary);
             }
-            let Some(&(width, height)) = self.sizes.get(self.selected) else {
+            let Some(selected) = self.selected else {
                 return Err(CaptureError::Unavailable);
             };
-            let shade = 40 + 60 * self.selected as u8;
+            let Some(&(width, height)) = self.sizes.get(selected) else {
+                return Err(CaptureError::Unavailable);
+            };
+            let shade = 40u8.wrapping_add(60u8.wrapping_mul(selected as u8));
             let mut data = vec![shade; (width * height * 4) as usize];
             for px in data.chunks_mut(4) {
                 px[3] = 255;

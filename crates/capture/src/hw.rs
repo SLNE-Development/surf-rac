@@ -6,7 +6,7 @@
 //! encoded input when its first encoder opens, and back to raw input when the
 //! encoder fails, before reporting the failure.
 
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -126,8 +126,15 @@ impl HwWorker {
     }
 
     /// Returns the failure that ended the worker, once it has ended.
+    ///
+    /// A worker that ended without reporting, because it panicked or never
+    /// started, reports [`EncodeError::WorkerGone`].
     pub(crate) fn failure(&self) -> Option<EncodeError> {
-        self.failed.try_recv().ok()
+        match self.failed.try_recv() {
+            Ok(err) => Some(err),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(EncodeError::WorkerGone),
+        }
     }
 }
 
@@ -174,12 +181,18 @@ impl<K: VideoSink> Worker<K> {
     }
 
     /// Encodes jobs and polls for output until the job sender is gone or the encoder fails.
+    ///
+    /// When the share stops, the track is switched back to raw frames so a later
+    /// software share can publish on it.
     fn run(mut self, jobs: Receiver<Job>) {
         loop {
             let result = match jobs.recv_timeout(POLL_INTERVAL) {
                 Ok(job) => self.encode(job),
                 Err(RecvTimeoutError::Timeout) => self.poll(),
-                Err(RecvTimeoutError::Disconnected) => return,
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.restore_raw();
+                    return;
+                }
             };
             if let Err(e) = result {
                 self.fail(e);
@@ -247,13 +260,19 @@ impl<K: VideoSink> Worker<K> {
 
     /// Releases the encoder, switches the track back to raw input and reports `err`.
     fn fail(&mut self, err: EncodeError) {
+        self.restore_raw();
+        let _ = self.failed.send(err);
+    }
+
+    /// Releases the encoder and switches the track back to raw input if it was switched.
+    fn restore_raw(&mut self) {
         self.encoder = None;
         if self.encoded_input {
             let (w, h) = self.size;
-            if let Err(e) = self.sink.switch_input(VideoInput::Raw, w, h) {
-                tracing::warn!(error = %e, "switching the track to raw frames failed");
+            match self.sink.switch_input(VideoInput::Raw, w, h) {
+                Ok(()) => self.encoded_input = false,
+                Err(e) => tracing::warn!(error = %e, "switching the track to raw frames failed"),
             }
         }
-        let _ = self.failed.send(err);
     }
 }

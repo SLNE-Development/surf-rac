@@ -1,7 +1,7 @@
 //! A running screen share: captures the selected monitor, publishes it on a
 //! host session and keeps every viewer informed about the screen state.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -29,6 +29,12 @@ const BACKOFF_START: Duration = Duration::from_millis(250);
 
 /// Longest wait between capture retries.
 const BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+/// Shortest time between two screen changes one viewer may make.
+const REQUEST_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Commands queued for the capture thread; further viewer messages are dropped.
+const COMMAND_CAPACITY: usize = 64;
 
 /// How often the share logs its frame counters.
 const STATS_INTERVAL: Duration = Duration::from_secs(10);
@@ -71,7 +77,7 @@ enum Command {
 /// A screen share running on its own capture thread.
 pub struct ScreenShare {
     /// Requests to the capture thread.
-    commands: std_mpsc::Sender<Command>,
+    commands: std_mpsc::SyncSender<Command>,
     /// The latest screen state.
     state: watch::Receiver<ScreenState>,
     /// The capture thread.
@@ -143,7 +149,7 @@ impl ScreenShare {
             host: host.clone(),
             runtime: Handle::current(),
         };
-        let (commands, command_rx) = std_mpsc::channel();
+        let (commands, command_rx) = std_mpsc::sync_channel(COMMAND_CAPACITY);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let thread = thread::Builder::new()
             .name("surf-rac-capture".into())
@@ -181,13 +187,15 @@ impl ScreenShare {
     }
 
     /// Hands the share a control message a viewer sent; screen requests are applied.
+    ///
+    /// Dropped when the capture thread is too far behind.
     pub fn handle_control(&self, from: DeviceId, control: &Control) {
-        let _ = self.commands.send(Command::Control(from, control.clone()));
+        let _ = self.commands.try_send(Command::Control(from, control.clone()));
     }
 
     /// Tells the share that `viewer` joined, so it is sent the current state.
     pub fn viewer_joined(&self, viewer: DeviceId) {
-        let _ = self.commands.send(Command::Joined(viewer));
+        let _ = self.commands.try_send(Command::Joined(viewer));
     }
 
     /// Returns the current screen state.
@@ -214,7 +222,7 @@ impl ScreenShare {
 impl Drop for ScreenShare {
     /// Asks the capture thread to end when the share is dropped without [`ScreenShare::stop`].
     fn drop(&mut self) {
-        let _ = self.commands.send(Command::Stop);
+        let _ = self.commands.try_send(Command::Stop);
     }
 }
 
@@ -249,6 +257,8 @@ pub(crate) trait VideoSink: Send + 'static {
     fn publish_encoded(&self, frame: &EncodedFrame<'_>) -> Result<(), FrameError>;
     /// Switches what the video track takes.
     fn switch_input(&self, input: VideoInput, width: u32, height: u32) -> Result<(), String>;
+    /// Returns what the video track takes.
+    fn video_input(&self) -> VideoInput;
     /// Returns and clears a pending keyframe request.
     fn take_keyframe_request(&self) -> bool;
     /// Returns and clears a pending rate request.
@@ -280,6 +290,11 @@ impl VideoSink for HostSink {
         self.runtime
             .block_on(self.host.set_video_input(input, width, height))
             .map_err(|e| e.to_string())
+    }
+
+    /// Forwards to [`HostSession::video_input`].
+    fn video_input(&self) -> VideoInput {
+        self.host.video_input()
     }
 
     /// Forwards to [`HostSession::take_keyframe_request`].
@@ -396,6 +411,10 @@ pub(crate) struct ShareLoop<K: VideoSink> {
     requested_bps: Option<u64>,
     /// Frame counters for the periodic stats line.
     stats: Stats,
+    /// Whether the source must be pointed at the selected monitor before the next capture.
+    needs_select: bool,
+    /// When each viewer last changed the screen.
+    last_change: HashMap<DeviceId, Instant>,
 }
 
 impl<K: VideoSink + Clone> ShareLoop<K> {
@@ -420,6 +439,7 @@ impl<K: VideoSink + Clone> ShareLoop<K> {
             Ok(_) => Err(CaptureError::Unavailable),
             Err(e) => Err(*e),
         };
+        let needs_select = selected.is_err();
         if let Err(e) = selected {
             ctl.set_capture(paused(e));
             retry_at = Some(now + backoff.next());
@@ -439,6 +459,8 @@ impl<K: VideoSink + Clone> ShareLoop<K> {
             force_keyframe: false,
             requested_bps: None,
             stats: Stats::new(now),
+            needs_select,
+            last_change: HashMap::new(),
         }
     }
 
@@ -467,30 +489,47 @@ impl<K: VideoSink + Clone> ShareLoop<K> {
             let wait = next_tick.saturating_duration_since(Instant::now());
             match commands.recv_timeout(wait) {
                 Ok(Command::Stop) | Err(std_mpsc::RecvTimeoutError::Disconnected) => return,
-                Ok(cmd) => self.command(cmd),
+                Ok(cmd) => self.command(cmd, Instant::now()),
                 Err(std_mpsc::RecvTimeoutError::Timeout) => {}
             }
         }
     }
 
-    /// Applies a viewer join or control message.
-    fn command(&mut self, cmd: Command) {
+    /// Applies a viewer join or control message received at `now`.
+    ///
+    /// A viewer may change the screen at most once per 250 ms; screen requests
+    /// that come sooner are ignored.
+    fn command(&mut self, cmd: Command, now: Instant) {
         match cmd {
             Command::Joined(viewer) => {
                 let out = self.ctl.viewer_joined(viewer);
                 self.emit(Some(out));
             }
             Command::Control(from, control) => {
-                let before = self.ctl.state().selected;
+                let request = matches!(
+                    control,
+                    Control::SelectMonitor { .. } | Control::SetQuality { .. }
+                );
+                self.last_change
+                    .retain(|_, at| now.duration_since(*at) < REQUEST_INTERVAL);
+                if request && self.last_change.contains_key(&from) {
+                    tracing::debug!(viewer = %from, "screen request ignored, too soon after the last one");
+                    return;
+                }
+                let before = self.ctl.state().clone();
                 let out = self.ctl.handle(from, &control);
-                if self.ctl.state().selected != before {
-                    tracing::info!(monitor = self.ctl.state().selected, "monitor selected");
-                    self.select_current();
+                if matches!(out, Some(Outgoing::All(_))) {
+                    self.last_change.insert(from, now);
                 }
-                if let Control::SetQuality { mode } = control {
-                    tracing::info!(?mode, "quality mode requested");
+                if self.ctl.state().mode != before.mode {
+                    tracing::info!(mode = ?self.ctl.state().mode, "quality mode changed");
                 }
+                let changed_monitor = self.ctl.state().selected != before.selected;
                 self.emit(out);
+                if changed_monitor {
+                    tracing::info!(monitor = self.ctl.state().selected, "monitor selected");
+                    self.select_current(now);
+                }
             }
             Command::Stop => {}
         }
@@ -503,6 +542,12 @@ impl<K: VideoSink + Clone> ShareLoop<K> {
         }
         if self.retry_at.is_some_and(|at| now < at) {
             return;
+        }
+        if self.needs_select {
+            self.select_current(now);
+            if self.needs_select {
+                return;
+            }
         }
         match self.source.capture() {
             Ok(Some(frame)) => {
@@ -523,16 +568,21 @@ impl<K: VideoSink + Clone> ShareLoop<K> {
         }
     }
 
-    /// Pauses capture after `err` and schedules a retry.
+    /// Pauses capture after the capture error `err`; the retry also re-selects the monitor.
     fn fail(&mut self, err: CaptureError, now: Instant) {
-        let wait = self.backoff.next();
-        self.retry_at = Some(now + wait);
+        self.needs_select = true;
+        self.pause(err, now);
+        self.enumerate(now);
+    }
+
+    /// Marks capture paused because of `err` and schedules a retry after the backoff.
+    fn pause(&mut self, err: CaptureError, now: Instant) {
+        self.retry_at = Some(now + self.backoff.next());
         let out = self.ctl.set_capture(paused(err));
         if out.is_some() {
             tracing::info!(error = %err, "capture paused");
         }
         self.emit(out);
-        self.enumerate(now);
     }
 
     /// Refreshes the monitor list at `now` and follows a changed selection.
@@ -548,18 +598,28 @@ impl<K: VideoSink + Clone> ShareLoop<K> {
                 selected = self.ctl.state().selected,
                 "monitor list changed"
             );
-            self.select_current();
+            self.emit(out);
+            self.select_current(now);
         }
-        self.emit(out);
     }
 
     /// Points the source at the selected monitor.
-    fn select_current(&mut self) {
+    ///
+    /// When that fails, capture pauses and the selection is retried with the
+    /// next capture attempt, so the shared state never names a monitor that
+    /// is not being captured.
+    fn select_current(&mut self, now: Instant) {
         if self.ctl.state().monitors.is_empty() {
+            self.needs_select = true;
             return;
         }
-        if let Err(e) = self.source.select(usize::from(self.ctl.state().selected)) {
-            tracing::warn!(error = %e, "selecting monitor failed");
+        match self.source.select(usize::from(self.ctl.state().selected)) {
+            Ok(()) => self.needs_select = false,
+            Err(e) => {
+                tracing::warn!(error = %e, "selecting monitor failed");
+                self.needs_select = true;
+                self.pause(e, now);
+            }
         }
     }
 
@@ -569,7 +629,7 @@ impl<K: VideoSink + Clone> ShareLoop<K> {
         let (w, h) = mode::target_size(self.ctl.state().mode, frame.width, frame.height);
         let timestamp_us = now_micros();
         if let Some(err) = self.worker.as_ref().and_then(HwWorker::failure) {
-            self.fall_back(err);
+            self.fall_back(err, (w, h));
         }
         if self.worker.is_none() {
             if let Some(factory) = self.hardware.take() {
@@ -614,10 +674,15 @@ impl<K: VideoSink + Clone> ShareLoop<K> {
 
     /// Encodes in software for the rest of the share after the hardware encoder failed with `err`.
     ///
-    /// The encoding thread has already switched the track back to raw frames.
-    fn fall_back(&mut self, err: EncodeError) {
+    /// Switches the track back to raw frames when the encoding thread could not.
+    fn fall_back(&mut self, err: EncodeError, (w, h): (u32, u32)) {
         self.worker = None;
         self.hardware = None;
+        if self.sink.video_input() != VideoInput::Raw {
+            if let Err(e) = self.sink.switch_input(VideoInput::Raw, w, h) {
+                tracing::warn!(error = %e, "switching the track to raw frames failed");
+            }
+        }
         if err == EncodeError::NoHardware {
             tracing::info!("encoder: software (no hardware H.264 encoder)");
         } else {
@@ -707,6 +772,16 @@ mod tests {
             Ok(())
         }
 
+        /// Returns the input of the last switch, raw before any.
+        fn video_input(&self) -> VideoInput {
+            self.switches
+                .lock()
+                .unwrap()
+                .last()
+                .copied()
+                .unwrap_or(VideoInput::Raw)
+        }
+
         /// Returns and clears the queued keyframe request.
         fn take_keyframe_request(&self) -> bool {
             std::mem::take(&mut *self.keyframe.lock().unwrap())
@@ -734,6 +809,8 @@ mod tests {
         pending: Arc<Mutex<u32>>,
         /// How long each encode call takes.
         delay: Arc<Mutex<Duration>>,
+        /// Frames after which encoding panics.
+        panic_after: Arc<Mutex<Option<u32>>>,
     }
 
     /// An encoder that emits one access unit per frame and fails after `fail_after` frames.
@@ -766,6 +843,9 @@ mod tests {
             let started = Instant::now();
             while started.elapsed() < delay && !self.log.delay.lock().unwrap().is_zero() {
                 std::thread::sleep(Duration::from_millis(1));
+            }
+            if *self.log.panic_after.lock().unwrap() == Some(self.frames) {
+                panic!("fake encoder crashed");
             }
             if self.frames >= self.fail_after {
                 return Err(EncodeError::Hresult(0x8000_4005));
@@ -870,19 +950,20 @@ mod tests {
             Control::SetQuality {
                 mode: QualityMode::Speed,
             },
-        ));
+        ), t0);
         lp.tick(t0);
-        lp.command(Command::Control(dev(1), Control::SelectMonitor { index: 1 }));
-        lp.tick(t0);
+        let later = t0 + REQUEST_INTERVAL;
+        lp.command(Command::Control(dev(1), Control::SelectMonitor { index: 1 }), later);
+        lp.tick(later);
         assert_eq!(*rec.raw.lock().unwrap(), [(1920, 1080), (1280, 720), (640, 480)]);
     }
 
     #[test]
     fn join_and_requests_reach_viewers() {
-        let (mut lp, _, _, mut rx, _) = setup();
-        lp.command(Command::Joined(dev(1)));
-        lp.command(Command::Control(dev(1), Control::SelectMonitor { index: 7 }));
-        lp.command(Command::Control(dev(1), Control::SelectMonitor { index: 1 }));
+        let (mut lp, _, _, mut rx, t0) = setup();
+        lp.command(Command::Joined(dev(1)), t0);
+        lp.command(Command::Control(dev(1), Control::SelectMonitor { index: 7 }), t0);
+        lp.command(Command::Control(dev(1), Control::SelectMonitor { index: 1 }), t0);
         let out = drain(&mut rx);
         assert!(matches!(&out[0], Outgoing::To(v, s) if *v == dev(1) && s.selected == 0));
         assert!(matches!(&out[1], Outgoing::To(v, s) if *v == dev(1) && s.selected == 0));
@@ -957,7 +1038,7 @@ mod tests {
             Control::SetQuality {
                 mode: QualityMode::Speed,
             },
-        ));
+        ), t0);
         tick_encoded(&mut lp, &rec, t0, 4);
         assert_eq!(*log.forced.lock().unwrap(), [true, false, true, true]);
         assert_eq!(
@@ -974,7 +1055,7 @@ mod tests {
         lp.hardware = Some(fake_factory(u32::MAX, log.clone()));
         tick_encoded(&mut lp, &rec, t0, 1);
         tick_encoded(&mut lp, &rec, t0, 2);
-        lp.command(Command::Control(dev(1), Control::SelectMonitor { index: 1 }));
+        lp.command(Command::Control(dev(1), Control::SelectMonitor { index: 1 }), t0);
         tick_encoded(&mut lp, &rec, t0, 3);
         assert_eq!(
             log.opened.lock().unwrap().iter().map(|o| (o.0, o.1)).collect::<Vec<_>>(),
@@ -1057,6 +1138,83 @@ mod tests {
         let at = lp.retry_at.unwrap();
         tick_encoded(&mut lp, &rec, at, 3);
         assert_eq!(*log.forced.lock().unwrap(), [true, false, true]);
+    }
+
+    #[test]
+    fn failed_initial_select_recovers() {
+        let (source, control) = SyntheticSource::new(vec![(640, 480)]);
+        control.fail_select(1);
+        let rec = Recorder::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let t0 = Instant::now();
+        let mut lp = ShareLoop::new(Box::new(source), rec.clone(), ShareOptions::default(), tx, t0);
+        assert!(matches!(lp.ctl.state().capture, CaptureState::Paused { .. }));
+        let at = lp.retry_at.expect("paused");
+        lp.tick(at);
+        assert_eq!(lp.ctl.state().capture, CaptureState::Active);
+        assert_eq!(*rec.raw.lock().unwrap(), [(640, 480)]);
+        assert!(
+            drain(&mut rx)
+                .iter()
+                .any(|o| matches!(o, Outgoing::All(s) if s.capture == CaptureState::Active))
+        );
+    }
+
+    #[test]
+    fn failed_monitor_switch_pauses_and_retries() {
+        let (mut lp, control, rec, _, t0) = setup();
+        lp.tick(t0);
+        control.fail_select(1);
+        lp.command(Command::Control(dev(1), Control::SelectMonitor { index: 1 }), t0);
+        assert!(matches!(lp.ctl.state().capture, CaptureState::Paused { .. }));
+        lp.tick(t0);
+        assert_eq!(rec.raw.lock().unwrap().len(), 1, "captured while the switch failed");
+        let at = lp.retry_at.expect("paused");
+        lp.tick(at);
+        assert_eq!(lp.ctl.state().capture, CaptureState::Active);
+        assert_eq!(rec.raw.lock().unwrap().last(), Some(&(640, 480)));
+    }
+
+    #[test]
+    fn viewer_requests_are_rate_limited() {
+        let (mut lp, _, _, _, t0) = setup();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let select = |v, index| Command::Control(dev(v), Control::SelectMonitor { index });
+        lp.command(select(1, 1), at(0));
+        assert_eq!(lp.ctl.state().selected, 1);
+        lp.command(select(1, 0), at(100));
+        assert_eq!(lp.ctl.state().selected, 1, "second change within 250 ms applied");
+        lp.command(select(2, 0), at(100));
+        assert_eq!(lp.ctl.state().selected, 0, "another viewer was limited too");
+        lp.command(select(1, 1), at(300));
+        assert_eq!(lp.ctl.state().selected, 1);
+    }
+
+    #[test]
+    fn stopping_hardware_restores_raw_input() {
+        let (mut lp, _, rec, _, t0) = setup();
+        lp.hardware = Some(fake_factory(u32::MAX, FakeLog::default()));
+        tick_encoded(&mut lp, &rec, t0, 1);
+        drop(lp);
+        assert_eq!(*rec.switches.lock().unwrap(), [VideoInput::Encoded, VideoInput::Raw]);
+    }
+
+    #[test]
+    fn encoder_panic_falls_back_to_software() {
+        let (mut lp, _, rec, _, t0) = setup();
+        let log = FakeLog::default();
+        *log.panic_after.lock().unwrap() = Some(1);
+        lp.hardware = Some(fake_factory(u32::MAX, log));
+        tick_encoded(&mut lp, &rec, t0, 1);
+        lp.tick(t0);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while rec.raw.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "no software frame after the encoder panicked");
+            lp.tick(t0);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(*rec.switches.lock().unwrap(), [VideoInput::Encoded, VideoInput::Raw]);
+        assert!(lp.worker.is_none());
     }
 
     #[test]

@@ -128,10 +128,13 @@ async fn viewer_switches_monitor_and_mode(pool: PgPool) {
     state_where(&mut s.events, |st| st.selected == 1).await;
     frames_of(&mut s.events, 640, 480).await;
 
+    tokio::time::sleep(Duration::from_millis(300)).await;
     s.viewer
         .send(&DataMessage::Control(Control::SelectMonitor { index: 0 }))
         .await
         .unwrap();
+    state_where(&mut s.events, |st| st.selected == 0).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
     s.viewer
         .send(&DataMessage::Control(Control::SetQuality {
             mode: QualityMode::Speed,

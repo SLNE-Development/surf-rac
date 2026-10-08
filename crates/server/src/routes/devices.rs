@@ -172,5 +172,6 @@ pub async fn presence(
     Ok(Json(PresenceInfo {
         device_id: id,
         online: state.hub.is_online(id),
+        public_key: None,
     }))
 }

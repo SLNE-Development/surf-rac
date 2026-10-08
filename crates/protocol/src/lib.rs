@@ -191,6 +191,16 @@ pub struct PresenceInfo {
     pub device_id: DeviceId,
     /// Whether the device is currently online.
     pub online: bool,
+    /// The device's X25519 public key (standard base64 of 32 bytes), when it has published one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+}
+
+/// Body of `PUT /v1/devices/{id}/public-key`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PutPublicKeyRequest {
+    /// The device's X25519 public key, standard base64 of 32 bytes.
+    pub public_key: String,
 }
 
 /// Error body of every failed HTTP request.
@@ -255,6 +265,39 @@ pub enum ClientMessage {
         /// Opaque payload; the server never inspects it.
         data: serde_json::Value,
     },
+    /// Ask host device `to` for a session; relayed as a server `session_request`.
+    SessionRequest {
+        /// Host device.
+        to: DeviceId,
+        /// Viewer-chosen session identifier, 1 to 64 characters.
+        session_id: String,
+        /// The viewer device's X25519 public key, standard base64 of 32 bytes.
+        viewer_public_key: String,
+    },
+    /// Answer a session request from viewer `to`; relayed as a server `session_response`.
+    SessionResponse {
+        /// Viewer device.
+        to: DeviceId,
+        /// Session identifier of the request.
+        session_id: String,
+        /// Whether the host accepted the session.
+        accepted: bool,
+        /// Why the session was refused, when it was.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<DenyReason>,
+        /// The host device's X25519 public key, standard base64 of 32 bytes, when accepted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host_public_key: Option<String>,
+    },
+    /// Ask for a LiveKit token for this device's own room; answered with `host_token`.
+    HostTokenRequest,
+    /// Ask the server to issue a viewer token for this device's room to `viewer_device_id`.
+    ViewerTokenRequest {
+        /// Session the token is for.
+        session_id: String,
+        /// The accepted viewer device.
+        viewer_device_id: DeviceId,
+    },
     /// Ask for short-lived TURN credentials.
     TurnRequest,
     /// Application-level keepalive; answered with `pong`.
@@ -280,6 +323,52 @@ pub enum ServerMessage {
         kind: SignalKind,
         /// Opaque payload from the sender.
         data: serde_json::Value,
+    },
+    /// A viewer asks this device for a session.
+    SessionRequest {
+        /// Viewer device, set by the server.
+        from: DeviceId,
+        /// Session identifier chosen by the viewer.
+        session_id: String,
+        /// The viewer device's X25519 public key, standard base64 of 32 bytes.
+        viewer_public_key: String,
+    },
+    /// A host answered this device's session request.
+    SessionResponse {
+        /// Host device, set by the server.
+        from: DeviceId,
+        /// Session identifier of the request.
+        session_id: String,
+        /// Whether the host accepted the session.
+        accepted: bool,
+        /// Why the session was refused, when it was.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<DenyReason>,
+        /// The host device's X25519 public key, standard base64 of 32 bytes, when accepted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host_public_key: Option<String>,
+    },
+    /// LiveKit join token for this device's own room.
+    HostToken {
+        /// LiveKit server URL.
+        url: String,
+        /// Room name, `host-<device_id>`.
+        room: String,
+        /// Short-lived join token.
+        token: String,
+    },
+    /// LiveKit join token for a host's room, issued on that host's request.
+    ViewerToken {
+        /// Host device that requested the token, set by the server.
+        from: DeviceId,
+        /// Session the token is for.
+        session_id: String,
+        /// LiveKit server URL.
+        url: String,
+        /// Room name, `host-<host_device_id>`.
+        room: String,
+        /// Short-lived join token bound to this device's identity.
+        token: String,
     },
     /// Short-lived TURN credentials.
     TurnCredentials {
@@ -312,6 +401,18 @@ pub enum ServerMessage {
     Replaced,
 }
 
+/// Why a host refused a session request.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DenyReason {
+    /// The host declined the request.
+    Denied,
+    /// The host's room already holds the maximum number of viewers.
+    RoomFull,
+    /// The viewer's public key differs from the one the host pinned.
+    KeyChanged,
+}
+
 /// Machine-readable WebSocket error codes.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -322,6 +423,8 @@ pub enum WsErrorCode {
     BadMessage,
     /// The connection exceeded its message rate.
     RateLimited,
+    /// The device may not make this request.
+    Forbidden,
 }
 
 #[cfg(test)]
@@ -414,6 +517,56 @@ mod tests {
     fn unknown_type_fails() {
         assert!(serde_json::from_value::<ClientMessage>(json!({"type":"nope"})).is_err());
         assert!(serde_json::from_value::<ClientMessage>(json!({"to":"123456789"})).is_err());
+    }
+
+    #[test]
+    fn session_request_round_trip() {
+        let raw = json!({"type":"session_request","to":"123456789","session_id":"s1","viewer_public_key":"AAAA"});
+        let msg: ClientMessage = serde_json::from_value(raw.clone()).unwrap();
+        assert!(matches!(msg, ClientMessage::SessionRequest { .. }));
+        assert_eq!(serde_json::to_value(&msg).unwrap(), raw);
+    }
+
+    #[test]
+    fn session_response_omits_absent_fields() {
+        let msg = ServerMessage::SessionResponse {
+            from: DeviceId::new(123_456_789).unwrap(),
+            session_id: "s1".into(),
+            accepted: false,
+            reason: Some(DenyReason::RoomFull),
+            host_public_key: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&msg).unwrap(),
+            json!({"type":"session_response","from":"123456789","session_id":"s1","accepted":false,"reason":"room_full"})
+        );
+    }
+
+    #[test]
+    fn token_messages_round_trip() {
+        let req: ClientMessage =
+            serde_json::from_value(json!({"type":"host_token_request"})).unwrap();
+        assert_eq!(req, ClientMessage::HostTokenRequest);
+        let v: ClientMessage = serde_json::from_value(
+            json!({"type":"viewer_token_request","session_id":"s","viewer_device_id":"223456789"}),
+        )
+        .unwrap();
+        assert!(matches!(v, ClientMessage::ViewerTokenRequest { .. }));
+        let t = ServerMessage::ViewerToken {
+            from: DeviceId::new(123_456_789).unwrap(),
+            session_id: "s".into(),
+            url: "ws://x".into(),
+            room: "host-123456789".into(),
+            token: "t".into(),
+        };
+        assert_eq!(serde_json::to_value(&t).unwrap()["type"], "viewer_token");
+    }
+
+    #[test]
+    fn presence_public_key_optional() {
+        let p: PresenceInfo =
+            serde_json::from_value(json!({"device_id":"123456789","online":true})).unwrap();
+        assert!(p.public_key.is_none());
     }
 
     #[test]

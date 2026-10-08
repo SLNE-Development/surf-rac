@@ -225,6 +225,13 @@ fn handle_text(
                 urls: config.turn_urls.clone(),
             })
         }
+        ClientMessage::SessionRequest { .. }
+        | ClientMessage::SessionResponse { .. }
+        | ClientMessage::HostTokenRequest
+        | ClientMessage::ViewerTokenRequest { .. } => Some(error(
+            WsErrorCode::BadMessage,
+            "message type not supported",
+        )),
     }
 }
 

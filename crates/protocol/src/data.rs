@@ -94,6 +94,85 @@ pub enum Control {
     },
     /// The sender ends the session.
     Hangup,
+    /// The host's current screen: its monitors, the shared selection and capture status.
+    ScreenState(ScreenState),
+    /// A viewer asks the host to show the monitor with this index.
+    SelectMonitor {
+        /// Index of the monitor in [`ScreenState::monitors`].
+        index: u8,
+    },
+    /// A viewer asks the host to switch the quality mode.
+    SetQuality {
+        /// The requested mode.
+        mode: QualityMode,
+    },
+}
+
+/// Most monitors a [`ScreenState`] lists.
+pub const MAX_MONITORS: usize = 16;
+
+/// Longest monitor name, in bytes, a [`MonitorInfo`] carries.
+pub const MAX_MONITOR_NAME_BYTES: usize = 64;
+
+/// The screen a host shares, as every viewer sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenState {
+    /// The host's monitors, at most [`MAX_MONITORS`].
+    pub monitors: Vec<MonitorInfo>,
+    /// Index of the monitor being shared.
+    pub selected: u8,
+    /// The quality mode the video is encoded with.
+    pub mode: QualityMode,
+    /// Whether frames are being captured.
+    pub capture: CaptureState,
+}
+
+/// One monitor of the host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorInfo {
+    /// Position in [`ScreenState::monitors`]; used to select it.
+    pub index: u8,
+    /// Display name, at most [`MAX_MONITOR_NAME_BYTES`].
+    pub name: String,
+    /// Native width in pixels.
+    pub width: u32,
+    /// Native height in pixels.
+    pub height: u32,
+    /// Whether it is the primary monitor.
+    pub primary: bool,
+}
+
+/// Trade-off between picture quality and speed, shared by all viewers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum QualityMode {
+    /// Native resolution and the highest bitrate.
+    Quality,
+    /// Resolution capped at 1920 pixels on the longest side.
+    #[default]
+    Balanced,
+    /// Resolution capped at 1280 pixels on the longest side and the lowest bitrate.
+    Speed,
+}
+
+/// Whether the host is capturing its screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CaptureState {
+    /// Frames are captured and sent.
+    Active,
+    /// No frames are sent; viewers keep the last one.
+    Paused {
+        /// Why capture is paused.
+        reason: PauseReason,
+    },
+}
+
+/// Why capture is paused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PauseReason {
+    /// No capture method works on the host.
+    Unavailable,
+    /// Capture failed and is being retried.
+    Recovering,
 }
 
 /// Kind of a clipboard item.
@@ -149,6 +228,14 @@ impl fmt::Debug for Control {
                 .field("index", index)
                 .finish_non_exhaustive(),
             Control::Hangup => f.write_str("Hangup"),
+            Control::ScreenState(state) => f.debug_tuple("ScreenState").field(state).finish(),
+            Control::SelectMonitor { index } => f
+                .debug_struct("SelectMonitor")
+                .field("index", index)
+                .finish(),
+            Control::SetQuality { mode } => {
+                f.debug_struct("SetQuality").field("mode", mode).finish()
+            }
         }
     }
 }
@@ -247,6 +334,62 @@ mod tests {
             assert_eq!(bytes[0], DATA_VERSION);
             assert_eq!(DataMessage::decode(&bytes).unwrap(), m);
         }
+    }
+
+    #[test]
+    fn screen_control_round_trips() {
+        let state = ScreenState {
+            monitors: vec![
+                MonitorInfo {
+                    index: 0,
+                    name: "DISPLAY1".into(),
+                    width: 2560,
+                    height: 1440,
+                    primary: true,
+                },
+                MonitorInfo {
+                    index: 1,
+                    name: "DISPLAY2".into(),
+                    width: 1080,
+                    height: 1920,
+                    primary: false,
+                },
+            ],
+            selected: 1,
+            mode: QualityMode::Speed,
+            capture: CaptureState::Paused {
+                reason: PauseReason::Recovering,
+            },
+        };
+        for m in [
+            DataMessage::Control(Control::ScreenState(state)),
+            DataMessage::Control(Control::SelectMonitor { index: 1 }),
+            DataMessage::Control(Control::SetQuality {
+                mode: QualityMode::Quality,
+            }),
+        ] {
+            assert_eq!(DataMessage::decode(&m.encode()).unwrap(), m);
+            assert_eq!(m.topic(), TOPIC_INPUT);
+            assert!(m.is_reliable());
+        }
+    }
+
+    #[test]
+    fn existing_variant_bytes_unchanged() {
+        assert_eq!(DataMessage::Control(Control::Hangup).encode(), [1, 4, 1]);
+        assert_eq!(
+            DataMessage::Control(Control::MediaKey {
+                index: 2,
+                key: [7; 32]
+            })
+            .encode()[..4],
+            [1, 4, 0, 2]
+        );
+    }
+
+    #[test]
+    fn default_quality_mode_is_balanced() {
+        assert_eq!(QualityMode::default(), QualityMode::Balanced);
     }
 
     #[test]

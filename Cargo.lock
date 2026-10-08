@@ -3412,6 +3412,8 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqlx",
+ "surf-rac-capture",
+ "surf-rac-input",
  "surf-rac-protocol",
  "surf-rac-server",
  "surf-rac-session",

@@ -1,0 +1,562 @@
+//! The host side of the runtime: being reachable, deciding requests, and
+//! running screen capture and input while viewers are connected.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use surf_rac_capture::{ScreenShare, ShareOptions};
+use surf_rac_input::{Grants, InputHost, InputStatus};
+use surf_rac_protocol::DeviceId;
+use surf_rac_protocol::data::{Control, DataMessage};
+use surf_rac_session::SessionConfig;
+use surf_rac_session::crypto::open_password;
+use surf_rac_session::host::{HostEvent, HostSession};
+use surf_rac_session::{PublicKey, crypto::CryptoError};
+use tokio::sync::{mpsc, watch};
+
+use super::actor::{Actor, Internal};
+use super::{Auth, HostViewerView, PromptView};
+use crate::access::{self, Decision, PasswordCheck};
+
+/// Placeholder size of the screen track until capture starts.
+const INITIAL_TRACK: (u32, u32) = (1280, 720);
+
+/// Wait before hosting is retried after it failed or ended.
+const RESTART_DELAY: Duration = Duration::from_secs(10);
+
+/// A viewer accepted by this host.
+struct HostViewer {
+    /// What it may do.
+    grants: Grants,
+    /// Whether the clipboard syncs with it.
+    clipboard: bool,
+    /// Whether it joined the room.
+    joined: bool,
+}
+
+/// A running host session with its capture and input, while viewers are connected.
+pub(super) struct Hosting {
+    /// The host session.
+    pub(super) session: HostSession,
+    /// The start generation this session belongs to.
+    generation: u64,
+    /// Screen capture, while viewers are connected.
+    share: Option<ScreenShare>,
+    /// Input arbitration, while viewers are connected and input works here.
+    input: Option<InputHost>,
+    /// The input status, while input runs.
+    status: Option<watch::Receiver<InputStatus>>,
+    /// Accepted viewers.
+    viewers: BTreeMap<DeviceId, HostViewer>,
+    /// Requests waiting for an answer.
+    pub(super) prompts: Vec<PromptView>,
+    /// Whether follow mode is on.
+    pub(super) follow: bool,
+    /// Whether the signaling connection this session used has closed.
+    stale: bool,
+}
+
+impl Hosting {
+    /// Returns whether host input currently locks out remote input.
+    pub(super) fn input_locked(&self) -> bool {
+        self.status.as_ref().is_some_and(|s| s.borrow().locked)
+    }
+
+    /// Passes an event to the share and input, whichever are running.
+    fn route(&self, event: &HostEvent) {
+        match (&self.share, &self.input) {
+            (Some(share), Some(input)) => surf_rac_input::route(event, share, input),
+            (Some(share), None) => match event {
+                HostEvent::ViewerJoined { viewer } => share.viewer_joined(*viewer),
+                HostEvent::DataReceived {
+                    viewer,
+                    message:
+                        DataMessage::Control(
+                            control @ (Control::SelectMonitor { .. } | Control::SetQuality { .. }),
+                        ),
+                } => share.handle_control(*viewer, control),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    /// Stops input and capture.
+    async fn stop_capture(&mut self) {
+        self.status = None;
+        if let Some(input) = self.input.take() {
+            input.stop().await;
+        }
+        if let Some(share) = self.share.take() {
+            share.stop().await;
+        }
+    }
+}
+
+/// Checks a request's sealed password against the host's password hash.
+fn check_password(
+    identity: &super::identity::Identity,
+    viewer_key: &PublicKey,
+    session_id: &str,
+    viewer: DeviceId,
+    sealed: Option<&str>,
+    hash: Option<&str>,
+) -> PasswordCheck {
+    let Some(sealed) = sealed else {
+        return PasswordCheck::Absent;
+    };
+    let opened: Result<String, CryptoError> = open_password(
+        &identity.keys,
+        viewer_key,
+        session_id,
+        viewer,
+        identity.id,
+        sealed,
+    );
+    match (opened, hash) {
+        (Err(_), _) => PasswordCheck::Unreadable,
+        (Ok(password), Some(hash)) if access::verify_password(&password, hash) => {
+            PasswordCheck::Correct
+        }
+        (Ok(_), _) => PasswordCheck::Wrong,
+    }
+}
+
+impl Actor {
+    /// Starts hosting when allowed, connected and not already running.
+    pub(super) fn start_hosting(&mut self) {
+        if self.host.is_some() || self.host_starting || !self.store.state().settings.allow_incoming
+        {
+            return;
+        }
+        let (Some(signaling), Some(identity)) = (self.signaling.clone(), self.identity.clone())
+        else {
+            return;
+        };
+        self.host_starting = true;
+        self.host_generation += 1;
+        let generation = self.host_generation;
+        let known = Arc::clone(&self.known);
+        let tx = self.internal.clone();
+        tokio::spawn(async move {
+            let result = HostSession::start(
+                signaling,
+                identity.keys,
+                known,
+                INITIAL_TRACK.0,
+                INITIAL_TRACK.1,
+                SessionConfig::default(),
+            )
+            .await
+            .map_err(|e| e.to_string());
+            let _ = tx.send(Internal::HostStarted(generation, result));
+        });
+    }
+
+    /// Takes a started host session into use, or schedules a retry when it failed.
+    pub(super) async fn on_host_started(
+        &mut self,
+        generation: u64,
+        result: Result<(HostSession, mpsc::Receiver<HostEvent>), String>,
+    ) {
+        if generation != self.host_generation {
+            if let Ok((session, _)) = result {
+                session.close().await;
+            }
+            return;
+        }
+        self.host_starting = false;
+        match result {
+            Ok((session, mut events)) => {
+                if !self.store.state().settings.allow_incoming || self.signaling.is_none() {
+                    session.close().await;
+                    return;
+                }
+                let tx = self.internal.clone();
+                tokio::spawn(async move {
+                    while let Some(event) = events.recv().await {
+                        if tx.send(Internal::Host(generation, event)).is_err() {
+                            return;
+                        }
+                    }
+                });
+                self.host = Some(Hosting {
+                    session,
+                    generation,
+                    share: None,
+                    input: None,
+                    status: None,
+                    viewers: BTreeMap::new(),
+                    prompts: Vec::new(),
+                    follow: false,
+                    stale: false,
+                });
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "hosting could not start");
+                self.banner = Some(format!("Incoming connections are unavailable: {e}"));
+                self.schedule_restart();
+            }
+        }
+    }
+
+    /// Asks for another hosting start after [`RESTART_DELAY`].
+    fn schedule_restart(&self) {
+        let tx = self.internal.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(RESTART_DELAY).await;
+            let _ = tx.send(Internal::RestartHosting);
+        });
+    }
+
+    /// Handles an event of the host session of `generation`.
+    pub(super) async fn on_host_event(&mut self, generation: u64, event: HostEvent) {
+        if self
+            .host
+            .as_ref()
+            .is_none_or(|h| h.generation != generation)
+        {
+            return;
+        }
+        match &event {
+            HostEvent::ViewerRequested {
+                session_id,
+                viewer,
+                fingerprint,
+                viewer_key,
+                password,
+            } => {
+                self.on_request(
+                    session_id,
+                    *viewer,
+                    fingerprint,
+                    viewer_key,
+                    password.as_deref(),
+                )
+                .await
+            }
+            HostEvent::KeyChanged(changed) => {
+                self.banner = Some(format!(
+                    "Device {} presented a different security key; its request was refused.",
+                    changed.device_id
+                ));
+            }
+            HostEvent::RequestExpired { session_id, .. } => {
+                if let Some(host) = self.host.as_mut() {
+                    host.prompts.retain(|p| &p.session_id != session_id);
+                }
+            }
+            HostEvent::ViewerJoined { viewer } => {
+                let remembered = self.grants.get(viewer).copied();
+                let clipboard = self.store.state().settings.clipboard_default;
+                let Some(host) = self.host.as_mut() else {
+                    return;
+                };
+                host.route(&event);
+                if let (Some(grants), Some(input)) = (remembered, &host.input) {
+                    input.set_grants(*viewer, grants);
+                }
+                host.viewers
+                    .entry(*viewer)
+                    .or_insert(HostViewer {
+                        grants: remembered.unwrap_or_default(),
+                        clipboard,
+                        joined: false,
+                    })
+                    .joined = true;
+            }
+            HostEvent::ViewerLeft { viewer } => {
+                let Some(host) = self.host.as_mut() else {
+                    return;
+                };
+                host.route(&event);
+                host.viewers.remove(viewer);
+                if host.viewers.is_empty() {
+                    host.stop_capture().await;
+                    if host.stale {
+                        self.stop_hosting().await;
+                        self.start_hosting();
+                    }
+                }
+            }
+            HostEvent::DataReceived {
+                viewer,
+                message: message @ DataMessage::Clipboard { .. },
+            } => {
+                let syncs = self
+                    .host
+                    .as_ref()
+                    .and_then(|h| h.viewers.get(viewer))
+                    .is_some_and(|v| v.joined && v.clipboard);
+                if syncs {
+                    self.apply_clipboard(message);
+                }
+            }
+            HostEvent::DataReceived { .. } => {
+                if let Some(host) = &self.host {
+                    host.route(&event);
+                }
+            }
+            HostEvent::Reconnecting | HostEvent::Reconnected => {}
+            HostEvent::Ended { reason } => {
+                tracing::warn!(?reason, "hosting ended");
+                self.stop_hosting().await;
+                if self.auth == Auth::Online {
+                    self.schedule_restart();
+                }
+            }
+        }
+    }
+
+    /// Decides a session request: admits it on a correct unattended password,
+    /// otherwise shows a prompt.
+    async fn on_request(
+        &mut self,
+        session_id: &str,
+        viewer: DeviceId,
+        fingerprint: &str,
+        viewer_key: &PublicKey,
+        sealed: Option<&str>,
+    ) {
+        self.persist_known();
+        let Some(identity) = self.identity.clone() else {
+            return;
+        };
+        let settings = &self.store.state().settings;
+        let hash = settings
+            .password_hash
+            .as_ref()
+            .map(|h| h.expose().to_string());
+        let unattended = settings.unattended && hash.is_some();
+        let check = check_password(
+            &identity,
+            viewer_key,
+            session_id,
+            viewer,
+            sealed,
+            hash.as_deref(),
+        );
+        let decision = access::decide(check, unattended, &mut self.lockout, viewer, Instant::now());
+        tracing::info!(viewer = %viewer, ?check, ?decision, "session request");
+        match decision {
+            Decision::Accept => self.accept_request(session_id, viewer).await,
+            Decision::Prompt(note) => {
+                let name = self.name_of(viewer);
+                if let Some(host) = self.host.as_mut() {
+                    host.prompts.push(PromptView {
+                        session_id: session_id.to_string(),
+                        viewer,
+                        name,
+                        fingerprint: fingerprint.to_string(),
+                        note,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Accepts the pending request `session_id` from the prompt.
+    pub(super) async fn accept(&mut self, session_id: &str) {
+        let Some(viewer) = self.take_prompt(session_id) else {
+            return;
+        };
+        self.accept_request(session_id, viewer).await;
+    }
+
+    /// Denies the pending request `session_id` from the prompt.
+    pub(super) async fn deny(&mut self, session_id: &str) {
+        if self.take_prompt(session_id).is_none() {
+            return;
+        }
+        if let Some(host) = &self.host
+            && let Err(e) = host.session.deny(session_id).await
+        {
+            tracing::debug!(error = %e, "deny failed");
+        }
+    }
+
+    /// Removes the prompt of `session_id` and returns its viewer.
+    fn take_prompt(&mut self, session_id: &str) -> Option<DeviceId> {
+        let host = self.host.as_mut()?;
+        let index = host
+            .prompts
+            .iter()
+            .position(|p| p.session_id == session_id)?;
+        Some(host.prompts.remove(index).viewer)
+    }
+
+    /// Starts capture if needed and accepts `viewer`'s request.
+    async fn accept_request(&mut self, session_id: &str, viewer: DeviceId) {
+        if let Err(e) = self.ensure_capture().await {
+            tracing::error!(error = %e, "screen capture could not start");
+            self.banner = Some(format!("The screen cannot be shared: {e}"));
+            if let Some(host) = &self.host {
+                let _ = host.session.deny(session_id).await;
+            }
+            return;
+        }
+        let grants = self.grants.get(&viewer).copied().unwrap_or_default();
+        let clipboard = self.store.state().settings.clipboard_default;
+        let Some(host) = self.host.as_mut() else {
+            return;
+        };
+        match host.session.accept(session_id).await {
+            Ok(()) => {
+                host.viewers.entry(viewer).or_insert(HostViewer {
+                    grants,
+                    clipboard,
+                    joined: false,
+                });
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "accept failed");
+                if host.viewers.is_empty() {
+                    host.stop_capture().await;
+                }
+            }
+        }
+    }
+
+    /// Starts screen capture and input when they are not running.
+    ///
+    /// Capture failing is an error; input failing leaves viewers watch-only.
+    async fn ensure_capture(&mut self) -> Result<(), String> {
+        let tx = self.internal.clone();
+        let host = self.host.as_mut().ok_or("not hosting")?;
+        if host.share.is_some() {
+            return Ok(());
+        }
+        let share = ScreenShare::start(host.session.clone(), ShareOptions::default())
+            .await
+            .map_err(|e| e.to_string())?;
+        let input = InputHost::start(host.session.clone(), share.handle()).await;
+        host.share = Some(share);
+        match input {
+            Ok(input) => {
+                input.set_follow(host.follow);
+                let mut status = input.subscribe();
+                host.status = Some(status.clone());
+                host.input = Some(input);
+                tokio::spawn(async move {
+                    while status.changed().await.is_ok() {
+                        if tx.send(Internal::InputChanged).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "remote input unavailable");
+                self.banner =
+                    Some("Remote control is unavailable here; viewers can only watch.".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Changes what `viewer` may do and remembers it for later sessions.
+    pub(super) fn set_grants(&mut self, viewer: DeviceId, grants: Grants) {
+        self.grants.insert(viewer, grants);
+        if let Some(host) = self.host.as_mut() {
+            if let Some(v) = host.viewers.get_mut(&viewer) {
+                v.grants = grants;
+            }
+            if let Some(input) = &host.input {
+                input.set_grants(viewer, grants);
+            }
+        }
+    }
+
+    /// Turns follow mode on or off.
+    pub(super) fn set_follow(&mut self, on: bool) {
+        if let Some(host) = self.host.as_mut() {
+            host.follow = on;
+            if let Some(input) = &host.input {
+                input.set_follow(on);
+            }
+        }
+    }
+
+    /// Turns clipboard sync with `viewer` on or off.
+    pub(super) fn set_host_clipboard(&mut self, viewer: DeviceId, on: bool) {
+        if let Some(v) = self.host.as_mut().and_then(|h| h.viewers.get_mut(&viewer)) {
+            v.clipboard = on;
+        }
+    }
+
+    /// Disconnects `viewer`.
+    pub(super) async fn disconnect(&mut self, viewer: DeviceId) {
+        if let Some(host) = &self.host
+            && let Err(e) = host.session.hangup(viewer).await
+        {
+            tracing::debug!(error = %e, "hangup message not delivered");
+        }
+    }
+
+    /// Disconnects every viewer.
+    pub(super) async fn disconnect_all(&mut self) {
+        let viewers: Vec<DeviceId> = self
+            .host
+            .as_ref()
+            .map(|h| h.viewers.keys().copied().collect())
+            .unwrap_or_default();
+        for viewer in viewers {
+            self.disconnect(viewer).await;
+        }
+    }
+
+    /// Stops hosting: ends capture and input and leaves the room.
+    pub(super) async fn stop_hosting(&mut self) {
+        self.host_starting = false;
+        self.host_generation += 1;
+        if let Some(mut host) = self.host.take() {
+            host.stop_capture().await;
+            host.session.close().await;
+        }
+    }
+
+    /// Handles a closed signaling connection: ends hosting now when no viewer
+    /// is connected, otherwise once the last one leaves.
+    pub(super) async fn mark_hosting_stale(&mut self) {
+        self.host_starting = false;
+        match self.host.as_mut() {
+            Some(host) if !host.viewers.is_empty() => host.stale = true,
+            Some(_) => self.stop_hosting().await,
+            None => self.host_generation += 1,
+        }
+    }
+
+    /// Returns the viewers the local clipboard is sent to.
+    pub(super) fn host_clipboard_targets(&self) -> Vec<DeviceId> {
+        self.host
+            .as_ref()
+            .map(|h| {
+                h.viewers
+                    .iter()
+                    .filter(|(_, v)| v.joined && v.clipboard)
+                    .map(|(id, _)| *id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Returns the connected viewers as the UI shows them.
+    pub(super) fn host_viewer_views(&self) -> Vec<HostViewerView> {
+        self.host
+            .as_ref()
+            .map(|h| {
+                h.viewers
+                    .iter()
+                    .filter(|(_, v)| v.joined)
+                    .map(|(id, v)| HostViewerView {
+                        id: *id,
+                        name: self.name_of(*id),
+                        grants: v.grants,
+                        clipboard: v.clipboard,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}

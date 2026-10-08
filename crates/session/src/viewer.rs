@@ -16,7 +16,7 @@ use surf_rac_protocol::{ClientMessage, DenyReason, DeviceId, ServerMessage, WsEr
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::channel::{Inbound, PeerChannel, SendError, Side};
+use crate::channel::{Inbound, PeerChannel, SendError, Side, topic_index};
 use crate::config::{EndReason, SessionConfig};
 use crate::crypto::{self, DeviceKeys, PublicKey};
 use crate::pinning::{KeyChanged, KnownKeys};
@@ -93,8 +93,8 @@ struct Inner {
     room: Room,
     /// Sealed data channel with the host.
     channel: Mutex<PeerChannel>,
-    /// Serializes sealing and sending so each topic's counters leave in order.
-    send_lock: tokio::sync::Mutex<()>,
+    /// Serialize sealing and sending per topic so each topic's counters leave in order.
+    send_locks: [tokio::sync::Mutex<()>; 3],
     /// Frame-encryption keys.
     key_provider: KeyProvider,
     /// Key index of the newest media key received.
@@ -213,7 +213,7 @@ impl ViewerSession {
             )),
             session_id,
             room: lk_room,
-            send_lock: tokio::sync::Mutex::new(()),
+            send_locks: Default::default(),
             key_provider,
             media_index: Mutex::new(None),
             task: Mutex::new(None),
@@ -256,7 +256,8 @@ impl ViewerSession {
 impl Inner {
     /// Seals `msg` and sends it to the host.
     async fn send(&self, msg: &DataMessage) -> Result<(), SendError> {
-        let _order = self.send_lock.lock().await;
+        let slot = topic_index(msg.topic()).expect("every message topic is known");
+        let _order = self.send_locks[slot].lock().await;
         let sealed = lock(&self.channel).seal(msg)?;
         room::send(
             &self.room,
@@ -342,7 +343,12 @@ async fn run(
                     continue;
                 }
                 Some(RoomEvent::ParticipantDisconnected(p)) if p.identity().0 == host_identity => {
-                    break EndReason::Closed;
+                    host_presence(false, &mut watch, &events);
+                    continue;
+                }
+                Some(RoomEvent::ParticipantActive(p)) if p.identity().0 == host_identity => {
+                    host_presence(true, &mut watch, &events);
+                    continue;
                 }
                 Some(RoomEvent::Reconnecting) => {
                     watch.reconnecting();
@@ -376,6 +382,26 @@ async fn run(
     let _ = events.send(ViewerEvent::Ended { reason });
     drop(events);
     let _ = forwarder.await;
+}
+
+/// Records that the host left the room (`present` false) or came back (`present` true).
+///
+/// A host that leaves is treated like a dropped connection: the reconnect
+/// window starts and the session ends only if the host does not return in time.
+fn host_presence(
+    present: bool,
+    watch: &mut ReconnectWatch,
+    events: &mpsc::UnboundedSender<ViewerEvent>,
+) {
+    if present {
+        if watch.is_reconnecting() {
+            watch.reconnected();
+            let _ = events.send(ViewerEvent::Connected);
+        }
+    } else {
+        watch.reconnecting();
+        let _ = events.send(ViewerEvent::Reconnecting);
+    }
 }
 
 /// Decodes frames of `track` and offers them to `public`, dropping frames it has no room for.
@@ -436,7 +462,7 @@ mod tests {
                 SessionKey::from_bytes([1; 32]),
                 Side::Viewer,
             )),
-            send_lock: tokio::sync::Mutex::new(()),
+            send_locks: Default::default(),
             key_provider,
             media_index: Mutex::new(None),
             task: Mutex::new(None),
@@ -495,6 +521,32 @@ mod tests {
                 [ViewerEvent::Reconnecting, ViewerEvent::Connected]
             ),
             "{got:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn host_that_drops_out_counts_as_reconnecting() {
+        let mut watch = ReconnectWatch::new(Duration::from_secs(30));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        host_presence(false, &mut watch, &tx);
+        assert!(matches!(rx.try_recv(), Ok(ViewerEvent::Reconnecting)));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(29), watch.expired())
+                .await
+                .is_err()
+        );
+        host_presence(true, &mut watch, &tx);
+        assert!(matches!(rx.try_recv(), Ok(ViewerEvent::Connected)));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(60), watch.expired())
+                .await
+                .is_err()
+        );
+        host_presence(false, &mut watch, &tx);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(31), watch.expired())
+                .await
+                .is_ok()
         );
     }
 

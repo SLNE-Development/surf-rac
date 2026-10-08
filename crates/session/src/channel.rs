@@ -207,7 +207,7 @@ impl PeerChannel {
 }
 
 /// Returns the counter slot of `topic`, or `None` for unknown topics.
-fn topic_index(topic: &str) -> Option<usize> {
+pub(crate) fn topic_index(topic: &str) -> Option<usize> {
     TOPICS.iter().position(|t| *t == topic)
 }
 

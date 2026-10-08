@@ -234,3 +234,35 @@ async fn median_frame_delay_under_200ms(pool: PgPool) {
     );
     assert!(median < 200_000, "median delay {median} us");
 }
+
+#[sqlx::test(migrations = "../server/migrations")]
+async fn clipboard_upload_does_not_delay_input(pool: PgPool) {
+    let env = TestEnv::start(pool).await;
+    let (h, v) = (env.device("host", 1).await, env.device("viewer", 2).await);
+    let (host, mut host_events) = start_host(&h, SessionConfig::default()).await;
+    let pending = request(&v, h.id, SessionConfig::default());
+    let (viewer, _events) = accept_next(&host, &mut host_events, pending).await;
+    let big = DataMessage::Clipboard {
+        kind: ClipboardKind::Image,
+        bytes: vec![7; surf_rac_protocol::data::MAX_CLIPBOARD_BYTES],
+    };
+    let uploader = viewer.clone();
+    let upload = tokio::spawn(async move { uploader.send(&big).await });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let key = DataMessage::Key {
+        code: 30,
+        down: true,
+    };
+    viewer.send(&key).await.unwrap();
+    assert!(
+        !upload.is_finished(),
+        "input send waited for the whole clipboard upload"
+    );
+    host_event(
+        &mut host_events,
+        Duration::from_secs(30),
+        |e| matches!(e, HostEvent::DataReceived { message, .. } if *message == key),
+    )
+    .await;
+    upload.await.unwrap().unwrap();
+}

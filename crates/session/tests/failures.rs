@@ -293,3 +293,40 @@ async fn request_flood_does_not_exhaust_host(pool: PgPool) {
     let pending = request(&v, h.id, SessionConfig::default());
     accept_next(&host, &mut host_events, pending).await;
 }
+
+#[sqlx::test(migrations = "../server/migrations")]
+async fn unread_host_events_do_not_stall_requests(pool: PgPool) {
+    use surf_rac_protocol::data::DataMessage;
+
+    let env = TestEnv::start(pool).await;
+    let (h, v) = (env.device("host", 1).await, env.device("viewer", 2).await);
+    let (host, mut host_events) = start_host(&h, SessionConfig::default()).await;
+    let pending = request(&v, h.id, SessionConfig::default());
+    let (viewer, _events) = accept_next(&host, &mut host_events, pending).await;
+    for i in 0..1500u32 {
+        viewer
+            .send(&DataMessage::Key {
+                code: i,
+                down: true,
+            })
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let other = env.device("other", 3).await;
+    h.known
+        .lock()
+        .unwrap()
+        .trust_key(other.id, DeviceKeys::generate().public_key());
+    let config = SessionConfig {
+        request_timeout: Duration::from_secs(5),
+        ..SessionConfig::default()
+    };
+    let result = request(&other, h.id, config).await.unwrap();
+    assert_eq!(
+        result.err(),
+        Some(RequestError::Denied),
+        "host refused the changed key without the app reading events"
+    );
+}

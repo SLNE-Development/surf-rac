@@ -11,13 +11,13 @@ use livekit::options::{TrackPublishOptions, VideoEncoding};
 use livekit::prelude::*;
 use livekit::webrtc::prelude::{RtcVideoSource, VideoResolution};
 use livekit::webrtc::video_source::native::NativeVideoSource;
-use surf_rac_protocol::data::{Control, DataMessage, TOPIC_POINTER};
+use surf_rac_protocol::data::{Control, DataMessage};
 use surf_rac_protocol::{ClientMessage, DenyReason, DeviceId, ServerMessage};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::channel::{Inbound, PeerChannel, SendError, Side};
+use crate::channel::{Inbound, PeerChannel, SendError, Side, topic_index};
 use crate::config::{EndReason, MAX_VIEWERS, SessionConfig};
 use crate::crypto::{self, DeviceKeys, PublicKey, SessionKey};
 use crate::pinning::{KeyChanged, KnownKeys};
@@ -26,8 +26,14 @@ use crate::room::{self, Incoming, JoinError};
 use crate::signaling::{SignalingClient, SignalingError, SignalingEvents};
 use crate::video::{self, Frame, FrameError};
 
-/// Host events the application may fall behind by before the session waits for it.
-const EVENT_CAPACITY: usize = 256;
+/// Host events buffered for the application.
+const EVENT_CAPACITY: usize = 1024;
+
+/// Event slots kept free for lifecycle events; data messages that would use them are dropped.
+const LIFECYCLE_RESERVE: usize = 64;
+
+/// How often the host checks for expired requests and viewers that did not come back.
+const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Unanswered session requests kept at once; further requests are denied.
 const MAX_PENDING: usize = 16;
@@ -69,7 +75,14 @@ pub enum HostEvent {
         /// The viewer device.
         viewer: DeviceId,
     },
-    /// A viewer left, hung up or was hung up on.
+    /// A request was not answered within the request timeout; the viewer has given up.
+    RequestExpired {
+        /// Identifies the request.
+        session_id: String,
+        /// The requesting device.
+        viewer: DeviceId,
+    },
+    /// A viewer left, hung up, was hung up on, or did not return within the reconnect window.
     ViewerLeft {
         /// The viewer device.
         viewer: DeviceId,
@@ -144,8 +157,8 @@ struct Inner {
     rotate_lock: tokio::sync::Mutex<()>,
     /// Requests and viewers.
     state: Mutex<State>,
-    /// Serializes sealing and sending so each topic's counters leave in order.
-    send_lock: tokio::sync::Mutex<()>,
+    /// Timeouts of the session.
+    config: SessionConfig,
     /// Events for the application.
     events: mpsc::Sender<HostEvent>,
     /// The event loop task.
@@ -176,6 +189,8 @@ struct Pending {
     viewer: DeviceId,
     /// Its public key.
     key: PublicKey,
+    /// When the request arrived.
+    requested_at: Instant,
 }
 
 /// An accepted viewer.
@@ -184,10 +199,16 @@ struct Viewer {
     session_id: String,
     /// Sealed data channel with it.
     channel: PeerChannel,
-    /// Whether it has joined the room.
+    /// Whether it is in the room and has been sent the current media keys.
     joined: bool,
+    /// Whether it was ever sent a media key.
+    keyed: bool,
     /// When it was accepted.
     accepted_at: Instant,
+    /// When it dropped out of the room, while it may still come back.
+    left_at: Option<Instant>,
+    /// Serialize sealing and sending per topic so each topic's counters leave in order.
+    send_locks: Arc<[tokio::sync::Mutex<()>; 3]>,
 }
 
 impl State {
@@ -214,10 +235,86 @@ impl State {
         true
     }
 
-    /// Frees the slots of accepted viewers that never joined within [`JOIN_WINDOW`].
+    /// Frees the slots of accepted viewers that were never sent a key within [`JOIN_WINDOW`].
     fn purge_stale(&mut self, now: Instant) {
         self.viewers
-            .retain(|_, v| v.joined || now.duration_since(v.accepted_at) < JOIN_WINDOW);
+            .retain(|_, v| v.keyed || now.duration_since(v.accepted_at) < JOIN_WINDOW);
+    }
+
+    /// Removes and returns requests older than `timeout`, as `(session_id, viewer)`.
+    fn expire_pending(&mut self, now: Instant, timeout: Duration) -> Vec<(String, DeviceId)> {
+        let expired: Vec<String> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| now.duration_since(p.requested_at) >= timeout)
+            .map(|(sid, _)| sid.clone())
+            .collect();
+        expired
+            .into_iter()
+            .filter_map(|sid| self.pending.remove(&sid).map(|p| (sid, p.viewer)))
+            .collect()
+    }
+
+    /// Gives `viewer` a slot for `session_id` with data channel `channel`.
+    ///
+    /// Refused when the viewer already holds a slot that was sent a media key,
+    /// or when [`MAX_VIEWERS`] other viewers hold slots. A slot the viewer holds
+    /// without a key is replaced.
+    fn admit(
+        &mut self,
+        viewer: DeviceId,
+        session_id: &str,
+        channel: PeerChannel,
+        now: Instant,
+    ) -> Result<(), DenyReason> {
+        self.purge_stale(now);
+        if self.viewers.get(&viewer).is_some_and(|v| v.keyed) {
+            return Err(DenyReason::Denied);
+        }
+        let others = self.viewers.keys().filter(|v| **v != viewer).count();
+        if others >= MAX_VIEWERS {
+            return Err(DenyReason::RoomFull);
+        }
+        self.viewers.insert(
+            viewer,
+            Viewer {
+                session_id: session_id.to_owned(),
+                channel,
+                joined: false,
+                keyed: false,
+                accepted_at: now,
+                left_at: None,
+                send_locks: Arc::default(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Records that `viewer` dropped out of the room at `now`; it may rejoin
+    /// within the reconnect window. Returns whether it was a viewer.
+    fn mark_left(&mut self, viewer: DeviceId, now: Instant) -> bool {
+        match self.viewers.get_mut(&viewer) {
+            Some(v) => {
+                v.joined = false;
+                v.left_at.get_or_insert(now);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Removes and returns viewers that dropped out longer than `window` ago.
+    fn expire_left(&mut self, now: Instant, window: Duration) -> Vec<(DeviceId, Viewer)> {
+        let expired: Vec<DeviceId> = self
+            .viewers
+            .iter()
+            .filter(|(_, v)| v.left_at.is_some_and(|at| now.duration_since(at) >= window))
+            .map(|(id, _)| *id)
+            .collect();
+        expired
+            .into_iter()
+            .filter_map(|id| self.viewers.remove(&id).map(|v| (id, v)))
+            .collect()
     }
 }
 
@@ -298,7 +395,7 @@ impl HostSession {
                 active_index: 0,
                 refused: HashMap::new(),
             }),
-            send_lock: tokio::sync::Mutex::new(()),
+            config: config.clone(),
             events,
             task: Mutex::new(None),
         });
@@ -319,6 +416,7 @@ impl HostSession {
     /// room full instead.
     pub async fn accept(&self, session_id: &str) -> Result<(), HostError> {
         let inner = &self.inner;
+        inner.expire_requests().await;
         let nonce = crypto::random_nonce();
         let (viewer, outcome) = {
             let mut st = lock(&inner.state);
@@ -326,33 +424,20 @@ impl HostSession {
                 .pending
                 .remove(session_id)
                 .ok_or(HostError::UnknownRequest)?;
-            st.purge_stale(Instant::now());
-            if st.viewers.len() >= MAX_VIEWERS {
-                (pending.viewer, Err(DenyReason::RoomFull))
-            } else {
-                match crypto::derive_session_key(
-                    &inner.keys,
-                    &pending.key,
-                    session_id,
-                    inner.device,
-                    pending.viewer,
-                    &nonce,
-                ) {
-                    Ok(key) => {
-                        st.viewers.insert(
-                            pending.viewer,
-                            Viewer {
-                                session_id: session_id.to_owned(),
-                                channel: PeerChannel::new(session_id.to_owned(), key, Side::Host),
-                                joined: false,
-                                accepted_at: Instant::now(),
-                            },
-                        );
-                        (pending.viewer, Ok(()))
-                    }
-                    Err(_) => (pending.viewer, Err(DenyReason::Denied)),
-                }
-            }
+            let outcome = crypto::derive_session_key(
+                &inner.keys,
+                &pending.key,
+                session_id,
+                inner.device,
+                pending.viewer,
+                &nonce,
+            )
+            .map_err(|_| DenyReason::Denied)
+            .and_then(|key| {
+                let channel = PeerChannel::new(session_id.to_owned(), key, Side::Host);
+                st.admit(pending.viewer, session_id, channel, Instant::now())
+            });
+            (pending.viewer, outcome)
         };
         match outcome {
             Err(reason) => inner.respond(viewer, session_id, Err(reason)).await,
@@ -447,7 +532,13 @@ impl Inner {
 
     /// Seals `msg` for `viewer` and sends it.
     async fn send(&self, viewer: DeviceId, msg: &DataMessage) -> Result<(), SendError> {
-        let _order = self.send_lock.lock().await;
+        let slot = topic_index(msg.topic()).expect("every message topic is known");
+        let locks = lock(&self.state)
+            .viewers
+            .get(&viewer)
+            .map(|v| Arc::clone(&v.send_locks))
+            .ok_or(SendError::NotConnected)?;
+        let _order = locks[slot].lock().await;
         let sealed = {
             let mut st = lock(&self.state);
             let v = st.viewers.get_mut(&viewer).ok_or(SendError::NotConnected)?;
@@ -458,15 +549,59 @@ impl Inner {
 
     /// Forgets `viewer` and reports that it left, if it was a viewer.
     ///
-    /// A viewer that had joined could still hold the media key, so the key is rotated.
+    /// A viewer that was sent a media key could still hold it, so the key is rotated.
     async fn remove_viewer(self: &Arc<Self>, viewer: DeviceId) {
         let removed = lock(&self.state).viewers.remove(&viewer);
         if let Some(v) = removed {
-            tracing::info!(viewer = %viewer, session_id = %v.session_id, "viewer left");
-            if v.joined {
-                spawn_rotation(self);
-            }
-            let _ = self.events.send(HostEvent::ViewerLeft { viewer }).await;
+            self.viewer_gone(viewer, v).await;
+        }
+    }
+
+    /// Rotates the media key if `v` held it and reports that `viewer` left.
+    async fn viewer_gone(self: &Arc<Self>, viewer: DeviceId, v: Viewer) {
+        tracing::info!(viewer = %viewer, session_id = %v.session_id, "viewer left");
+        if v.keyed {
+            spawn_rotation(self);
+        }
+        let _ = self.events.send(HostEvent::ViewerLeft { viewer }).await;
+    }
+
+    /// Drops requests the viewer has given up on and reports each one.
+    async fn expire_requests(&self) {
+        let expired = lock(&self.state).expire_pending(Instant::now(), self.config.request_timeout);
+        for (session_id, viewer) in expired {
+            tracing::info!(viewer = %viewer, %session_id, "session request expired");
+            let _ = self
+                .events
+                .send(HostEvent::RequestExpired { session_id, viewer })
+                .await;
+        }
+    }
+
+    /// Ends the sessions of viewers that dropped out and did not return within the reconnect window.
+    async fn expire_departed(self: &Arc<Self>) {
+        let gone = lock(&self.state).expire_left(Instant::now(), self.config.reconnect_window);
+        for (viewer, v) in gone {
+            self.viewer_gone(viewer, v).await;
+        }
+    }
+
+    /// Records that `viewer` dropped out of the room; it keeps its slot for the reconnect window.
+    fn on_viewer_dropped(&self, viewer: DeviceId) {
+        if lock(&self.state).mark_left(viewer, Instant::now()) {
+            tracing::info!(viewer = %viewer, "viewer dropped out, waiting for it to return");
+        }
+    }
+
+    /// Hands a data message to the application unless its event buffer is nearly full.
+    ///
+    /// The last [`LIFECYCLE_RESERVE`] slots are kept for lifecycle events, so a
+    /// flood of data never blocks the session.
+    fn emit_data(&self, event: HostEvent) {
+        if self.events.capacity() > LIFECYCLE_RESERVE {
+            let _ = self.events.try_send(event);
+        } else {
+            tracing::warn!(device_id = %self.device, "application not reading events, data message dropped");
         }
     }
 
@@ -480,6 +615,7 @@ impl Inner {
     /// viewer that was accepted but never joined may request again; accepting
     /// that request replaces its old slot.
     async fn on_request(&self, viewer: DeviceId, session_id: String, key: String) {
+        self.expire_requests().await;
         let decision = match PublicKey::from_base64(&key) {
             Err(_) => Err(DenyReason::Denied),
             Ok(key) => {
@@ -493,8 +629,14 @@ impl Inner {
                     match lock(&self.known).check(viewer, &key) {
                         Err(changed) => Ok(Err(changed)),
                         Ok(()) => {
-                            st.pending
-                                .insert(session_id.clone(), Pending { viewer, key });
+                            st.pending.insert(
+                                session_id.clone(),
+                                Pending {
+                                    viewer,
+                                    key,
+                                    requested_at: Instant::now(),
+                                },
+                            );
                             Ok(Ok(key.fingerprint()))
                         }
                     }
@@ -541,6 +683,8 @@ impl Inner {
             match st.viewers.get_mut(&viewer) {
                 Some(v) if !v.joined => {
                     v.joined = true;
+                    v.keyed = true;
+                    v.left_at = None;
                     keys
                 }
                 _ => return,
@@ -575,12 +719,7 @@ impl Inner {
             }
             Inbound::Message(DataMessage::Control(Control::MediaKey { .. })) => {}
             Inbound::Message(message) => {
-                let event = HostEvent::DataReceived { viewer, message };
-                if incoming.topic == TOPIC_POINTER {
-                    let _ = self.events.try_send(event);
-                } else {
-                    let _ = self.events.send(event).await;
-                }
+                self.emit_data(HostEvent::DataReceived { viewer, message });
             }
             Inbound::Dropped => {}
             Inbound::UnknownVersion(version) => {
@@ -605,7 +744,8 @@ async fn run(
     mut watch: ReconnectWatch,
 ) {
     let (incoming_tx, mut incoming_rx) = mpsc::unbounded_channel();
-    let gate = room::StreamGate::new();
+    let mut gates: HashMap<String, room::StreamGate> = HashMap::new();
+    let mut housekeeping = tokio::time::interval(HOUSEKEEPING_INTERVAL);
     let mut signaling_open = true;
     let reason = loop {
         tokio::select! {
@@ -627,7 +767,7 @@ async fn run(
                 }
                 Some(RoomEvent::ParticipantDisconnected(p)) => {
                     if let Ok(viewer) = p.identity().0.parse() {
-                        inner.remove_viewer(viewer).await;
+                        inner.on_viewer_dropped(viewer);
                     }
                 }
                 Some(RoomEvent::DataReceived { payload, topic: Some(topic), participant: Some(p), .. }) => {
@@ -639,7 +779,10 @@ async fn run(
                         .parse()
                         .is_ok_and(|viewer| lock(&inner.state).viewers.contains_key(&viewer));
                     if let (true, Some(reader)) = (from_viewer, reader.take()) {
-                        room::read_clipboard_stream(reader, topic, participant_identity.0, &gate, incoming_tx.clone());
+                        let gate = gates
+                            .entry(participant_identity.0.clone())
+                            .or_insert_with(room::StreamGate::new);
+                        room::read_clipboard_stream(reader, topic, participant_identity.0, gate, incoming_tx.clone());
                     }
                 }
                 Some(RoomEvent::LocalTrackPublished { .. } | RoomEvent::LocalTrackRepublished { .. }) => {
@@ -660,6 +803,15 @@ async fn run(
                 Some(_) => {}
             },
             Some(incoming) = incoming_rx.recv() => inner.on_data(incoming).await,
+            _ = housekeeping.tick() => {
+                inner.expire_requests().await;
+                inner.expire_departed().await;
+                gates.retain(|identity, _| {
+                    identity
+                        .parse()
+                        .is_ok_and(|viewer| lock(&inner.state).viewers.contains_key(&viewer))
+                });
+            }
             _ = watch.expired() => break EndReason::Timeout,
         }
     };
@@ -672,7 +824,8 @@ async fn run(
 ///
 /// The new key goes to every remaining joined viewer at the next key index;
 /// after [`KEY_SWITCH_DELAY`] the host encrypts with it. Viewers that left
-/// keep only older keys and cannot decrypt frames from then on.
+/// keep only older keys and cannot decrypt frames from then on. A viewer the
+/// new key could not be sent to is hung up on, since it could no longer decrypt.
 fn spawn_rotation(inner: &Arc<Inner>) {
     let inner = Arc::clone(inner);
     tokio::spawn(async move {
@@ -690,9 +843,11 @@ fn spawn_rotation(inner: &Arc<Inner>) {
             (st.media_index, *st.media_key.as_bytes(), remaining)
         };
         let msg = DataMessage::Control(Control::MediaKey { index, key });
+        let mut failed = Vec::new();
         for viewer in remaining {
             if let Err(err) = inner.send(viewer, &msg).await {
-                tracing::warn!(viewer = %viewer, error = %err, "sending rotated media key failed");
+                tracing::warn!(viewer = %viewer, error = %err, "sending rotated media key failed, ending its session");
+                failed.push(viewer);
             }
         }
         tokio::time::sleep(KEY_SWITCH_DELAY).await;
@@ -707,6 +862,13 @@ fn spawn_rotation(inner: &Arc<Inner>) {
         }
         sync_own_key_index(&inner.room, &own, index);
         tracing::info!(device_id = %inner.device, index, "media key rotated");
+        drop(_serial);
+        for viewer in failed {
+            let _ = inner
+                .send(viewer, &DataMessage::Control(Control::Hangup))
+                .await;
+            inner.remove_viewer(viewer).await;
+        }
     });
 }
 
@@ -758,6 +920,99 @@ mod tests {
             active_index,
             refused: HashMap::new(),
         }
+    }
+
+    fn id(n: u32) -> DeviceId {
+        DeviceId::new(100_000_000 + n).unwrap()
+    }
+
+    fn channel(sid: &str) -> PeerChannel {
+        PeerChannel::new(sid.into(), SessionKey::from_bytes([1; 32]), Side::Host)
+    }
+
+    fn pending(st: &mut State, sid: &str, viewer: DeviceId, at: Instant) {
+        st.pending.insert(
+            sid.into(),
+            Pending {
+                viewer,
+                key: PublicKey::from_bytes([5; 32]),
+                requested_at: at,
+            },
+        );
+    }
+
+    #[test]
+    fn pending_requests_expire() {
+        let mut st = state(0, 0);
+        let t0 = Instant::now();
+        pending(&mut st, "old", id(1), t0);
+        pending(&mut st, "new", id(2), t0 + Duration::from_secs(50));
+        let gone = st.expire_pending(t0 + Duration::from_secs(61), Duration::from_secs(60));
+        assert_eq!(gone, vec![("old".to_owned(), id(1))]);
+        assert!(st.pending.contains_key("new"));
+    }
+
+    #[test]
+    fn keyed_viewer_cannot_be_replaced() {
+        let mut st = state(0, 0);
+        let now = Instant::now();
+        st.admit(id(1), "s1", channel("s1"), now).unwrap();
+        st.viewers.get_mut(&id(1)).unwrap().keyed = true;
+        assert_eq!(
+            st.admit(id(1), "s2", channel("s2"), now),
+            Err(DenyReason::Denied)
+        );
+        assert_eq!(st.viewers[&id(1)].session_id, "s1");
+    }
+
+    #[test]
+    fn unkeyed_slot_is_replaced_without_counting_twice() {
+        let mut st = state(0, 0);
+        let now = Instant::now();
+        for n in 1..=MAX_VIEWERS as u32 {
+            st.admit(id(n), "s", channel("s"), now).unwrap();
+        }
+        st.admit(id(1), "again", channel("again"), now).unwrap();
+        assert_eq!(st.viewers[&id(1)].session_id, "again");
+        assert_eq!(
+            st.admit(id(99), "s", channel("s"), now),
+            Err(DenyReason::RoomFull)
+        );
+    }
+
+    #[test]
+    fn stale_unkeyed_slots_are_freed() {
+        let mut st = state(0, 0);
+        let t0 = Instant::now();
+        for n in 1..=MAX_VIEWERS as u32 {
+            st.admit(id(n), "s", channel("s"), t0).unwrap();
+        }
+        st.viewers.get_mut(&id(1)).unwrap().keyed = true;
+        st.admit(id(99), "s", channel("s"), t0 + JOIN_WINDOW)
+            .unwrap();
+        assert!(st.viewers.contains_key(&id(1)), "keyed viewer kept");
+        assert_eq!(st.viewers.len(), 2);
+    }
+
+    #[test]
+    fn viewer_that_drops_out_expires_after_window() {
+        let mut st = state(0, 0);
+        let t0 = Instant::now();
+        st.admit(id(1), "s", channel("s"), t0).unwrap();
+        st.viewers.get_mut(&id(1)).unwrap().joined = true;
+        assert!(st.mark_left(id(1), t0));
+        assert!(!st.viewers[&id(1)].joined, "a rejoin gets the keys again");
+        assert!(!st.mark_left(id(2), t0));
+        assert!(
+            st.expire_left(t0 + Duration::from_secs(29), Duration::from_secs(30))
+                .is_empty()
+        );
+        let gone = st.expire_left(t0 + Duration::from_secs(31), Duration::from_secs(30));
+        assert_eq!(
+            gone.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
+            vec![id(1)]
+        );
+        assert!(st.viewers.is_empty());
     }
 
     #[test]

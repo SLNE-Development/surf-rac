@@ -28,6 +28,11 @@ impl ReconnectWatch {
         }
     }
 
+    /// Returns whether a reconnect attempt is in progress.
+    pub fn is_reconnecting(&self) -> bool {
+        self.deadline.is_some()
+    }
+
     /// Records that the connection was restored.
     pub fn reconnected(&mut self) {
         self.deadline = None;

@@ -7,6 +7,7 @@ use livekit::prelude::*;
 use livekit::webrtc::prelude::IceTransportsType;
 use livekit::{ByteStreamReader, StreamByteOptions, StreamReader};
 use std::sync::Arc;
+use std::time::Duration;
 use surf_rac_protocol::DeviceId;
 use surf_rac_protocol::data::{MAX_CLIPBOARD_BYTES, TOPIC_CLIPBOARD};
 
@@ -18,10 +19,13 @@ use crate::channel::SendError;
 /// Largest sealed clipboard stream accepted: the item limit plus sealing overhead.
 const MAX_CLIPBOARD_STREAM_BYTES: usize = MAX_CLIPBOARD_BYTES + 1024;
 
-/// Clipboard streams a session reads at the same time; further streams are discarded.
+/// Clipboard streams read at the same time from one peer; further streams are discarded.
 const MAX_CONCURRENT_STREAMS: usize = 2;
 
-/// Limits how many clipboard streams a session buffers at once.
+/// Longest time a clipboard stream may take to arrive completely.
+const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Limits how many clipboard streams are buffered at once from one peer.
 #[derive(Clone)]
 pub(crate) struct StreamGate(Arc<Semaphore>);
 
@@ -169,13 +173,27 @@ pub(crate) fn read_clipboard_stream(
         let _permit = permit;
         let mut reader = reader;
         let mut payload = Vec::new();
-        while let Some(chunk) = reader.next().await {
-            let Ok(chunk) = chunk else { return };
-            if payload.len() + chunk.len() > MAX_CLIPBOARD_STREAM_BYTES {
-                tracing::warn!(from = %from, "clipboard stream over the size limit dropped");
+        let read = tokio::time::timeout(STREAM_READ_TIMEOUT, async {
+            while let Some(chunk) = reader.next().await {
+                let chunk = chunk.map_err(|_| "stream failed")?;
+                if payload.len() + chunk.len() > MAX_CLIPBOARD_STREAM_BYTES {
+                    return Err("stream over the size limit");
+                }
+                payload.extend_from_slice(&chunk);
+            }
+            Ok(())
+        })
+        .await;
+        match read {
+            Ok(Ok(())) => {}
+            Ok(Err(reason)) => {
+                tracing::warn!(from = %from, reason, "clipboard stream dropped");
                 return;
             }
-            payload.extend_from_slice(&chunk);
+            Err(_) => {
+                tracing::warn!(from = %from, "clipboard stream timed out");
+                return;
+            }
         }
         let _ = out.send(Incoming {
             from,

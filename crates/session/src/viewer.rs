@@ -25,6 +25,9 @@ use crate::room::{self, Incoming, JoinError};
 use crate::signaling::{SignalingClient, SignalingError};
 use crate::video::{self, Frame};
 
+/// Number of media key indices the frame-decryption key ring holds.
+const KEY_RING_SIZE: u8 = 16;
+
 /// Viewer events buffered for the application; frames beyond this are dropped.
 const EVENT_CAPACITY: usize = 64;
 
@@ -276,6 +279,12 @@ impl Inner {
         }
         let outcome = lock(&self.channel).open(&incoming.topic, &incoming.payload);
         match outcome {
+            Inbound::Message(DataMessage::Control(Control::MediaKey { index, .. }))
+                if index >= KEY_RING_SIZE =>
+            {
+                tracing::warn!(host = %self.host, index, "media key index outside the key ring ignored");
+                (None, None)
+            }
             Inbound::Message(DataMessage::Control(Control::MediaKey { index, key })) => {
                 self.key_provider.set_key(
                     &room::identity(self.host),
@@ -548,6 +557,25 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn media_key_outside_key_ring_is_ignored() {
+        let (inner, _tx, _events) = loop_on_simulated_events(Duration::from_secs(30)).await;
+        let mut host = PeerChannel::new("s1".into(), SessionKey::from_bytes([1; 32]), Side::Host);
+        let bad = host
+            .seal(&DataMessage::Control(Control::MediaKey {
+                index: 16,
+                key: [4; 32],
+            }))
+            .unwrap();
+        let incoming = Incoming {
+            from: "123456789".into(),
+            topic: surf_rac_protocol::data::TOPIC_INPUT.into(),
+            payload: bad,
+        };
+        assert!(matches!(inner.on_data(incoming), (None, None)));
+        assert_eq!(*lock(&inner.media_index), None);
     }
 
     #[tokio::test(flavor = "multi_thread")]

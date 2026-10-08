@@ -5,4 +5,7 @@ pub mod access;
 pub mod api;
 pub mod dpapi;
 pub mod fingerprint;
+pub mod keys;
 pub mod store;
+pub mod viewmap;
+pub mod yuv;

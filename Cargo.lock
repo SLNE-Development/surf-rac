@@ -3263,6 +3263,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "hmac",
+ "livekit",
  "reqwest",
  "serde",
  "serde_json",

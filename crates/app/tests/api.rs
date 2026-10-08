@@ -1,5 +1,6 @@
 //! The app's API client against an in-process signaling server.
 
+#[allow(clippy::collapsible_if)]
 #[path = "../../session/tests/common/mod.rs"]
 mod common;
 

@@ -367,7 +367,7 @@ impl HostSession {
                 JoinError::Rejected => StartError::MediaUnavailable("token rejected".into()),
                 JoinError::Unavailable(reason) => StartError::MediaUnavailable(reason),
             })?;
-        let video = publish_video(&lk_room, VideoInput::Raw, width, height)
+        let video = publish_video(&lk_room, &room::identity(device), 0, VideoInput::Raw, width, height)
             .await
             .map_err(StartError::MediaUnavailable)?;
         tracing::info!(device_id = %device, "hosting started");
@@ -517,9 +517,13 @@ impl HostSession {
             .unpublish_track(&old)
             .await
             .map_err(|e| StartError::MediaUnavailable(e.to_string()))?;
-        let video = publish_video(&self.inner.room, input, width, height)
+        let own = room::identity(self.inner.device);
+        let index = lock(&self.inner.state).active_index;
+        let video = publish_video(&self.inner.room, &own, index, input, width, height)
             .await
             .map_err(StartError::MediaUnavailable)?;
+        let index = lock(&self.inner.state).active_index;
+        sync_own_key_index(&self.inner.room, &own, index);
         tracing::info!(device_id = %self.inner.device, ?input, "video input switched");
         *lock(&self.inner.video) = video;
         Ok(())
@@ -582,8 +586,13 @@ impl HostSession {
 }
 
 /// Publishes a `width` x `height` H.264 screen track in `room` fed by `input`.
+///
+/// The track's frame cryptor encrypts with key `key_index` of `own` from its
+/// first frame on.
 async fn publish_video(
     room: &Room,
+    own: &ParticipantIdentity,
+    key_index: u8,
     input: VideoInput,
     width: u32,
     height: u32,
@@ -619,6 +628,7 @@ async fn publish_video(
         )
         .await
         .map_err(|e| e.to_string())?;
+    sync_own_key_index(room, own, key_index);
     Ok(Video {
         source,
         input,
@@ -1183,6 +1193,30 @@ mod tests {
             .map(|c| c.key_index())
             .collect();
         assert_eq!(after, vec![3, 3]);
+        lk_room.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn republished_video_encrypts_with_active_key_at_once() {
+        let now = unix_now();
+        let own = room::identity(DeviceId::new(123_456_788).unwrap());
+        let token = mint_token(&room_name(), &own.0, now, now + 60);
+        let keys = room::key_provider();
+        keys.set_key(&own, 0, vec![1; 32]);
+        keys.set_key(&own, 5, vec![2; 32]);
+        let (lk_room, _events) = room::connect(&env("LIVEKIT_URL"), &token, &keys, false)
+            .await
+            .unwrap();
+        for input in [VideoInput::Raw, VideoInput::Encoded] {
+            publish_video(&lk_room, &own, 5, input, 64, 64).await.unwrap();
+        }
+        let indices: Vec<i32> = lk_room
+            .e2ee_manager()
+            .frame_cryptors()
+            .values()
+            .map(|c| c.key_index())
+            .collect();
+        assert_eq!(indices, vec![5, 5]);
         lk_room.close().await.unwrap();
     }
 }

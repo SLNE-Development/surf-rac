@@ -495,8 +495,10 @@ impl HostSession {
 
     /// Replaces the video track with one fed by `input` at `width` x `height`.
     ///
-    /// Does nothing when the track already takes `input`. Viewers subscribe to
-    /// the new track on their own; frame encryption keys are unchanged.
+    /// Does nothing when the track already takes `input`. The new track is
+    /// published before the old one is removed, so a failed switch leaves the
+    /// old track and input in place. Viewers subscribe to the new track on
+    /// their own; frame encryption keys are unchanged.
     pub async fn set_video_input(
         &self,
         input: VideoInput,
@@ -504,27 +506,20 @@ impl HostSession {
         height: u32,
     ) -> Result<(), StartError> {
         let _switch = self.inner.video_switch.lock().await;
-        let old = {
-            let video = lock(&self.inner.video);
-            if video.input == input {
-                return Ok(());
-            }
-            video.sid.clone()
-        };
-        self.inner
-            .room
-            .local_participant()
-            .unpublish_track(&old)
-            .await
-            .map_err(|e| StartError::MediaUnavailable(e.to_string()))?;
+        if lock(&self.inner.video).input == input {
+            return Ok(());
+        }
         let own = room::identity(self.inner.device);
         let index = lock(&self.inner.state).active_index;
         let video = publish_video(&self.inner.room, &own, index, input, width, height)
             .await
             .map_err(StartError::MediaUnavailable)?;
         self.inner.sync_key_index();
+        let old = std::mem::replace(&mut *lock(&self.inner.video), video).sid;
         tracing::info!(device_id = %self.inner.device, ?input, "video input switched");
-        *lock(&self.inner.video) = video;
+        if let Err(e) = self.inner.room.local_participant().unpublish_track(&old).await {
+            tracing::warn!(device_id = %self.inner.device, error = %e, "removing the previous video track failed");
+        }
         Ok(())
     }
 

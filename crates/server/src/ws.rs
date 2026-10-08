@@ -239,6 +239,7 @@ fn handle_text(
             accepted,
             reason,
             host_public_key,
+            host_nonce,
         } => {
             if !valid_session_id(&session_id) {
                 return Some(bad_session_id());
@@ -246,6 +247,7 @@ fn handle_text(
             if host_public_key
                 .as_deref()
                 .is_some_and(|k| !valid_public_key(k))
+                || host_nonce.as_deref().is_some_and(|n| !valid_public_key(n))
             {
                 return Some(bad_public_key());
             }
@@ -259,6 +261,7 @@ fn handle_text(
                     accepted,
                     reason,
                     host_public_key,
+                    host_nonce,
                 },
             )
         }
@@ -325,7 +328,7 @@ fn valid_session_id(session_id: &str) -> bool {
     (1..=MAX_SESSION_ID_CHARS).contains(&session_id.chars().count())
 }
 
-/// Returns whether `key` is standard base64 of exactly 32 bytes.
+/// Returns whether `key` (a public key or nonce) is standard base64 of exactly 32 bytes.
 fn valid_public_key(key: &str) -> bool {
     STANDARD.decode(key).is_ok_and(|bytes| bytes.len() == 32)
 }
@@ -342,7 +345,7 @@ fn bad_session_id() -> ServerMessage {
 fn bad_public_key() -> ServerMessage {
     error(
         WsErrorCode::BadMessage,
-        "public key must be base64 of 32 bytes",
+        "public key and nonce must be base64 of 32 bytes",
     )
 }
 

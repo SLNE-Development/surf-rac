@@ -290,6 +290,9 @@ pub enum ClientMessage {
         /// The host device's X25519 public key, standard base64 of 32 bytes, when accepted.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         host_public_key: Option<String>,
+        /// Random bytes the host chose for this session's key, standard base64 of 32 bytes, when accepted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host_nonce: Option<String>,
     },
     /// Ask for a LiveKit token for this device's own room; answered with `host_token`.
     HostTokenRequest,
@@ -349,6 +352,9 @@ pub enum ServerMessage {
         /// The host device's X25519 public key, standard base64 of 32 bytes, when accepted.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         host_public_key: Option<String>,
+        /// Random bytes the host chose for this session's key, standard base64 of 32 bytes, when accepted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host_nonce: Option<String>,
     },
     /// LiveKit join token for this device's own room.
     HostToken {
@@ -537,6 +543,7 @@ mod tests {
             accepted: false,
             reason: Some(DenyReason::RoomFull),
             host_public_key: None,
+            host_nonce: None,
         };
         assert_eq!(
             serde_json::to_value(&msg).unwrap(),

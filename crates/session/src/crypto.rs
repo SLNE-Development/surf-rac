@@ -178,7 +178,9 @@ impl fmt::Debug for SessionKey {
 /// Derives the pairwise session key of `host` and `viewer` for `session_id`.
 ///
 /// Both sides get the same key: each passes its own key pair and the other's
-/// public key. Fails with [`CryptoError::LowOrderPoint`] when the peer key
+/// public key, plus the `host_nonce` the host chose when accepting. A fresh
+/// nonce makes every accepted session use a new key, even for a repeated
+/// request. Fails with [`CryptoError::LowOrderPoint`] when the peer key
 /// yields an all-zero shared secret.
 pub fn derive_session_key(
     own: &DeviceKeys,
@@ -186,6 +188,7 @@ pub fn derive_session_key(
     session_id: &str,
     host: DeviceId,
     viewer: DeviceId,
+    host_nonce: &[u8; 32],
 ) -> Result<SessionKey, CryptoError> {
     let shared = own
         .secret
@@ -196,8 +199,10 @@ pub fn derive_session_key(
     let mut info = KDF_INFO.to_vec();
     info.extend_from_slice(host.to_string().as_bytes());
     info.extend_from_slice(viewer.to_string().as_bytes());
+    let mut salt = session_id.as_bytes().to_vec();
+    salt.extend_from_slice(host_nonce);
     let mut key = [0u8; 32];
-    Hkdf::<Sha256>::new(Some(session_id.as_bytes()), shared.as_bytes())
+    Hkdf::<Sha256>::new(Some(&salt), shared.as_bytes())
         .expand(&info, &mut key)
         .expect("32 bytes is a valid HKDF-SHA256 output length");
     Ok(SessionKey(key))
@@ -246,6 +251,13 @@ pub fn open(
         .map_err(|_| CryptoError::Decrypt)
 }
 
+/// Returns 32 random bytes for use as a host nonce.
+pub fn random_nonce() -> [u8; 32] {
+    let mut nonce = [0u8; 32];
+    OsRng.fill_bytes(&mut nonce);
+    nonce
+}
+
 /// Returns the AEAD cipher keyed with `key`.
 fn cipher(key: &SessionKey) -> ChaCha20Poly1305 {
     ChaCha20Poly1305::new(Key::from_slice(&key.0))
@@ -275,13 +287,27 @@ mod tests {
     fn both_sides_derive_same_key() {
         let (h, v) = (DeviceKeys::generate(), DeviceKeys::generate());
         let (hid, vid) = ids();
-        let a = derive_session_key(&h, &v.public_key(), "s1", hid, vid).unwrap();
-        let b = derive_session_key(&v, &h.public_key(), "s1", hid, vid).unwrap();
+        let a = derive_session_key(&h, &v.public_key(), "s1", hid, vid, &[9; 32]).unwrap();
+        let b = derive_session_key(&v, &h.public_key(), "s1", hid, vid, &[9; 32]).unwrap();
         assert_eq!(a.as_bytes(), b.as_bytes());
-        let c = derive_session_key(&h, &v.public_key(), "s2", hid, vid).unwrap();
+        let c = derive_session_key(&h, &v.public_key(), "s2", hid, vid, &[9; 32]).unwrap();
         assert_ne!(a.as_bytes(), c.as_bytes());
-        let d = derive_session_key(&h, &v.public_key(), "s1", vid, hid).unwrap();
+        let d = derive_session_key(&h, &v.public_key(), "s1", vid, hid, &[9; 32]).unwrap();
         assert_ne!(a.as_bytes(), d.as_bytes());
+    }
+
+    #[test]
+    fn replayed_request_gets_fresh_key() {
+        let (h, v) = (DeviceKeys::generate(), DeviceKeys::generate());
+        let (hid, vid) = ids();
+        let first = derive_session_key(&h, &v.public_key(), "s1", hid, vid, &[1; 32]).unwrap();
+        let replay = derive_session_key(&h, &v.public_key(), "s1", hid, vid, &[2; 32]).unwrap();
+        assert_ne!(first.as_bytes(), replay.as_bytes());
+        let recorded = seal(&first, "surf-rac/input", "s1", b"keystroke");
+        assert_eq!(
+            open(&replay, "surf-rac/input", "s1", &recorded),
+            Err(CryptoError::Decrypt)
+        );
     }
 
     #[test]
@@ -290,7 +316,7 @@ mod tests {
         let zero = PublicKey::from_bytes([0; 32]);
         let (hid, vid) = ids();
         assert_eq!(
-            derive_session_key(&h, &zero, "s", hid, vid).unwrap_err(),
+            derive_session_key(&h, &zero, "s", hid, vid, &[9; 32]).unwrap_err(),
             CryptoError::LowOrderPoint
         );
     }

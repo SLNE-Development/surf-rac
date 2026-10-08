@@ -4,6 +4,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
+use base64::Engine;
 use common::{TestEnv, accept_next, collect_stamps, feed_frames, host_event, request, start_host};
 use sqlx::PgPool;
 use surf_rac_protocol::{ClientMessage, ServerMessage};
@@ -231,6 +232,7 @@ async fn livekit_unreachable(pool: PgPool) {
             accepted: true,
             reason: None,
             host_public_key: Some(h.keys.public_key().to_base64()),
+            host_nonce: Some(base64::engine::general_purpose::STANDARD.encode([3u8; 32])),
         })
         .await
         .unwrap();

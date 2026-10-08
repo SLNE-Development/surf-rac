@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use livekit::options::{TrackPublishOptions, VideoEncoding};
 use livekit::prelude::*;
 use livekit::webrtc::prelude::{RtcVideoSource, VideoResolution};
@@ -317,6 +319,7 @@ impl HostSession {
     /// room full instead.
     pub async fn accept(&self, session_id: &str) -> Result<(), HostError> {
         let inner = &self.inner;
+        let nonce = crypto::random_nonce();
         let (viewer, outcome) = {
             let mut st = lock(&inner.state);
             let pending = st
@@ -333,6 +336,7 @@ impl HostSession {
                     session_id,
                     inner.device,
                     pending.viewer,
+                    &nonce,
                 ) {
                     Ok(key) => {
                         st.viewers.insert(
@@ -351,10 +355,10 @@ impl HostSession {
             }
         };
         match outcome {
-            Err(reason) => inner.respond(viewer, session_id, Some(reason)).await,
+            Err(reason) => inner.respond(viewer, session_id, Err(reason)).await,
             Ok(()) => {
                 tracing::info!(viewer = %viewer, %session_id, "session accepted");
-                inner.respond(viewer, session_id, None).await?;
+                inner.respond(viewer, session_id, Ok(&nonce)).await?;
                 inner
                     .signaling
                     .send(ClientMessage::ViewerTokenRequest {
@@ -375,7 +379,7 @@ impl HostSession {
             .ok_or(HostError::UnknownRequest)?;
         tracing::info!(viewer = %pending.viewer, %session_id, "session denied");
         self.inner
-            .respond(pending.viewer, session_id, Some(DenyReason::Denied))
+            .respond(pending.viewer, session_id, Err(DenyReason::Denied))
             .await
     }
 
@@ -412,20 +416,30 @@ impl HostSession {
 }
 
 impl Inner {
-    /// Answers `viewer`'s request `session_id`: accepted when `deny` is `None`.
+    /// Answers `viewer`'s request `session_id`: accepted with the session's
+    /// host nonce, or refused with a reason.
     async fn respond(
         &self,
         viewer: DeviceId,
         session_id: &str,
-        deny: Option<DenyReason>,
+        answer: Result<&[u8; 32], DenyReason>,
     ) -> Result<(), HostError> {
+        let (reason, host_public_key, host_nonce) = match answer {
+            Ok(nonce) => (
+                None,
+                Some(self.keys.public_key().to_base64()),
+                Some(STANDARD.encode(nonce)),
+            ),
+            Err(reason) => (Some(reason), None, None),
+        };
         self.signaling
             .send(ClientMessage::SessionResponse {
                 to: viewer,
                 session_id: session_id.to_owned(),
-                accepted: deny.is_none(),
-                reason: deny,
-                host_public_key: deny.is_none().then(|| self.keys.public_key().to_base64()),
+                accepted: answer.is_ok(),
+                reason,
+                host_public_key,
+                host_nonce,
             })
             .await?;
         Ok(())
@@ -508,12 +522,12 @@ impl Inner {
                 tracing::warn!(viewer = %viewer, %session_id, "viewer key changed, request refused");
                 let _ = self.events.send(HostEvent::KeyChanged(changed)).await;
                 let _ = self
-                    .respond(viewer, &session_id, Some(DenyReason::KeyChanged))
+                    .respond(viewer, &session_id, Err(DenyReason::KeyChanged))
                     .await;
             }
             Err(reason) => {
                 tracing::info!(viewer = %viewer, %session_id, "session request refused");
-                let _ = self.respond(viewer, &session_id, Some(reason)).await;
+                let _ = self.respond(viewer, &session_id, Err(reason)).await;
             }
             Ok(Ok(_)) => {}
         }

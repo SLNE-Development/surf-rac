@@ -3,6 +3,8 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use futures_util::StreamExt;
 use livekit::e2ee::key_provider::KeyProvider;
 use livekit::prelude::*;
@@ -143,6 +145,7 @@ impl ViewerSession {
                         accepted,
                         reason,
                         host_public_key,
+                        host_nonce,
                     }) if from == host && sid == session_id => {
                         if !accepted {
                             return Err(match reason {
@@ -155,9 +158,20 @@ impl ViewerSession {
                             .and_then(|k| PublicKey::from_base64(k).ok())
                             .ok_or(RequestError::Denied)?;
                         lock(&known).check(host, &host_key)?;
-                        let derived =
-                            crypto::derive_session_key(&keys, &host_key, &session_id, host, viewer)
-                                .map_err(|_| RequestError::Denied)?;
+                        let nonce: [u8; 32] = host_nonce
+                            .as_deref()
+                            .and_then(|n| STANDARD.decode(n).ok())
+                            .and_then(|n| n.try_into().ok())
+                            .ok_or(RequestError::Denied)?;
+                        let derived = crypto::derive_session_key(
+                            &keys,
+                            &host_key,
+                            &session_id,
+                            host,
+                            viewer,
+                            &nonce,
+                        )
+                        .map_err(|_| RequestError::Denied)?;
                         key = Some(derived);
                     }
                     Some(ServerMessage::ViewerToken {

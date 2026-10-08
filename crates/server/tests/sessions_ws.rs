@@ -95,13 +95,13 @@ async fn session_response_is_relayed(pool: PgPool) {
     let mut bob = app.online_device("bob", 2).await;
     send(
         &mut alice.ws,
-        json!({"type":"session_response","to":bob.id,"session_id":"s1","accepted":true,"host_public_key":key_b64()}),
+        json!({"type":"session_response","to":bob.id,"session_id":"s1","accepted":true,"host_public_key":key_b64(),"host_nonce":key_b64()}),
     )
     .await;
     let got = recv_type(&mut bob.ws, "session_response").await;
     assert_eq!(
         got,
-        json!({"type":"session_response","from":alice.id,"session_id":"s1","accepted":true,"host_public_key":key_b64()})
+        json!({"type":"session_response","from":alice.id,"session_id":"s1","accepted":true,"host_public_key":key_b64(),"host_nonce":key_b64()})
     );
     send(
         &mut alice.ws,
@@ -208,5 +208,22 @@ async fn viewer_token_to_offline_viewer(pool: PgPool) {
     assert_eq!(
         recv_type(&mut alice.ws, "error").await["code"],
         "target_offline"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn session_response_rejects_bad_nonce(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let mut alice = app.online_device("alice", 1).await;
+    let bob = app.online_device("bob", 2).await;
+    send(
+        &mut alice.ws,
+        json!({"type":"session_response","to":bob.id,"session_id":"s1","accepted":true,
+               "host_public_key":key_b64(),"host_nonce":"AAAA"}),
+    )
+    .await;
+    assert_eq!(
+        recv_type(&mut alice.ws, "error").await["code"],
+        "bad_message"
     );
 }

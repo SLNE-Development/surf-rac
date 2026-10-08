@@ -1,0 +1,4 @@
+# The prebuilt libwebrtc that the LiveKit SDK links on Windows uses the static
+# C runtime, so Rust code on that target must link it statically as well.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

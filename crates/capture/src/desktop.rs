@@ -8,7 +8,7 @@
 use std::sync::{Arc, Mutex};
 
 use livekit::webrtc::desktop_capturer::{
-    CaptureError as LkCaptureError, CaptureSource, DesktopCaptureSourceType, DesktopCapturer,
+    CaptureError as LkCaptureError, DesktopCaptureSourceType, DesktopCapturer,
     DesktopCapturerOptions,
 };
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
@@ -61,20 +61,18 @@ impl DesktopSource {
 impl FrameSource for DesktopSource {
     /// Lists the monitors the capturer can capture, in DXGI order.
     ///
-    /// A monitor is matched to a capturer source by its monitor handle, or
-    /// otherwise by its position among the attached outputs.
+    /// Monitors without a matching capturer source are left out; see [`match_sources`].
     fn monitors(&mut self) -> Result<Vec<SourceMonitor>, CaptureError> {
         let outputs = dxgi_outputs().map_err(|_| CaptureError::Temporary)?;
-        let sources = new_capturer()?.get_source_list();
-        let ids: Vec<u64> = sources.iter().map(CaptureSource::id).collect();
+        let sources: Vec<(u64, String)> = new_capturer()?
+            .get_source_list()
+            .iter()
+            .map(|s| (s.id(), s.title()))
+            .collect();
+        let ids = match_sources(&outputs, &sources);
         let mut monitors = Vec::new();
         self.source_ids.clear();
-        for (i, out) in outputs.iter().enumerate() {
-            let id = ids
-                .iter()
-                .copied()
-                .find(|id| *id == out.hmonitor)
-                .or_else(|| ids.get(i).copied());
+        for (out, id) in outputs.iter().zip(ids) {
             if let Some(id) = id {
                 self.source_ids.push(id);
                 monitors.push(SourceMonitor {
@@ -130,6 +128,43 @@ impl FrameSource for DesktopSource {
     }
 }
 
+/// Returns the capturer source ID of each output, `None` where no source matches.
+///
+/// A source matches an output when its title is the output's device name
+/// (`\\.\DISPLAYn`) or its ID is the output's monitor handle. Sources
+/// without a title are otherwise taken in order, the way the duplication
+/// capturer numbers the outputs. No source is given to two outputs.
+fn match_sources(outputs: &[Output], sources: &[(u64, String)]) -> Vec<Option<u64>> {
+    let mut used = vec![false; sources.len()];
+    let take = |i: usize, used: &mut Vec<bool>| {
+        if used[i] {
+            None
+        } else {
+            used[i] = true;
+            Some(sources[i].0)
+        }
+    };
+    outputs
+        .iter()
+        .enumerate()
+        .map(|(position, out)| {
+            let device = format!(r"\\.\{}", out.name);
+            let named = sources
+                .iter()
+                .position(|(_, title)| *title == device || *title == out.name);
+            let handle = sources.iter().position(|(id, _)| *id == out.hmonitor);
+            let ordered = sources
+                .get(position)
+                .filter(|(_, title)| title.is_empty())
+                .map(|_| position);
+            named
+                .or(handle)
+                .or(ordered)
+                .and_then(|i| take(i, &mut used))
+        })
+        .collect()
+}
+
 /// Creates a screen capturer that composites the cursor into frames.
 fn new_capturer() -> Result<DesktopCapturer, CaptureError> {
     let mut options = DesktopCapturerOptions::new(DesktopCaptureSourceType::Screen);
@@ -165,5 +200,56 @@ fn dxgi_outputs() -> windows::core::Result<Vec<Output>> {
             a += 1;
         }
         Ok(outputs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Returns an output named `name` with monitor handle `hmonitor`.
+    fn out(name: &str, hmonitor: u64) -> Output {
+        Output {
+            name: name.into(),
+            width: 1920,
+            height: 1080,
+            primary: false,
+            hmonitor,
+        }
+    }
+
+    #[test]
+    fn matches_by_monitor_handle() {
+        let outputs = [out("DISPLAY1", 0x1001), out("DISPLAY2", 0x2002)];
+        let sources = [(0x2002, String::new()), (0x1001, String::new())];
+        assert_eq!(match_sources(&outputs, &sources), [Some(0x1001), Some(0x2002)]);
+    }
+
+    #[test]
+    fn matches_by_device_name_title() {
+        let outputs = [out("DISPLAY1", 1), out("DISPLAY3", 3)];
+        let sources = [(5, r"\\.\DISPLAY3".to_owned()), (0, r"\\.\DISPLAY1".to_owned())];
+        assert_eq!(match_sources(&outputs, &sources), [Some(0), Some(5)]);
+    }
+
+    #[test]
+    fn falls_back_to_position_without_titles() {
+        let outputs = [out("DISPLAY1", 11), out("DISPLAY2", 22)];
+        let sources = [(0, String::new()), (1, String::new())];
+        assert_eq!(match_sources(&outputs, &sources), [Some(0), Some(1)]);
+    }
+
+    #[test]
+    fn titled_sources_are_never_matched_by_position() {
+        let outputs = [out("DISPLAY1", 11), out("DISPLAY2", 22)];
+        let sources = [(7, r"\\.\DISPLAY9".to_owned()), (8, r"\\.\DISPLAY2".to_owned())];
+        assert_eq!(match_sources(&outputs, &sources), [None, Some(8)]);
+    }
+
+    #[test]
+    fn a_source_is_used_once() {
+        let outputs = [out("DISPLAY1", 0), out("DISPLAY2", 22)];
+        let sources = [(0, String::new())];
+        assert_eq!(match_sources(&outputs, &sources), [Some(0), None]);
     }
 }

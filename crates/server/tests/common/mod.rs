@@ -13,6 +13,9 @@ use sqlx::PgPool;
 use surf_rac_server::config::Config;
 use surf_rac_server::state::AppState;
 
+/// LiveKit API secret used by every test server.
+pub const TEST_LIVEKIT_SECRET: &str = "test-livekit-secret-0123456789abcdef";
+
 /// TURN shared secret used by every test server.
 pub const TEST_TURN_SECRET: &str = "test-turn-secret-0123";
 
@@ -38,6 +41,9 @@ pub fn test_config() -> Config {
         turn_secret: TEST_TURN_SECRET.into(),
         turn_urls: vec!["turn:turn.example:3478".into()],
         turn_ttl_secs: 3600,
+        livekit_url: "ws://livekit.example:7880".into(),
+        livekit_api_key: "testkey".into(),
+        livekit_api_secret: TEST_LIVEKIT_SECRET.into(),
         trust_forwarded_for: true,
         log_json: false,
     }

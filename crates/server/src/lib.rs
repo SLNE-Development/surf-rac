@@ -12,6 +12,7 @@ pub mod error;
 pub mod extract;
 pub mod hub;
 pub mod limits;
+pub mod livekit;
 pub mod presence;
 pub mod routes;
 pub mod sessions;

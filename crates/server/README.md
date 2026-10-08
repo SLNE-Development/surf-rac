@@ -24,6 +24,9 @@ docker compose -f compose.test.yaml run --rm test
 | `TURN_SECRET` | yes | | coturn `static-auth-secret`, at least 16 characters |
 | `TURN_URLS` | yes | | Comma-separated TURN URLs handed to clients, e.g. `turn:turn.example.com:3478` |
 | `TURN_TTL_SECS` | no | `3600` | Lifetime of issued TURN credentials |
+| `LIVEKIT_URL` | yes | | LiveKit URL handed to clients, `ws://` or `wss://`, e.g. `wss://rac-livekit.slne.dev` |
+| `LIVEKIT_API_KEY` | yes | | LiveKit API key that issues join tokens |
+| `LIVEKIT_API_SECRET` | yes | | LiveKit API secret, at least 32 characters, the same as in the LiveKit `keys` setting |
 | `BIND_ADDR` | no | `0.0.0.0:8080` | Listen address |
 | `TRUST_FORWARDED_FOR` | no | `false` | Use the right-most `X-Forwarded-For` entry as client IP. Set `true` only behind a proxy that appends it (Traefik) |
 | `LOG_FORMAT` | no | `json` | `json` or `pretty` |

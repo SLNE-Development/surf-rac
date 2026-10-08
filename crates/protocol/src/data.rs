@@ -24,7 +24,7 @@ pub const TOPIC_CLIPBOARD: &str = "surf-rac/clipboard";
 pub const MAX_CLIPBOARD_BYTES: usize = 8 * 1024 * 1024;
 
 /// A message on one of the session's data topics.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub enum DataMessage {
     /// Absolute pointer position on a monitor.
     PointerMove {
@@ -83,7 +83,7 @@ pub enum MouseButton {
 }
 
 /// Session control messages.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Control {
     /// The host's media encryption key at a key index.
     MediaKey {
@@ -103,6 +103,50 @@ pub enum ClipboardKind {
     Text,
     /// An encoded image.
     Image,
+}
+
+impl fmt::Debug for DataMessage {
+    /// Writes the message with clipboard contents replaced by their length.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DataMessage::PointerMove { x, y, monitor } => f
+                .debug_struct("PointerMove")
+                .field("x", x)
+                .field("y", y)
+                .field("monitor", monitor)
+                .finish(),
+            DataMessage::PointerButton { button, down } => f
+                .debug_struct("PointerButton")
+                .field("button", button)
+                .field("down", down)
+                .finish(),
+            DataMessage::Wheel { dx, dy } => {
+                f.debug_struct("Wheel").field("dx", dx).field("dy", dy).finish()
+            }
+            DataMessage::Key { code, down } => {
+                f.debug_struct("Key").field("code", code).field("down", down).finish()
+            }
+            DataMessage::Control(c) => f.debug_tuple("Control").field(c).finish(),
+            DataMessage::Clipboard { kind, bytes } => f
+                .debug_struct("Clipboard")
+                .field("kind", kind)
+                .field("bytes", &format_args!("{} bytes", bytes.len()))
+                .finish(),
+        }
+    }
+}
+
+impl fmt::Debug for Control {
+    /// Writes the control message with key material omitted.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Control::MediaKey { index, .. } => f
+                .debug_struct("MediaKey")
+                .field("index", index)
+                .finish_non_exhaustive(),
+            Control::Hangup => f.write_str("Hangup"),
+        }
+    }
 }
 
 /// Why bytes could not be decoded into a [`DataMessage`].
@@ -183,6 +227,22 @@ mod tests {
             assert_eq!(bytes[0], DATA_VERSION);
             assert_eq!(DataMessage::decode(&bytes).unwrap(), m);
         }
+    }
+
+    #[test]
+    fn debug_hides_media_key() {
+        let msg = DataMessage::Control(Control::MediaKey { index: 2, key: [0xAB; 32] });
+        let text = format!("{msg:?}");
+        assert!(text.contains("index: 2"), "{text}");
+        assert!(!text.contains("171"), "{text}");
+    }
+
+    #[test]
+    fn debug_hides_clipboard_contents() {
+        let msg = DataMessage::Clipboard { kind: ClipboardKind::Text, bytes: b"hunter2".to_vec() };
+        let text = format!("{msg:?}");
+        assert!(text.contains("7 bytes"), "{text}");
+        assert!(!text.contains("104"), "{text}");
     }
 
     #[test]

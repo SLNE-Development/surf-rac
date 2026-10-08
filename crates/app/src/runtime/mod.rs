@@ -379,6 +379,15 @@ pub fn password_offer(saved: Option<&str>, typed: Option<&str>) -> Option<(Strin
     }
 }
 
+/// Returns whether the viewer may take the host's key from the server to seal
+/// a password: only for a typed password when no key is pinned yet.
+///
+/// A saved password is only ever sealed for a pinned key, so the server
+/// cannot obtain it by presenting a key of its own.
+pub fn may_fetch_host_key(saved_password: bool, pinned: bool) -> bool {
+    !saved_password && !pinned
+}
+
 /// Returns the text a viewer window shows when a request fails.
 pub fn request_error_text(error: &RequestError) -> String {
     match error {
@@ -414,6 +423,14 @@ mod tests {
         let secs: Vec<u64> = (0..8).map(|n| backoff(n).as_secs()).collect();
         assert_eq!(secs, vec![0, 1, 2, 4, 8, 16, 30, 30]);
         assert_eq!(backoff(200), MAX_BACKOFF);
+    }
+
+    #[test]
+    fn host_key_is_fetched_only_for_a_typed_password_without_pin() {
+        assert!(may_fetch_host_key(false, false));
+        assert!(!may_fetch_host_key(true, false));
+        assert!(!may_fetch_host_key(false, true));
+        assert!(!may_fetch_host_key(true, true));
     }
 
     #[test]

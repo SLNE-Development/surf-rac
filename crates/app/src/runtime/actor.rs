@@ -19,7 +19,8 @@ use super::hosting::Hosting;
 use super::identity::{self, Identity};
 use super::{
     Auth, Command, ContactView, DEFAULT_SERVER, FrameImage, Repaint, SERVER_ENV, Snapshot,
-    ViewerStatus, ViewerView, backoff, end_text, lock, password_offer, request_error_text,
+    ViewerStatus, ViewerView, backoff, end_text, lock, may_fetch_host_key, password_offer,
+    request_error_text,
 };
 use crate::access;
 use crate::api::{Api, ApiError};
@@ -301,10 +302,18 @@ impl Actor {
             } => self.login(Some(invite), username, password),
             Command::Logout => self.logout(None).await,
             Command::SetServer(url) => {
-                self.logout(None).await;
                 let url = url.trim().trim_end_matches('/').to_string();
                 let saved = (!url.is_empty()).then_some(url);
-                self.save(|s| s.server_url = saved);
+                if saved == self.store.state().server_url {
+                    return;
+                }
+                self.logout(None).await;
+                self.identity = None;
+                *lock(&self.known) = KnownKeys::default();
+                self.save(|s| {
+                    s.forget_server();
+                    s.server_url = saved;
+                });
                 self.api = Api::new(&server_url(&self.store));
             }
             Command::RefreshLists => self.refresh_lists(),
@@ -751,9 +760,9 @@ impl Actor {
         let tx = self.internal.clone();
         tokio::spawn(async move {
             let used_saved = offer.as_ref().is_some_and(|(_, saved)| *saved);
-            let pinned = lock(&known).get(host).copied();
-            let host_key = match (&offer, pinned) {
-                (Some(_), None) => api
+            let pinned = lock(&known).get(host).is_some();
+            let host_key = match &offer {
+                Some(_) if may_fetch_host_key(used_saved, pinned) => api
                     .presence(host)
                     .await
                     .ok()

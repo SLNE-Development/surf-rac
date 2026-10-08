@@ -181,6 +181,20 @@ impl Default for State {
     }
 }
 
+impl State {
+    /// Forgets everything that belongs to the current server: the account,
+    /// session token, device registration, pinned keys and saved host
+    /// passwords. The device key pair and the settings are kept.
+    pub fn forget_server(&mut self) {
+        self.account = None;
+        self.session_token = None;
+        self.device_id = None;
+        self.device_secret = None;
+        self.known_keys.clear();
+        self.saved_passwords.clear();
+    }
+}
+
 /// The state file and its loaded contents.
 #[derive(Debug)]
 pub struct Store {
@@ -328,6 +342,33 @@ mod tests {
         #[cfg(windows)]
         assert!(store.state().session_token.is_none());
         assert!(store.state().saved_passwords.is_empty());
+    }
+
+    #[test]
+    fn forgetting_the_server_drops_everything_bound_to_it() {
+        let mut state = State {
+            server_url: Some("https://old.example".into()),
+            account: Some("alice".into()),
+            session_token: Some(Secret::new("token")),
+            device_id: Some(id(123_456_789)),
+            device_secret: Some(Secret::new("secret")),
+            device_key: Some(Secret::new("key")),
+            ..State::default()
+        };
+        state.known_keys.insert(id(223_456_789), "AAAA".into());
+        state
+            .saved_passwords
+            .insert(id(223_456_789), Secret::new("pw"));
+        state.settings.unattended = true;
+        state.forget_server();
+        assert!(state.account.is_none());
+        assert!(state.session_token.is_none());
+        assert!(state.device_id.is_none());
+        assert!(state.device_secret.is_none());
+        assert!(state.known_keys.is_empty());
+        assert!(state.saved_passwords.is_empty());
+        assert!(state.device_key.is_some());
+        assert!(state.settings.unattended);
     }
 
     #[test]

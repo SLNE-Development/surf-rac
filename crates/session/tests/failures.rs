@@ -4,9 +4,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{
-    TestEnv, accept_next, collect_stamps, feed_frames, host_event, request, start_host,
-};
+use common::{TestEnv, accept_next, collect_stamps, feed_frames, host_event, request, start_host};
 use sqlx::PgPool;
 use surf_rac_protocol::{ClientMessage, ServerMessage};
 use surf_rac_session::host::{HostEvent, HostSession, StartError};
@@ -18,7 +16,9 @@ async fn offline_host(pool: PgPool) {
     let env = TestEnv::start(pool).await;
     let (_, host_id, _) = env.register("host", 1).await;
     let v = env.device("viewer", 2).await;
-    let result = request(&v, host_id, SessionConfig::default()).await.unwrap();
+    let result = request(&v, host_id, SessionConfig::default())
+        .await
+        .unwrap();
     assert_eq!(result.err(), Some(RequestError::Offline));
 }
 
@@ -38,7 +38,10 @@ async fn denied(pool: PgPool) {
     };
     host.deny(&session_id).await.unwrap();
     assert_eq!(pending.await.unwrap().err(), Some(RequestError::Denied));
-    assert!(host.accept(&session_id).await.is_err(), "answered request stays answered");
+    assert!(
+        host.accept(&session_id).await.is_err(),
+        "answered request stays answered"
+    );
 }
 
 #[sqlx::test(migrations = "../server/migrations")]
@@ -167,8 +170,9 @@ async fn token_for_other_room_cannot_reach_host_room(pool: PgPool) {
         .unwrap();
     let (url, room, token) = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if let Some(ServerMessage::ViewerToken { url, room, token, .. }) =
-                carol_events.recv().await
+            if let Some(ServerMessage::ViewerToken {
+                url, room, token, ..
+            }) = carol_events.recv().await
             {
                 return (url, room, token);
             }
@@ -203,7 +207,10 @@ async fn livekit_unreachable(pool: PgPool) {
         SessionConfig::default(),
     )
     .await;
-    assert!(matches!(started.err(), Some(StartError::MediaUnavailable(_))));
+    assert!(matches!(
+        started.err(),
+        Some(StartError::MediaUnavailable(_))
+    ));
 
     // Act as the host by hand so the viewer receives a token for the unreachable server.
     let mut host_sig = h.signaling.subscribe();

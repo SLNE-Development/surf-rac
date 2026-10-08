@@ -181,13 +181,25 @@ mod tests {
     #[test]
     fn config_rejects_short_livekit_secret() {
         let err = Config::from_vars(vars(&with("LIVEKIT_API_SECRET", Some("short")))).unwrap_err();
-        assert!(matches!(err, ConfigError::Invalid { name: "LIVEKIT_API_SECRET", .. }));
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                name: "LIVEKIT_API_SECRET",
+                ..
+            }
+        ));
     }
 
     #[test]
     fn config_rejects_non_ws_livekit_url() {
         let err = Config::from_vars(vars(&with("LIVEKIT_URL", Some("https://x")))).unwrap_err();
-        assert!(matches!(err, ConfigError::Invalid { name: "LIVEKIT_URL", .. }));
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                name: "LIVEKIT_URL",
+                ..
+            }
+        ));
     }
 
     #[test]

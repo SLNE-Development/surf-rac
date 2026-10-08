@@ -397,9 +397,15 @@ async fn public_key_set_and_returned_on_presence(pool: PgPool) {
     let bob = app.register_and_login("bob").await;
     let (id, _) = app.new_device(&alice, &fingerprint(1)).await;
     assert_eq!(put_key(&app, &alice, &id, &b64_key(5)).await.status(), 204);
-    assert_eq!(presence_of(&app, &bob, &id).await["public_key"], b64_key(5).as_str());
+    assert_eq!(
+        presence_of(&app, &bob, &id).await["public_key"],
+        b64_key(5).as_str()
+    );
     assert_eq!(put_key(&app, &alice, &id, &b64_key(6)).await.status(), 204);
-    assert_eq!(presence_of(&app, &bob, &id).await["public_key"], b64_key(6).as_str());
+    assert_eq!(
+        presence_of(&app, &bob, &id).await["public_key"],
+        b64_key(6).as_str()
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -410,7 +416,10 @@ async fn public_key_rejects_wrong_length(pool: PgPool) {
     let (id, _) = app.new_device(&alice, &fingerprint(1)).await;
     let short = base64::engine::general_purpose::STANDARD.encode([1u8; 31]);
     assert_eq!(put_key(&app, &alice, &id, &short).await.status(), 400);
-    assert_eq!(put_key(&app, &alice, &id, "not base64!").await.status(), 400);
+    assert_eq!(
+        put_key(&app, &alice, &id, "not base64!").await.status(),
+        400
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -420,8 +429,16 @@ async fn public_key_of_other_account_forbidden(pool: PgPool) {
     let bob = app.register_and_login("bob").await;
     let (id, _) = app.new_device(&alice, &fingerprint(1)).await;
     assert_eq!(put_key(&app, &bob, &id, &b64_key(5)).await.status(), 403);
-    assert_eq!(put_key(&app, &bob, "123456789", &b64_key(5)).await.status(), 404);
-    assert!(presence_of(&app, &alice, &id).await.get("public_key").is_none());
+    assert_eq!(
+        put_key(&app, &bob, "123456789", &b64_key(5)).await.status(),
+        404
+    );
+    assert!(
+        presence_of(&app, &alice, &id)
+            .await
+            .get("public_key")
+            .is_none()
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -440,10 +457,20 @@ async fn rebind_clears_public_key(pool: PgPool) {
     let (id, _) = app.new_device(&alice, &fingerprint(1)).await;
     assert_eq!(put_key(&app, &alice, &id, &b64_key(5)).await.status(), 204);
     register_ok(&app, &alice, &fingerprint(2), Some(&id)).await;
-    assert!(presence_of(&app, &alice, &id).await.get("public_key").is_none());
+    assert!(
+        presence_of(&app, &alice, &id)
+            .await
+            .get("public_key")
+            .is_none()
+    );
 
     let (id2, _) = app.new_device(&alice, &fingerprint(3)).await;
     assert_eq!(put_key(&app, &alice, &id2, &b64_key(6)).await.status(), 204);
     register_ok(&app, &alice, &fingerprint(3), None).await;
-    assert!(presence_of(&app, &alice, &id2).await.get("public_key").is_none());
+    assert!(
+        presence_of(&app, &alice, &id2)
+            .await
+            .get("public_key")
+            .is_none()
+    );
 }

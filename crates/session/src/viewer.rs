@@ -131,12 +131,19 @@ impl ViewerSession {
             loop {
                 match sig_events.recv().await {
                     None => return Err(RequestError::Signaling(SignalingError::Closed)),
-                    Some(ServerMessage::Error { code: WsErrorCode::TargetOffline, .. }) if key.is_none() => {
+                    Some(ServerMessage::Error {
+                        code: WsErrorCode::TargetOffline,
+                        ..
+                    }) if key.is_none() => {
                         return Err(RequestError::Offline);
                     }
-                    Some(ServerMessage::SessionResponse { from, session_id: sid, accepted, reason, host_public_key })
-                        if from == host && sid == session_id =>
-                    {
+                    Some(ServerMessage::SessionResponse {
+                        from,
+                        session_id: sid,
+                        accepted,
+                        reason,
+                        host_public_key,
+                    }) if from == host && sid == session_id => {
                         if !accepted {
                             return Err(match reason {
                                 Some(DenyReason::RoomFull) => RequestError::RoomFull,
@@ -148,13 +155,18 @@ impl ViewerSession {
                             .and_then(|k| PublicKey::from_base64(k).ok())
                             .ok_or(RequestError::Denied)?;
                         lock(&known).check(host, &host_key)?;
-                        let derived = crypto::derive_session_key(&keys, &host_key, &session_id, host, viewer)
-                            .map_err(|_| RequestError::Denied)?;
+                        let derived =
+                            crypto::derive_session_key(&keys, &host_key, &session_id, host, viewer)
+                                .map_err(|_| RequestError::Denied)?;
                         key = Some(derived);
                     }
-                    Some(ServerMessage::ViewerToken { from, session_id: sid, url, token: t, .. })
-                        if from == host && sid == session_id =>
-                    {
+                    Some(ServerMessage::ViewerToken {
+                        from,
+                        session_id: sid,
+                        url,
+                        token: t,
+                        ..
+                    }) if from == host && sid == session_id => {
                         token = Some((url, t));
                     }
                     Some(_) => {}
@@ -180,7 +192,11 @@ impl ViewerSession {
         let (public_tx, public_rx) = mpsc::channel(EVENT_CAPACITY);
         let inner = Arc::new(Inner {
             host,
-            channel: Mutex::new(PeerChannel::new(session_id.clone(), channel_key, Side::Viewer)),
+            channel: Mutex::new(PeerChannel::new(
+                session_id.clone(),
+                channel_key,
+                Side::Viewer,
+            )),
             session_id,
             room: lk_room,
             send_lock: tokio::sync::Mutex::new(()),
@@ -211,7 +227,10 @@ impl ViewerSession {
 
     /// Ends the session: tells the host and leaves the room.
     pub async fn hangup(self) {
-        let _ = self.inner.send(&DataMessage::Control(Control::Hangup)).await;
+        let _ = self
+            .inner
+            .send(&DataMessage::Control(Control::Hangup))
+            .await;
         if let Some(task) = lock(&self.inner.task).take() {
             task.abort();
         }
@@ -225,7 +244,14 @@ impl Inner {
     async fn send(&self, msg: &DataMessage) -> Result<(), SendError> {
         let _order = self.send_lock.lock().await;
         let sealed = lock(&self.channel).seal(msg)?;
-        room::send(&self.room, self.host, msg.topic(), msg.is_reliable(), sealed).await
+        room::send(
+            &self.room,
+            self.host,
+            msg.topic(),
+            msg.is_reliable(),
+            sealed,
+        )
+        .await
     }
 
     /// Opens a sealed payload; returns the event to emit and whether the session ends.
@@ -236,12 +262,17 @@ impl Inner {
         let outcome = lock(&self.channel).open(&incoming.topic, &incoming.payload);
         match outcome {
             Inbound::Message(DataMessage::Control(Control::MediaKey { index, key })) => {
-                self.key_provider
-                    .set_key(&room::identity(self.host), i32::from(index), key.to_vec());
+                self.key_provider.set_key(
+                    &room::identity(self.host),
+                    i32::from(index),
+                    key.to_vec(),
+                );
                 let first = lock(&self.media_index).replace(index).is_none();
                 (first.then_some(ViewerEvent::Connected), None)
             }
-            Inbound::Message(DataMessage::Control(Control::Hangup)) => (None, Some(EndReason::Hangup)),
+            Inbound::Message(DataMessage::Control(Control::Hangup)) => {
+                (None, Some(EndReason::Hangup))
+            }
             Inbound::Message(message) => (Some(ViewerEvent::DataReceived(message)), None),
             Inbound::Dropped => (None, None),
             Inbound::UnknownVersion(version) => {
@@ -378,14 +409,19 @@ mod tests {
         let now = unix_now();
         let token = mint_token(&room_name(), "223456789", now, now + 60);
         let key_provider = room::key_provider();
-        let (lk_room, _real_events) = room::connect(&env("LIVEKIT_URL"), &token, &key_provider, false)
-            .await
-            .unwrap();
+        let (lk_room, _real_events) =
+            room::connect(&env("LIVEKIT_URL"), &token, &key_provider, false)
+                .await
+                .unwrap();
         let inner = Arc::new(Inner {
             host: DeviceId::new(123_456_789).unwrap(),
             session_id: "s1".into(),
             room: lk_room,
-            channel: Mutex::new(PeerChannel::new("s1".into(), SessionKey::from_bytes([1; 32]), Side::Viewer)),
+            channel: Mutex::new(PeerChannel::new(
+                "s1".into(),
+                SessionKey::from_bytes([1; 32]),
+                Side::Viewer,
+            )),
             send_lock: tokio::sync::Mutex::new(()),
             key_provider,
             media_index: Mutex::new(None),
@@ -393,7 +429,12 @@ mod tests {
         });
         let (tx, rx) = mpsc::unbounded_channel();
         let (public_tx, public_rx) = mpsc::channel(EVENT_CAPACITY);
-        tokio::spawn(run(Arc::clone(&inner), rx, public_tx, ReconnectWatch::new(window)));
+        tokio::spawn(run(
+            Arc::clone(&inner),
+            rx,
+            public_tx,
+            ReconnectWatch::new(window),
+        ));
         (inner, tx, public_rx)
     }
 
@@ -412,8 +453,19 @@ mod tests {
         let (_inner, tx, mut events) = loop_on_simulated_events(Duration::from_secs(2)).await;
         tx.send(RoomEvent::Reconnecting).unwrap();
         let got = drain(&mut events, Duration::from_secs(4)).await;
-        assert!(matches!(got.first(), Some(ViewerEvent::Reconnecting)), "{got:?}");
-        assert!(matches!(got.last(), Some(ViewerEvent::Ended { reason: EndReason::Timeout })), "{got:?}");
+        assert!(
+            matches!(got.first(), Some(ViewerEvent::Reconnecting)),
+            "{got:?}"
+        );
+        assert!(
+            matches!(
+                got.last(),
+                Some(ViewerEvent::Ended {
+                    reason: EndReason::Timeout
+                })
+            ),
+            "{got:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -423,7 +475,13 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(1)).await;
         tx.send(RoomEvent::Reconnected).unwrap();
         let got = drain(&mut events, Duration::from_secs(4)).await;
-        assert!(matches!(got.as_slice(), [ViewerEvent::Reconnecting, ViewerEvent::Connected]), "{got:?}");
+        assert!(
+            matches!(
+                got.as_slice(),
+                [ViewerEvent::Reconnecting, ViewerEvent::Connected]
+            ),
+            "{got:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -437,7 +495,10 @@ mod tests {
         for _ in 0..crate::CRYPTO_FAILURE_LIMIT - 1 {
             assert!(matches!(inner.on_data(garbage()), (None, None)));
         }
-        assert!(matches!(inner.on_data(garbage()), (None, Some(EndReason::CryptoError))));
+        assert!(matches!(
+            inner.on_data(garbage()),
+            (None, Some(EndReason::CryptoError))
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread")]

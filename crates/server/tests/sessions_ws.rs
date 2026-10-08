@@ -82,7 +82,10 @@ async fn session_request_to_offline_host(pool: PgPool) {
         json!({"type":"session_request","to":"123456789","session_id":"s1","viewer_public_key":key_b64()}),
     )
     .await;
-    assert_eq!(recv_type(&mut bob.ws, "error").await["code"], "target_offline");
+    assert_eq!(
+        recv_type(&mut bob.ws, "error").await["code"],
+        "target_offline"
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -120,7 +123,10 @@ async fn session_response_rejects_bad_host_key(pool: PgPool) {
         json!({"type":"session_response","to":bob.id,"session_id":"s1","accepted":true,"host_public_key":"AAAA"}),
     )
     .await;
-    assert_eq!(recv_type(&mut alice.ws, "error").await["code"], "bad_message");
+    assert_eq!(
+        recv_type(&mut alice.ws, "error").await["code"],
+        "bad_message"
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -199,5 +205,8 @@ async fn viewer_token_to_offline_viewer(pool: PgPool) {
         json!({"type":"viewer_token_request","session_id":"s1","viewer_device_id":"123456789"}),
     )
     .await;
-    assert_eq!(recv_type(&mut alice.ws, "error").await["code"], "target_offline");
+    assert_eq!(
+        recv_type(&mut alice.ws, "error").await["code"],
+        "target_offline"
+    );
 }

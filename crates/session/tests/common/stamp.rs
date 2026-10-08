@@ -80,8 +80,11 @@ pub fn read_stamp(frame: &Frame) -> Option<i64> {
 
 #[test]
 fn stamp_round_trip() {
-    assert_eq!(read_stamp(&stamp_frame(640, 480, 123_456_789)), Some(123_456_789));
-    assert_eq!(read_stamp(&stamp_frame(320, 240, now_micros())).is_some(), true);
+    assert_eq!(
+        read_stamp(&stamp_frame(640, 480, 123_456_789)),
+        Some(123_456_789)
+    );
+    assert!(read_stamp(&stamp_frame(320, 240, now_micros())).is_some());
     let mut grey = stamp_frame(640, 480, 1);
     grey.data.fill(128);
     assert_eq!(read_stamp(&grey), None);

@@ -1,10 +1,10 @@
 //! Device, contact and presence routes.
 
 use axum::Json;
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use surf_rac_protocol::{
     ContactInfo, DeviceId, DeviceInfo, PresenceInfo, PutContactRequest, PutPublicKeyRequest,
     RegisterDeviceRequest, RegisterDeviceResponse,

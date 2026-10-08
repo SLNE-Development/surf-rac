@@ -235,7 +235,10 @@ mod tests {
     #[test]
     fn channel_round_trip() {
         let (mut tx, mut rx) = pair();
-        let msg = DataMessage::Key { code: 30, down: true };
+        let msg = DataMessage::Key {
+            code: 30,
+            down: true,
+        };
         let sealed = tx.seal(&msg).unwrap();
         assert_eq!(rx.open(TOPIC_INPUT, &sealed), Inbound::Message(msg));
     }
@@ -243,11 +246,26 @@ mod tests {
     #[test]
     fn channel_rejects_topic_mismatch() {
         let (mut tx, mut rx) = pair();
-        let msg = DataMessage::Key { code: 30, down: true };
+        let msg = DataMessage::Key {
+            code: 30,
+            down: true,
+        };
         let sealed = tx.seal(&msg).unwrap();
-        assert_ne!(rx.open(TOPIC_POINTER, &sealed), Inbound::Message(msg.clone()));
+        assert_ne!(
+            rx.open(TOPIC_POINTER, &sealed),
+            Inbound::Message(msg.clone())
+        );
         assert_eq!(rx.open(TOPIC_INPUT, &sealed), Inbound::Message(msg));
-        let wrong = raw(Side::Viewer, 0, TOPIC_POINTER, &DataMessage::Key { code: 1, down: true }.encode());
+        let wrong = raw(
+            Side::Viewer,
+            0,
+            TOPIC_POINTER,
+            &DataMessage::Key {
+                code: 1,
+                down: true,
+            }
+            .encode(),
+        );
         assert_eq!(rx.open(TOPIC_POINTER, &wrong), Inbound::Dropped);
         assert_eq!(rx.open("other/topic", &wrong), Inbound::Dropped);
     }
@@ -255,10 +273,20 @@ mod tests {
     #[test]
     fn replayed_message_is_dropped() {
         let (mut tx, mut rx) = pair();
-        let sealed = tx.seal(&DataMessage::Key { code: 30, down: true }).unwrap();
+        let sealed = tx
+            .seal(&DataMessage::Key {
+                code: 30,
+                down: true,
+            })
+            .unwrap();
         assert!(matches!(rx.open(TOPIC_INPUT, &sealed), Inbound::Message(_)));
         assert_eq!(rx.open(TOPIC_INPUT, &sealed), Inbound::Dropped);
-        let next = tx.seal(&DataMessage::Key { code: 30, down: false }).unwrap();
+        let next = tx
+            .seal(&DataMessage::Key {
+                code: 30,
+                down: false,
+            })
+            .unwrap();
         assert!(matches!(rx.open(TOPIC_INPUT, &next), Inbound::Message(_)));
     }
 
@@ -266,7 +294,12 @@ mod tests {
     fn reflected_message_is_dropped() {
         let (mut viewer, _) = pair();
         let mut other_viewer = channel(Side::Viewer);
-        let sealed = viewer.seal(&DataMessage::Key { code: 30, down: true }).unwrap();
+        let sealed = viewer
+            .seal(&DataMessage::Key {
+                code: 30,
+                down: true,
+            })
+            .unwrap();
         assert_eq!(other_viewer.open(TOPIC_INPUT, &sealed), Inbound::Dropped);
     }
 
@@ -274,15 +307,48 @@ mod tests {
     fn lossy_reordering_within_window_is_accepted() {
         let (mut tx, mut rx) = pair();
         let moves: Vec<_> = (0..5)
-            .map(|i| tx.seal(&DataMessage::PointerMove { x: i, y: 0, monitor: 0 }).unwrap())
+            .map(|i| {
+                tx.seal(&DataMessage::PointerMove {
+                    x: i,
+                    y: 0,
+                    monitor: 0,
+                })
+                .unwrap()
+            })
             .collect();
         for i in [1, 0, 4, 2] {
-            assert!(matches!(rx.open(TOPIC_POINTER, &moves[i]), Inbound::Message(_)), "{i}");
+            assert!(
+                matches!(rx.open(TOPIC_POINTER, &moves[i]), Inbound::Message(_)),
+                "{i}"
+            );
         }
         assert_eq!(rx.open(TOPIC_POINTER, &moves[2]), Inbound::Dropped);
-        assert!(matches!(rx.open(TOPIC_POINTER, &moves[3]), Inbound::Message(_)));
-        let late = raw(Side::Viewer, 0, TOPIC_POINTER, &DataMessage::PointerMove { x: 0, y: 0, monitor: 0 }.encode());
-        let far = raw(Side::Viewer, 200, TOPIC_POINTER, &DataMessage::PointerMove { x: 0, y: 0, monitor: 0 }.encode());
+        assert!(matches!(
+            rx.open(TOPIC_POINTER, &moves[3]),
+            Inbound::Message(_)
+        ));
+        let late = raw(
+            Side::Viewer,
+            0,
+            TOPIC_POINTER,
+            &DataMessage::PointerMove {
+                x: 0,
+                y: 0,
+                monitor: 0,
+            }
+            .encode(),
+        );
+        let far = raw(
+            Side::Viewer,
+            200,
+            TOPIC_POINTER,
+            &DataMessage::PointerMove {
+                x: 0,
+                y: 0,
+                monitor: 0,
+            }
+            .encode(),
+        );
         assert!(matches!(rx.open(TOPIC_POINTER, &far), Inbound::Message(_)));
         assert_eq!(rx.open(TOPIC_POINTER, &late), Inbound::Dropped);
     }
@@ -290,12 +356,32 @@ mod tests {
     #[test]
     fn reliable_topics_reject_reordering() {
         let (mut tx, mut rx) = pair();
-        let first = tx.seal(&DataMessage::Key { code: 30, down: true }).unwrap();
-        let second = tx.seal(&DataMessage::Key { code: 30, down: false }).unwrap();
+        let first = tx
+            .seal(&DataMessage::Key {
+                code: 30,
+                down: true,
+            })
+            .unwrap();
+        let second = tx
+            .seal(&DataMessage::Key {
+                code: 30,
+                down: false,
+            })
+            .unwrap();
         assert!(matches!(rx.open(TOPIC_INPUT, &second), Inbound::Message(_)));
         assert_eq!(rx.open(TOPIC_INPUT, &first), Inbound::Dropped);
-        let c1 = tx.seal(&DataMessage::Clipboard { kind: ClipboardKind::Text, bytes: b"a".to_vec() }).unwrap();
-        let c2 = tx.seal(&DataMessage::Clipboard { kind: ClipboardKind::Text, bytes: b"b".to_vec() }).unwrap();
+        let c1 = tx
+            .seal(&DataMessage::Clipboard {
+                kind: ClipboardKind::Text,
+                bytes: b"a".to_vec(),
+            })
+            .unwrap();
+        let c2 = tx
+            .seal(&DataMessage::Clipboard {
+                kind: ClipboardKind::Text,
+                bytes: b"b".to_vec(),
+            })
+            .unwrap();
         assert!(matches!(rx.open(TOPIC_CLIPBOARD, &c2), Inbound::Message(_)));
         assert_eq!(rx.open(TOPIC_CLIPBOARD, &c1), Inbound::Dropped);
     }
@@ -303,11 +389,22 @@ mod tests {
     #[test]
     fn topics_count_independently() {
         let (mut tx, mut rx) = pair();
-        let key = tx.seal(&DataMessage::Key { code: 1, down: true }).unwrap();
-        let clip = tx
-            .seal(&DataMessage::Clipboard { kind: ClipboardKind::Text, bytes: b"x".to_vec() })
+        let key = tx
+            .seal(&DataMessage::Key {
+                code: 1,
+                down: true,
+            })
             .unwrap();
-        assert!(matches!(rx.open(TOPIC_CLIPBOARD, &clip), Inbound::Message(_)));
+        let clip = tx
+            .seal(&DataMessage::Clipboard {
+                kind: ClipboardKind::Text,
+                bytes: b"x".to_vec(),
+            })
+            .unwrap();
+        assert!(matches!(
+            rx.open(TOPIC_CLIPBOARD, &clip),
+            Inbound::Message(_)
+        ));
         assert!(matches!(rx.open(TOPIC_INPUT, &key), Inbound::Message(_)));
     }
 
@@ -315,14 +412,23 @@ mod tests {
     fn channel_crypto_limit_after_ten() {
         let (mut tx, mut rx) = pair();
         for _ in 0..CRYPTO_FAILURE_LIMIT - 1 {
-            assert_eq!(rx.open(TOPIC_INPUT, b"garbage-garbage-garbage"), Inbound::Dropped);
+            assert_eq!(
+                rx.open(TOPIC_INPUT, b"garbage-garbage-garbage"),
+                Inbound::Dropped
+            );
         }
         let good = tx.seal(&DataMessage::Wheel { dx: 1, dy: 1 }).unwrap();
         assert!(matches!(rx.open(TOPIC_INPUT, &good), Inbound::Message(_)));
         for _ in 0..CRYPTO_FAILURE_LIMIT - 1 {
-            assert_eq!(rx.open(TOPIC_INPUT, b"garbage-garbage-garbage"), Inbound::Dropped);
+            assert_eq!(
+                rx.open(TOPIC_INPUT, b"garbage-garbage-garbage"),
+                Inbound::Dropped
+            );
         }
-        assert_eq!(rx.open(TOPIC_INPUT, b"garbage-garbage-garbage"), Inbound::CryptoLimit);
+        assert_eq!(
+            rx.open(TOPIC_INPUT, b"garbage-garbage-garbage"),
+            Inbound::CryptoLimit
+        );
     }
 
     #[test]
@@ -335,10 +441,24 @@ mod tests {
     #[test]
     fn clipboard_over_limit_refused() {
         let (mut tx, mut rx) = pair();
-        let big = DataMessage::Clipboard { kind: ClipboardKind::Image, bytes: vec![0; MAX_CLIPBOARD_BYTES + 1] };
-        assert_eq!(tx.seal(&big), Err(SendError::ClipboardTooLarge { size: MAX_CLIPBOARD_BYTES + 1 }));
-        let max = DataMessage::Clipboard { kind: ClipboardKind::Image, bytes: vec![0; MAX_CLIPBOARD_BYTES] };
+        let big = DataMessage::Clipboard {
+            kind: ClipboardKind::Image,
+            bytes: vec![0; MAX_CLIPBOARD_BYTES + 1],
+        };
+        assert_eq!(
+            tx.seal(&big),
+            Err(SendError::ClipboardTooLarge {
+                size: MAX_CLIPBOARD_BYTES + 1
+            })
+        );
+        let max = DataMessage::Clipboard {
+            kind: ClipboardKind::Image,
+            bytes: vec![0; MAX_CLIPBOARD_BYTES],
+        };
         let sealed = tx.seal(&max).unwrap();
-        assert!(matches!(rx.open(TOPIC_CLIPBOARD, &sealed), Inbound::Message(_)));
+        assert!(matches!(
+            rx.open(TOPIC_CLIPBOARD, &sealed),
+            Inbound::Message(_)
+        ));
     }
 }

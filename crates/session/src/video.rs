@@ -1,8 +1,7 @@
 //! Raw video frames and their conversion to and from LiveKit frames.
 
 use livekit::webrtc::prelude::{
-    BoxVideoBuffer, BoxVideoFrame, I420Buffer, NV12Buffer, VideoBuffer, VideoFrame,
-    VideoRotation,
+    BoxVideoBuffer, BoxVideoFrame, I420Buffer, NV12Buffer, VideoBuffer, VideoFrame, VideoRotation,
 };
 
 /// Layout of a frame's pixel data.
@@ -142,7 +141,8 @@ fn copy_rows_out(plane: &[u8], stride: usize, row_len: usize, rows: usize, out: 
 /// Copies tightly packed rows of `row_len` bytes from `src` into a strided plane.
 fn copy_rows_in(src: &[u8], plane: &mut [u8], stride: usize, row_len: usize, rows: usize) {
     for r in 0..rows {
-        plane[r * stride..r * stride + row_len].copy_from_slice(&src[r * row_len..(r + 1) * row_len]);
+        plane[r * stride..r * stride + row_len]
+            .copy_from_slice(&src[r * row_len..(r + 1) * row_len]);
     }
 }
 
@@ -165,7 +165,10 @@ mod tests {
     fn frame_len_odd_dimensions() {
         assert_eq!(Frame::expected_len(PixelFormat::I420, 3, 3), 9 + 2 * 2 * 2);
         assert_eq!(Frame::expected_len(PixelFormat::Nv12, 4, 2), 8 + 4);
-        assert_eq!(Frame::expected_len(PixelFormat::I420, 640, 480), 640 * 480 * 3 / 2);
+        assert_eq!(
+            Frame::expected_len(PixelFormat::I420, 640, 480),
+            640 * 480 * 3 / 2
+        );
     }
 
     #[test]
@@ -173,8 +176,17 @@ mod tests {
         let mut f = frame(PixelFormat::I420, 4, 4);
         assert_eq!(f.validate(), Ok(()));
         f.data.pop();
-        assert_eq!(f.validate(), Err(FrameError::Length { expected: 24, actual: 23 }));
-        let z = Frame { width: 0, ..frame(PixelFormat::I420, 4, 4) };
+        assert_eq!(
+            f.validate(),
+            Err(FrameError::Length {
+                expected: 24,
+                actual: 23
+            })
+        );
+        let z = Frame {
+            width: 0,
+            ..frame(PixelFormat::I420, 4, 4)
+        };
         assert_eq!(z.validate(), Err(FrameError::ZeroSize));
     }
 
@@ -184,7 +196,10 @@ mod tests {
         let lk = to_livekit(&f);
         let boxed: BoxVideoFrame = lk;
         let back = from_livekit(&boxed);
-        assert_eq!((back.width, back.height, back.format), (33, 17, PixelFormat::I420));
+        assert_eq!(
+            (back.width, back.height, back.format),
+            (33, 17, PixelFormat::I420)
+        );
         assert_eq!(back.timestamp_us, 42);
         assert_eq!(back.data, f.data);
     }
@@ -195,6 +210,9 @@ mod tests {
         let back = from_livekit(&to_livekit(&f));
         assert_eq!(back.format, PixelFormat::I420);
         assert_eq!(&back.data[..16 * 8], &f.data[..16 * 8]);
-        assert_eq!(back.data.len(), Frame::expected_len(PixelFormat::I420, 16, 8));
+        assert_eq!(
+            back.data.len(),
+            Frame::expected_len(PixelFormat::I420, 16, 8)
+        );
     }
 }

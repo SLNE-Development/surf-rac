@@ -243,7 +243,10 @@ fn handle_text(
             if !valid_session_id(&session_id) {
                 return Some(bad_session_id());
             }
-            if host_public_key.as_deref().is_some_and(|k| !valid_public_key(k)) {
+            if host_public_key
+                .as_deref()
+                .is_some_and(|k| !valid_public_key(k))
+            {
                 return Some(bad_public_key());
             }
             tracing::info!(host = %device, viewer = %to, %session_id, accepted, "session answered");

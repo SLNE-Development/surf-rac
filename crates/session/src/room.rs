@@ -6,9 +6,9 @@ use livekit::e2ee::{E2eeOptions, EncryptionType};
 use livekit::prelude::*;
 use livekit::webrtc::prelude::IceTransportsType;
 use livekit::{ByteStreamReader, StreamByteOptions, StreamReader};
+use std::sync::Arc;
 use surf_rac_protocol::DeviceId;
 use surf_rac_protocol::data::{MAX_CLIPBOARD_BYTES, TOPIC_CLIPBOARD};
-use std::sync::Arc;
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -88,9 +88,7 @@ pub(crate) async fn connect(
     if force_relay {
         options.rtc_config.ice_transport_type = IceTransportsType::Relay;
     }
-    let (room, events) = Room::connect(url, token, options)
-        .await
-        .map_err(classify)?;
+    let (room, events) = Room::connect(url, token, options).await.map_err(classify)?;
     room.e2ee_manager().set_enabled(true);
     Ok((room, events))
 }

@@ -250,13 +250,12 @@ impl HostSession {
         let key_provider = room::key_provider();
         let media_key = SessionKey::random();
         key_provider.set_key(&room::identity(device), 0, media_key.as_bytes().to_vec());
-        let (lk_room, room_events) =
-            room::connect(&url, &token, &key_provider, config.force_relay)
-                .await
-                .map_err(|e| match e {
-                    JoinError::Rejected => StartError::MediaUnavailable("token rejected".into()),
-                    JoinError::Unavailable(reason) => StartError::MediaUnavailable(reason),
-                })?;
+        let (lk_room, room_events) = room::connect(&url, &token, &key_provider, config.force_relay)
+            .await
+            .map_err(|e| match e {
+                JoinError::Rejected => StartError::MediaUnavailable("token rejected".into()),
+                JoinError::Unavailable(reason) => StartError::MediaUnavailable(reason),
+            })?;
         let source = NativeVideoSource::new(VideoResolution { width, height }, true);
         let track =
             LocalVideoTrack::create_video_track("screen", RtcVideoSource::Native(source.clone()));
@@ -720,7 +719,13 @@ mod tests {
 
     /// Publishes a fresh video track named `name` on `lk_room`.
     async fn publish(lk_room: &Room, name: &str) {
-        let source = NativeVideoSource::new(VideoResolution { width: 64, height: 64 }, true);
+        let source = NativeVideoSource::new(
+            VideoResolution {
+                width: 64,
+                height: 64,
+            },
+            true,
+        );
         let track = LocalVideoTrack::create_video_track(name, RtcVideoSource::Native(source));
         lk_room
             .local_participant()
@@ -765,10 +770,23 @@ mod tests {
         publish(&lk_room, "first").await;
         sync_own_key_index(&lk_room, &own, 3);
         publish(&lk_room, "second").await;
-        let before: Vec<i32> = lk_room.e2ee_manager().frame_cryptors().values().map(|c| c.key_index()).collect();
-        assert!(before.contains(&0), "a new cryptor starts at index 0: {before:?}");
+        let before: Vec<i32> = lk_room
+            .e2ee_manager()
+            .frame_cryptors()
+            .values()
+            .map(|c| c.key_index())
+            .collect();
+        assert!(
+            before.contains(&0),
+            "a new cryptor starts at index 0: {before:?}"
+        );
         sync_own_key_index(&lk_room, &own, 3);
-        let after: Vec<i32> = lk_room.e2ee_manager().frame_cryptors().values().map(|c| c.key_index()).collect();
+        let after: Vec<i32> = lk_room
+            .e2ee_manager()
+            .frame_cryptors()
+            .values()
+            .map(|c| c.key_index())
+            .collect();
         assert_eq!(after, vec![3, 3]);
         lk_room.close().await.unwrap();
     }

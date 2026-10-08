@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use surf_rac_protocol::{ClientMessage, DeviceId, HEADER_DEVICE_ID, HEADER_DEVICE_SECRET, ServerMessage};
+use surf_rac_protocol::{
+    ClientMessage, DeviceId, HEADER_DEVICE_ID, HEADER_DEVICE_SECRET, ServerMessage,
+};
 use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -161,9 +163,8 @@ impl SignalingEvents {
 }
 
 /// The WebSocket stream type of a client connection.
-type Ws = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Runs the connection until either side closes it, then marks it closed.
 async fn run(ws: Ws, mut out_rx: mpsc::Receiver<ClientMessage>, inner: Arc<Inner>) {

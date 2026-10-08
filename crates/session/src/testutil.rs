@@ -40,5 +40,8 @@ pub fn mint_token(room: &str, identity: &str, nbf: i64, exp: i64) -> String {
     let signed = format!("{header}.{claims}");
     let mut mac = Hmac::<Sha256>::new_from_slice(env("LIVEKIT_API_SECRET").as_bytes()).unwrap();
     mac.update(signed.as_bytes());
-    format!("{signed}.{}", URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
+    format!(
+        "{signed}.{}",
+        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    )
 }

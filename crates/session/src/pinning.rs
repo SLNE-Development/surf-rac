@@ -68,7 +68,10 @@ mod tests {
     #[test]
     fn pinning_tofu_then_change_then_trust() {
         let mut known = KnownKeys::default();
-        let (k1, k2) = (DeviceKeys::generate().public_key(), DeviceKeys::generate().public_key());
+        let (k1, k2) = (
+            DeviceKeys::generate().public_key(),
+            DeviceKeys::generate().public_key(),
+        );
         known.check(id(), &k1).unwrap();
         known.check(id(), &k1).unwrap();
         let err = known.check(id(), &k2).unwrap_err();

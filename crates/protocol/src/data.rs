@@ -120,12 +120,16 @@ impl fmt::Debug for DataMessage {
                 .field("button", button)
                 .field("down", down)
                 .finish(),
-            DataMessage::Wheel { dx, dy } => {
-                f.debug_struct("Wheel").field("dx", dx).field("dy", dy).finish()
-            }
-            DataMessage::Key { code, down } => {
-                f.debug_struct("Key").field("code", code).field("down", down).finish()
-            }
+            DataMessage::Wheel { dx, dy } => f
+                .debug_struct("Wheel")
+                .field("dx", dx)
+                .field("dy", dy)
+                .finish(),
+            DataMessage::Key { code, down } => f
+                .debug_struct("Key")
+                .field("code", code)
+                .field("down", down)
+                .finish(),
             DataMessage::Control(c) => f.debug_tuple("Control").field(c).finish(),
             DataMessage::Clipboard { kind, bytes } => f
                 .debug_struct("Clipboard")
@@ -215,13 +219,29 @@ mod tests {
     #[test]
     fn round_trip_every_variant() {
         for m in [
-            DataMessage::PointerMove { x: -5, y: 7, monitor: 1 },
-            DataMessage::PointerButton { button: MouseButton::Right, down: true },
+            DataMessage::PointerMove {
+                x: -5,
+                y: 7,
+                monitor: 1,
+            },
+            DataMessage::PointerButton {
+                button: MouseButton::Right,
+                down: true,
+            },
             DataMessage::Wheel { dx: 0, dy: -120 },
-            DataMessage::Key { code: 0x1E, down: false },
-            DataMessage::Control(Control::MediaKey { index: 3, key: [9; 32] }),
+            DataMessage::Key {
+                code: 0x1E,
+                down: false,
+            },
+            DataMessage::Control(Control::MediaKey {
+                index: 3,
+                key: [9; 32],
+            }),
             DataMessage::Control(Control::Hangup),
-            DataMessage::Clipboard { kind: ClipboardKind::Text, bytes: b"hi".to_vec() },
+            DataMessage::Clipboard {
+                kind: ClipboardKind::Text,
+                bytes: b"hi".to_vec(),
+            },
         ] {
             let bytes = m.encode();
             assert_eq!(bytes[0], DATA_VERSION);
@@ -231,7 +251,10 @@ mod tests {
 
     #[test]
     fn debug_hides_media_key() {
-        let msg = DataMessage::Control(Control::MediaKey { index: 2, key: [0xAB; 32] });
+        let msg = DataMessage::Control(Control::MediaKey {
+            index: 2,
+            key: [0xAB; 32],
+        });
         let text = format!("{msg:?}");
         assert!(text.contains("index: 2"), "{text}");
         assert!(!text.contains("171"), "{text}");
@@ -239,7 +262,10 @@ mod tests {
 
     #[test]
     fn debug_hides_clipboard_contents() {
-        let msg = DataMessage::Clipboard { kind: ClipboardKind::Text, bytes: b"hunter2".to_vec() };
+        let msg = DataMessage::Clipboard {
+            kind: ClipboardKind::Text,
+            bytes: b"hunter2".to_vec(),
+        };
         let text = format!("{msg:?}");
         assert!(text.contains("7 bytes"), "{text}");
         assert!(!text.contains("104"), "{text}");
@@ -247,29 +273,57 @@ mod tests {
 
     #[test]
     fn unknown_version_is_reported() {
-        let mut b = DataMessage::Key { code: 1, down: true }.encode();
+        let mut b = DataMessage::Key {
+            code: 1,
+            down: true,
+        }
+        .encode();
         b[0] = 99;
-        assert_eq!(DataMessage::decode(&b), Err(DecodeError::UnknownVersion(99)));
+        assert_eq!(
+            DataMessage::decode(&b),
+            Err(DecodeError::UnknownVersion(99))
+        );
     }
 
     #[test]
     fn empty_and_garbage_fail() {
         assert_eq!(DataMessage::decode(&[]), Err(DecodeError::Empty));
-        assert_eq!(DataMessage::decode(&[DATA_VERSION, 250, 250]), Err(DecodeError::Malformed));
-        let mut trailing = DataMessage::Key { code: 1, down: true }.encode();
+        assert_eq!(
+            DataMessage::decode(&[DATA_VERSION, 250, 250]),
+            Err(DecodeError::Malformed)
+        );
+        let mut trailing = DataMessage::Key {
+            code: 1,
+            down: true,
+        }
+        .encode();
         trailing.push(0);
         assert_eq!(DataMessage::decode(&trailing), Err(DecodeError::Malformed));
     }
 
     #[test]
     fn topics_and_reliability() {
-        let pointer = DataMessage::PointerMove { x: 0, y: 0, monitor: 0 };
+        let pointer = DataMessage::PointerMove {
+            x: 0,
+            y: 0,
+            monitor: 0,
+        };
         assert_eq!(pointer.topic(), TOPIC_POINTER);
         assert!(!pointer.is_reliable());
-        let clip = DataMessage::Clipboard { kind: ClipboardKind::Image, bytes: vec![] };
+        let clip = DataMessage::Clipboard {
+            kind: ClipboardKind::Image,
+            bytes: vec![],
+        };
         assert_eq!(clip.topic(), TOPIC_CLIPBOARD);
         assert!(clip.is_reliable());
         assert_eq!(DataMessage::Control(Control::Hangup).topic(), TOPIC_INPUT);
-        assert_eq!(DataMessage::Key { code: 1, down: true }.topic(), TOPIC_INPUT);
+        assert_eq!(
+            DataMessage::Key {
+                code: 1,
+                down: true
+            }
+            .topic(),
+            TOPIC_INPUT
+        );
     }
 }

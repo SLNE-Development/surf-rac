@@ -265,7 +265,10 @@ mod tests {
     use super::*;
 
     fn ids() -> (DeviceId, DeviceId) {
-        (DeviceId::new(123_456_789).unwrap(), DeviceId::new(223_456_789).unwrap())
+        (
+            DeviceId::new(123_456_789).unwrap(),
+            DeviceId::new(223_456_789).unwrap(),
+        )
     }
 
     #[test]
@@ -310,20 +313,32 @@ mod tests {
         assert!(open(&SessionKey::random(), "surf-rac/input", "s1", &s).is_err());
         let last = s.len() - 1;
         s[last] ^= 1;
-        assert_eq!(open(&k, "surf-rac/input", "s1", &s), Err(CryptoError::Decrypt));
-        assert_eq!(open(&k, "surf-rac/input", "s1", &[0u8; 5]), Err(CryptoError::Decrypt));
+        assert_eq!(
+            open(&k, "surf-rac/input", "s1", &s),
+            Err(CryptoError::Decrypt)
+        );
+        assert_eq!(
+            open(&k, "surf-rac/input", "s1", &[0u8; 5]),
+            Err(CryptoError::Decrypt)
+        );
     }
 
     #[test]
     fn nonces_differ() {
         let k = SessionKey::random();
-        assert_ne!(seal(&k, "t", "s", b"x")[..12], seal(&k, "t", "s", b"x")[..12]);
+        assert_ne!(
+            seal(&k, "t", "s", b"x")[..12],
+            seal(&k, "t", "s", b"x")[..12]
+        );
     }
 
     #[test]
     fn public_key_base64_requires_32_bytes() {
         assert_eq!(PublicKey::from_base64("AAAA"), Err(CryptoError::InvalidKey));
-        assert_eq!(PublicKey::from_base64("not base64!"), Err(CryptoError::InvalidKey));
+        assert_eq!(
+            PublicKey::from_base64("not base64!"),
+            Err(CryptoError::InvalidKey)
+        );
         let k = DeviceKeys::generate().public_key();
         assert_eq!(PublicKey::from_base64(&k.to_base64()).unwrap(), k);
     }

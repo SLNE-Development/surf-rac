@@ -73,7 +73,14 @@ mod tests {
     fn viewer_token_claims() {
         let id = DeviceId::new(223_456_789).unwrap();
         let secret = "s".repeat(32);
-        let t = token("k", &secret, "host-123456789", id, Role::Viewer, 1_700_000_000);
+        let t = token(
+            "k",
+            &secret,
+            "host-123456789",
+            id,
+            Role::Viewer,
+            1_700_000_000,
+        );
         let parts: Vec<&str> = t.split('.').collect();
         assert_eq!(parts.len(), 3);
         assert_eq!(decode_part(parts[0]), json!({"alg":"HS256","typ":"JWT"}));
@@ -92,16 +99,30 @@ mod tests {
     #[test]
     fn token_signature_verifies() {
         let secret = "s".repeat(32);
-        let t = token("k", &secret, "r", DeviceId::new(123_456_789).unwrap(), Role::Host, 1);
+        let t = token(
+            "k",
+            &secret,
+            "r",
+            DeviceId::new(123_456_789).unwrap(),
+            Role::Host,
+            1,
+        );
         let (signed, sig) = t.rsplit_once('.').unwrap();
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(signed.as_bytes());
-        mac.verify_slice(&URL_SAFE_NO_PAD.decode(sig).unwrap()).unwrap();
-        assert_eq!(decode_part(t.split('.').nth(1).unwrap())["video"]["canPublish"], true);
+        mac.verify_slice(&URL_SAFE_NO_PAD.decode(sig).unwrap())
+            .unwrap();
+        assert_eq!(
+            decode_part(t.split('.').nth(1).unwrap())["video"]["canPublish"],
+            true
+        );
     }
 
     #[test]
     fn room_name() {
-        assert_eq!(room_for(DeviceId::new(123_456_789).unwrap()), "host-123456789");
+        assert_eq!(
+            room_for(DeviceId::new(123_456_789).unwrap()),
+            "host-123456789"
+        );
     }
 }

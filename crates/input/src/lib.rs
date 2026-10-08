@@ -3,8 +3,10 @@
 //! pointers for viewers that may not control the cursor.
 
 pub mod arbiter;
+pub mod host;
 pub mod inject;
 #[cfg(windows)]
 pub mod ui;
 
 pub use arbiter::{Action, Arbiter, Grants, InputStatus, ViewerStatus};
+pub use host::{InputError, InputHost, route};

@@ -3,5 +3,6 @@
 //! pointers for viewers that may not control the cursor.
 
 pub mod arbiter;
+pub mod inject;
 
 pub use arbiter::{Action, Arbiter, Grants, InputStatus, ViewerStatus};

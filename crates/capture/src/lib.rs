@@ -13,5 +13,5 @@ pub mod share;
 pub mod source;
 pub mod state;
 
-pub use share::{FORCE_SOFTWARE_ENV, ScreenShare, ShareError, ShareOptions};
-pub use source::{CaptureError, FrameSource, SourceMonitor};
+pub use share::{FORCE_SOFTWARE_ENV, ScreenShare, ShareError, ShareHandle, ShareOptions};
+pub use source::{CaptureError, FrameSource, MonitorRect, SourceMonitor};

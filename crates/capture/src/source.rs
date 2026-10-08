@@ -13,6 +13,44 @@ pub struct SourceMonitor {
     pub height: u32,
     /// Whether it is the primary monitor.
     pub primary: bool,
+    /// Left edge in desktop pixels.
+    pub left: i32,
+    /// Top edge in desktop pixels.
+    pub top: i32,
+}
+
+/// Where a monitor lies on the host's desktop, in physical desktop pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MonitorRect {
+    /// Left edge.
+    pub left: i32,
+    /// Top edge.
+    pub top: i32,
+    /// Width.
+    pub width: u32,
+    /// Height.
+    pub height: u32,
+}
+
+impl MonitorRect {
+    /// Returns whether the desktop pixel `(x, y)` lies on this monitor.
+    pub fn contains(&self, x: i32, y: i32) -> bool {
+        let (x, y) = (i64::from(x), i64::from(y));
+        let (left, top) = (i64::from(self.left), i64::from(self.top));
+        x >= left && y >= top && x < left + i64::from(self.width) && y < top + i64::from(self.height)
+    }
+}
+
+impl From<&SourceMonitor> for MonitorRect {
+    /// Returns the desktop rectangle of `m`.
+    fn from(m: &SourceMonitor) -> MonitorRect {
+        MonitorRect {
+            left: m.left,
+            top: m.top,
+            width: m.width,
+            height: m.height,
+        }
+    }
 }
 
 /// Why a frame source could not deliver.
@@ -96,17 +134,25 @@ mod synthetic {
     }
 
     impl FrameSource for SyntheticSource {
-        /// Returns the fixed monitors named `SYNTH0`, `SYNTH1`, ...
+        /// Returns the fixed monitors named `SYNTH0`, `SYNTH1`, ..., laid out
+        /// left to right from the desktop origin.
         fn monitors(&mut self) -> Result<Vec<SourceMonitor>, CaptureError> {
+            let mut left = 0;
             Ok(self
                 .sizes
                 .iter()
                 .enumerate()
-                .map(|(i, &(width, height))| SourceMonitor {
-                    name: format!("SYNTH{i}"),
-                    width,
-                    height,
-                    primary: i == 0,
+                .map(|(i, &(width, height))| {
+                    let m = SourceMonitor {
+                        name: format!("SYNTH{i}"),
+                        width,
+                        height,
+                        primary: i == 0,
+                        left,
+                        top: 0,
+                    };
+                    left += width as i32;
+                    m
                 })
                 .collect())
         }

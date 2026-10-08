@@ -6,7 +6,7 @@ use surf_rac_protocol::data::{
     ScreenState,
 };
 
-use crate::source::SourceMonitor;
+use crate::source::{MonitorRect, SourceMonitor};
 
 /// A screen state to send, and to whom.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +22,8 @@ pub enum Outgoing {
 pub struct Controller {
     /// The current state.
     state: ScreenState,
+    /// Desktop rectangle of each monitor in `state.monitors`, in the same order.
+    geometry: Vec<MonitorRect>,
 }
 
 impl Controller {
@@ -32,6 +34,7 @@ impl Controller {
         initial_monitor: Option<u8>,
         mode: QualityMode,
     ) -> Controller {
+        let geometry = rects(&monitors);
         let monitors = bounded(monitors);
         let selected = initial_monitor
             .filter(|i| usize::from(*i) < monitors.len())
@@ -43,7 +46,23 @@ impl Controller {
                 mode,
                 capture: CaptureState::Active,
             },
+            geometry,
         }
+    }
+
+    /// Returns the desktop rectangle of each monitor, indexed like the state's monitors.
+    pub fn geometry(&self) -> &[MonitorRect] {
+        &self.geometry
+    }
+
+    /// Selects monitor `index` on the host's behalf; returns the broadcast when
+    /// the selection changed and `None` when it did not or the monitor does not exist.
+    pub fn select(&mut self, index: u8) -> Option<Outgoing> {
+        if usize::from(index) >= self.state.monitors.len() || index == self.state.selected {
+            return None;
+        }
+        self.state.selected = index;
+        Some(Outgoing::All(self.state.clone()))
     }
 
     /// Returns the current state.
@@ -85,11 +104,13 @@ impl Controller {
         })
     }
 
-    /// Replaces the monitor list; returns the broadcast when anything changed.
+    /// Replaces the monitor list; returns the broadcast when anything viewers see changed.
     ///
     /// The selection follows the selected monitor by name. When it is gone, the
-    /// primary monitor is selected.
+    /// primary monitor is selected. Moved monitor origins update the geometry
+    /// without a broadcast.
     pub fn set_monitors(&mut self, monitors: Vec<SourceMonitor>) -> Option<Outgoing> {
+        self.geometry = rects(&monitors);
         let monitors = bounded(monitors);
         if monitors == self.state.monitors {
             return None;
@@ -115,6 +136,11 @@ impl Controller {
         self.state.capture = capture;
         Some(Outgoing::All(self.state.clone()))
     }
+}
+
+/// Returns the desktop rectangles of the first [`MAX_MONITORS`] source monitors.
+fn rects(monitors: &[SourceMonitor]) -> Vec<MonitorRect> {
+    monitors.iter().take(MAX_MONITORS).map(MonitorRect::from).collect()
 }
 
 /// Converts source monitors to at most [`MAX_MONITORS`] entries with names of at
@@ -164,6 +190,8 @@ mod tests {
             width: w,
             height: h,
             primary,
+            left: 0,
+            top: 0,
         }
     }
 
@@ -247,6 +275,45 @@ mod tests {
         );
         assert_eq!(c.state().mode, QualityMode::Speed);
         assert_eq!(out, Some(Outgoing::All(c.state().clone())));
+    }
+
+    #[test]
+    fn select_ignores_invalid_and_unchanged() {
+        let mut c = two();
+        assert_eq!(c.select(1), None);
+        assert_eq!(c.select(9), None);
+        assert_eq!(c.select(0), Some(Outgoing::All(c.state().clone())));
+        assert_eq!(c.state().selected, 0);
+    }
+
+    #[test]
+    fn geometry_tracks_origins() {
+        let mut a = mon("A", 1920, 1080, true);
+        let mut b = mon("B", 1280, 1024, false);
+        b.left = 1920;
+        b.top = -100;
+        let mut c = Controller::new(vec![a.clone(), b.clone()], None, QualityMode::Balanced);
+        assert_eq!(
+            c.geometry(),
+            [
+                MonitorRect { left: 0, top: 0, width: 1920, height: 1080 },
+                MonitorRect { left: 1920, top: -100, width: 1280, height: 1024 },
+            ]
+        );
+        a.left = 1280;
+        b.left = 0;
+        b.top = 0;
+        assert_eq!(c.set_monitors(vec![a, b]), None, "only origins moved");
+        assert_eq!(c.geometry()[0].left, 1280);
+    }
+
+    #[test]
+    fn rect_contains_half_open() {
+        let r = MonitorRect { left: -10, top: 5, width: 20, height: 10 };
+        assert!(r.contains(-10, 5));
+        assert!(r.contains(9, 14));
+        assert!(!r.contains(10, 14));
+        assert!(!r.contains(0, 15));
     }
 
     #[test]

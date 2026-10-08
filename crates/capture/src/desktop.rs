@@ -30,6 +30,10 @@ struct Output {
     height: u32,
     /// Whether the monitor's top-left corner is the desktop origin.
     primary: bool,
+    /// Left edge in desktop pixels.
+    left: i32,
+    /// Top edge in desktop pixels.
+    top: i32,
     /// The monitor handle as an integer.
     hmonitor: u64,
 }
@@ -80,6 +84,8 @@ impl FrameSource for DesktopSource {
                     width: out.width,
                     height: out.height,
                     primary: out.primary,
+                    left: out.left,
+                    top: out.top,
                 });
             }
         }
@@ -192,6 +198,8 @@ fn dxgi_outputs() -> windows::core::Result<Vec<Output>> {
                         width: (r.right - r.left).max(0) as u32,
                         height: (r.bottom - r.top).max(0) as u32,
                         primary: r.left == 0 && r.top == 0,
+                        left: r.left,
+                        top: r.top,
                         hmonitor: desc.Monitor.0 as usize as u64,
                     });
                 }
@@ -214,6 +222,8 @@ mod tests {
             width: 1920,
             height: 1080,
             primary: false,
+            left: 0,
+            top: 0,
             hmonitor,
         }
     }

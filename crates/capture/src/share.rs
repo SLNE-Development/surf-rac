@@ -18,7 +18,7 @@ use crate::convert::{self, BgraFrame};
 use crate::h264::EncodeError;
 use crate::hw::{HwFactory, HwWorker, Job};
 use crate::mode::{self, FRAME_RATE};
-use crate::source::{CaptureError, FrameSource};
+use crate::source::{CaptureError, FrameSource, MonitorRect};
 use crate::state::{Controller, Outgoing};
 
 /// How often the monitor list is refreshed.
@@ -70,6 +70,8 @@ enum Command {
     Control(DeviceId, Control),
     /// A viewer joined and needs the current state.
     Joined(DeviceId),
+    /// The host selects a monitor.
+    Select(u8),
     /// End the share.
     Stop,
 }
@@ -80,6 +82,8 @@ pub struct ScreenShare {
     commands: std_mpsc::SyncSender<Command>,
     /// The latest screen state.
     state: watch::Receiver<ScreenState>,
+    /// The latest monitor geometry.
+    geometry: watch::Receiver<Vec<MonitorRect>>,
     /// The capture thread.
     thread: Option<thread::JoinHandle<()>>,
     /// Delivers state messages to viewers.
@@ -166,13 +170,13 @@ impl ScreenShare {
                 if share.hardware.is_none() {
                     tracing::info!("encoder: software");
                 }
-                if ready_tx.send(Ok(share.state_rx())).is_ok() {
+                if ready_tx.send(Ok((share.state_rx(), share.geometry_rx()))).is_ok() {
                     share.run(command_rx);
                 }
             })
             .map_err(|e| ShareError::Capture(e.to_string()))?;
-        let state = match ready_rx.await {
-            Ok(Ok(state)) => state,
+        let (state, geometry) = match ready_rx.await {
+            Ok(Ok(watches)) => watches,
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err(ShareError::Capture("capture thread ended".into())),
         };
@@ -181,6 +185,7 @@ impl ScreenShare {
         Ok(ScreenShare {
             commands,
             state,
+            geometry,
             thread: Some(thread),
             deliver,
         })
@@ -208,6 +213,16 @@ impl ScreenShare {
         self.state.clone()
     }
 
+    /// Returns a cloneable handle for host-side components that read the
+    /// screen state and geometry and select monitors.
+    pub fn handle(&self) -> ShareHandle {
+        ShareHandle {
+            commands: self.commands.clone(),
+            state: self.state.clone(),
+            geometry: self.geometry.clone(),
+        }
+    }
+
     /// Stops capturing and waits for the capture thread to end. The host session keeps running.
     pub async fn stop(mut self) {
         let _ = self.commands.send(Command::Stop);
@@ -223,6 +238,37 @@ impl Drop for ScreenShare {
     /// Asks the capture thread to end when the share is dropped without [`ScreenShare::stop`].
     fn drop(&mut self) {
         let _ = self.commands.try_send(Command::Stop);
+    }
+}
+
+/// A cloneable view of a running share for host-side components.
+#[derive(Clone)]
+pub struct ShareHandle {
+    /// Requests to the capture thread.
+    commands: std_mpsc::SyncSender<Command>,
+    /// The latest screen state.
+    state: watch::Receiver<ScreenState>,
+    /// The latest monitor geometry.
+    geometry: watch::Receiver<Vec<MonitorRect>>,
+}
+
+impl ShareHandle {
+    /// Returns the current screen state.
+    pub fn state(&self) -> ScreenState {
+        self.state.borrow().clone()
+    }
+
+    /// Returns the desktop rectangle of each monitor, indexed like the screen state's monitors.
+    pub fn geometry(&self) -> Vec<MonitorRect> {
+        self.geometry.borrow().clone()
+    }
+
+    /// Asks the share to show monitor `index`, for every viewer.
+    ///
+    /// Unlike viewer requests this is not rate limited. An index that does not
+    /// exist is ignored. Dropped when the capture thread is too far behind.
+    pub fn select_monitor(&self, index: u8) {
+        let _ = self.commands.try_send(Command::Select(index));
     }
 }
 
@@ -395,6 +441,8 @@ pub(crate) struct ShareLoop<K: VideoSink> {
     out: mpsc::UnboundedSender<Outgoing>,
     /// Publishes every state change.
     state_tx: watch::Sender<ScreenState>,
+    /// Publishes every geometry change.
+    geometry_tx: watch::Sender<Vec<MonitorRect>>,
     /// Waits between retries while capture is paused.
     backoff: Backoff,
     /// When capture is retried next; `Some` while paused.
@@ -445,12 +493,14 @@ impl<K: VideoSink + Clone> ShareLoop<K> {
             retry_at = Some(now + backoff.next());
         }
         let (state_tx, _) = watch::channel(ctl.state().clone());
+        let (geometry_tx, _) = watch::channel(ctl.geometry().to_vec());
         ShareLoop {
             source,
             sink,
             ctl,
             out,
             state_tx,
+            geometry_tx,
             backoff,
             retry_at,
             next_enumerate: now + ENUMERATE_INTERVAL,
@@ -467,6 +517,11 @@ impl<K: VideoSink + Clone> ShareLoop<K> {
     /// Returns a receiver of the screen state.
     pub(crate) fn state_rx(&self) -> watch::Receiver<ScreenState> {
         self.state_tx.subscribe()
+    }
+
+    /// Returns a receiver of the monitor geometry.
+    pub(crate) fn geometry_rx(&self) -> watch::Receiver<Vec<MonitorRect>> {
+        self.geometry_tx.subscribe()
     }
 
     /// Runs the loop until [`Command::Stop`] arrives or every command sender is gone.
@@ -531,6 +586,14 @@ impl<K: VideoSink + Clone> ShareLoop<K> {
                     self.select_current(now);
                 }
             }
+            Command::Select(index) => {
+                let out = self.ctl.select(index);
+                if out.is_some() {
+                    tracing::info!(monitor = index, "monitor selected by the host");
+                    self.emit(out);
+                    self.select_current(now);
+                }
+            }
             Command::Stop => {}
         }
     }
@@ -592,6 +655,14 @@ impl<K: VideoSink + Clone> ShareLoop<K> {
             return;
         };
         let out = self.ctl.set_monitors(monitors);
+        let geometry = self.ctl.geometry();
+        self.geometry_tx.send_if_modified(|g| {
+            let changed = g.as_slice() != geometry;
+            if changed {
+                *g = geometry.to_vec();
+            }
+            changed
+        });
         if out.is_some() {
             tracing::info!(
                 monitors = self.ctl.state().monitors.len(),
@@ -724,7 +795,7 @@ mod tests {
     use super::*;
     use crate::h264::EncodedAu;
     use crate::hw::HwEncoder;
-    use crate::source::{SyntheticControl, SyntheticSource};
+    use crate::source::{MonitorRect, SyntheticControl, SyntheticSource};
 
     /// Waits up to 2 s for `cond` to hold.
     fn wait_for(cond: impl Fn() -> bool) {
@@ -1173,6 +1244,30 @@ mod tests {
         lp.tick(at);
         assert_eq!(lp.ctl.state().capture, CaptureState::Active);
         assert_eq!(rec.raw.lock().unwrap().last(), Some(&(640, 480)));
+    }
+
+    #[test]
+    fn host_select_skips_rate_limit_and_broadcasts() {
+        let (mut lp, _, _, mut rx, t0) = setup();
+        lp.command(Command::Control(dev(1), Control::SelectMonitor { index: 1 }), t0);
+        drain(&mut rx);
+        lp.command(Command::Select(0), t0);
+        assert_eq!(lp.ctl.state().selected, 0);
+        assert!(matches!(&drain(&mut rx)[..], [Outgoing::All(s)] if s.selected == 0));
+        lp.command(Command::Select(0), t0);
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn geometry_follows_monitors() {
+        let (lp, _, _, _, _) = setup();
+        assert_eq!(
+            *lp.geometry_rx().borrow(),
+            [
+                MonitorRect { left: 0, top: 0, width: 1920, height: 1080 },
+                MonitorRect { left: 1920, top: 0, width: 640, height: 480 },
+            ]
+        );
     }
 
     #[test]

@@ -28,8 +28,8 @@ pub enum CaptureError {
 
 /// Captures one monitor at a time as BGRA frames.
 ///
-/// A source is driven from a single thread: the share loop owns it.
-pub trait FrameSource: Send + 'static {
+/// A source is created and driven on the share's capture thread.
+pub trait FrameSource: 'static {
     /// Lists the monitors that can be captured, in a stable order.
     fn monitors(&mut self) -> Result<Vec<SourceMonitor>, CaptureError>;
 

@@ -9,7 +9,7 @@ use std::time::Duration;
 use common::{TestEnv, accept_next, request, start_host, viewer_event};
 use sqlx::PgPool;
 use surf_rac_capture::source::{SyntheticControl, SyntheticSource};
-use surf_rac_capture::{ScreenShare, ShareOptions};
+use surf_rac_capture::{FrameSource, ScreenShare, ShareOptions};
 use surf_rac_protocol::data::{
     CaptureState, Control, DataMessage, PauseReason, QualityMode, ScreenState,
 };
@@ -60,9 +60,11 @@ async fn shared(pool: PgPool, sizes: Vec<(u32, u32)>) -> Shared {
     let (host, mut host_events) = start_host(&h, SessionConfig::default()).await;
     let (source, control) = SyntheticSource::new(sizes);
     let share = Arc::new(
-        ScreenShare::start_with_source(host.clone(), Box::new(source), ShareOptions::default())
-            .await
-            .expect("share start"),
+        ScreenShare::start_with_source(host.clone(), ShareOptions::default(), move || {
+            Ok(Box::new(source) as Box<dyn FrameSource>)
+        })
+        .await
+        .expect("share start"),
     );
     let pending = request(&v, h.id, SessionConfig::default());
     let (viewer, events) = accept_next(&host, &mut host_events, pending).await;

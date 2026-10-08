@@ -37,6 +37,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal
 tokio-tungstenite = "0.26"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 # Optimise dependencies in debug builds so argon2 hashing stays fast in tests.

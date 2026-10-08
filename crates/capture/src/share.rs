@@ -74,29 +74,63 @@ pub struct ScreenShare {
 impl ScreenShare {
     /// Starts sharing this machine's screen on `host`.
     ///
-    /// Fails with [`ShareError::Unsupported`] on platforms without screen capture.
+    /// Fails with [`ShareError::Unsupported`] on platforms without screen capture,
+    /// and with [`ShareError::Capture`] when no screen capturer can be created.
     pub async fn start(host: HostSession, options: ShareOptions) -> Result<ScreenShare, ShareError> {
-        let _ = (host, options);
-        Err(ShareError::Unsupported)
+        #[cfg(windows)]
+        {
+            Self::start_with_source(host, options, || {
+                crate::desktop::DesktopSource::new()
+                    .map(|s| Box::new(s) as Box<dyn FrameSource>)
+                    .map_err(|e| ShareError::Capture(e.to_string()))
+            })
+            .await
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (host, options);
+            Err(ShareError::Unsupported)
+        }
     }
 
-    /// Starts sharing frames from `source` on `host`.
-    pub async fn start_with_source(
+    /// Starts sharing on `host` from the source `make_source` creates.
+    ///
+    /// `make_source` runs on the capture thread, which then owns the source.
+    pub async fn start_with_source<F>(
         host: HostSession,
-        source: Box<dyn FrameSource>,
         options: ShareOptions,
-    ) -> Result<ScreenShare, ShareError> {
+        make_source: F,
+    ) -> Result<ScreenShare, ShareError>
+    where
+        F: FnOnce() -> Result<Box<dyn FrameSource>, ShareError> + Send + 'static,
+    {
         let (out_tx, out_rx) = mpsc::unbounded_channel();
-        let deliver = tokio::spawn(deliver(host.clone(), out_rx));
-        let sink = HostSink { host };
+        let sink = HostSink { host: host.clone() };
         let (commands, command_rx) = std_mpsc::channel();
-        let mut share = ShareLoop::new(source, sink, options, out_tx, Instant::now());
-        let state = share.state_rx();
-        tracing::info!(mode = ?options.mode, "screen share started");
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let thread = thread::Builder::new()
             .name("surf-rac-capture".into())
-            .spawn(move || share.run(command_rx))
+            .spawn(move || {
+                let source = match make_source() {
+                    Ok(source) => source,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                        return;
+                    }
+                };
+                let mut share = ShareLoop::new(source, sink, options, out_tx, Instant::now());
+                if ready_tx.send(Ok(share.state_rx())).is_ok() {
+                    share.run(command_rx);
+                }
+            })
             .map_err(|e| ShareError::Capture(e.to_string()))?;
+        let state = match ready_rx.await {
+            Ok(Ok(state)) => state,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err(ShareError::Capture("capture thread ended".into())),
+        };
+        let deliver = tokio::spawn(deliver(host, out_rx));
+        tracing::info!(mode = ?options.mode, "screen share started");
         Ok(ScreenShare {
             commands,
             state,

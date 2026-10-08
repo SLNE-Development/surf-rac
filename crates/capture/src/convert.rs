@@ -89,7 +89,7 @@ fn i420(src: &BgraFrame, out_w: u32, out_h: u32) -> I420Buffer {
     let (w, h) = (src.width & !1, src.height & !1);
     assert!(w >= 2 && h >= 2, "frame {}x{} is smaller than 2x2", src.width, src.height);
     assert!(
-        out_w >= 2 && out_h >= 2 && out_w % 2 == 0 && out_h % 2 == 0,
+        out_w >= 2 && out_h >= 2 && out_w.is_multiple_of(2) && out_h.is_multiple_of(2),
         "output size {out_w}x{out_h} must be even and at least 2x2"
     );
     assert!(

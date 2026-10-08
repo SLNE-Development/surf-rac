@@ -409,7 +409,7 @@ impl<K: VideoSink + Clone> ShareLoop<K> {
     ) -> ShareLoop<K> {
         let monitors = source.monitors();
         let mut ctl = Controller::new(
-            monitors.as_ref().map(Vec::clone).unwrap_or_default(),
+            monitors.clone().unwrap_or_default(),
             options.monitor,
             options.mode,
         );

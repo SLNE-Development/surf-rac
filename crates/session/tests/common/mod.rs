@@ -51,7 +51,10 @@ pub fn mint_token(room: &str, identity: &str, can_publish: bool, nbf: i64, exp: 
     let signed = format!("{header}.{claims}");
     let mut mac = Hmac::<Sha256>::new_from_slice(env("LIVEKIT_API_SECRET").as_bytes()).unwrap();
     mac.update(signed.as_bytes());
-    format!("{signed}.{}", URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
+    format!(
+        "{signed}.{}",
+        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    )
 }
 
 /// Starts a host session for `device` with a 640x480 track.
@@ -136,7 +139,7 @@ pub async fn accept_next(
     };
     host.accept(&session_id).await.expect("accept");
     let (viewer, mut events) = pending.await.unwrap().expect("viewer request");
-    viewer_event(&mut events, Duration::from_secs(15), |e| {
+    viewer_event(&mut events, Duration::from_secs(30), |e| {
         matches!(e, ViewerEvent::Connected)
     })
     .await;

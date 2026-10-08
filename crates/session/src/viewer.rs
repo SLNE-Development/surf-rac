@@ -270,6 +270,7 @@ async fn run(
         }
     });
     let (incoming_tx, mut incoming_rx) = mpsc::unbounded_channel();
+    let gate = room::StreamGate::new();
     let host_identity = inner.host.to_string();
     let mut frames: Option<JoinHandle<()>> = None;
     let reason = loop {
@@ -288,8 +289,10 @@ async fn run(
                     Incoming { from: p.identity().0, topic, payload: payload.to_vec() }
                 }
                 Some(RoomEvent::ByteStreamOpened { reader, topic, participant_identity }) => {
-                    if let Some(reader) = reader.take() {
-                        room::read_clipboard_stream(reader, topic, participant_identity.0, incoming_tx.clone());
+                    if participant_identity.0 == host_identity {
+                        if let Some(reader) = reader.take() {
+                            room::read_clipboard_stream(reader, topic, participant_identity.0, &gate, incoming_tx.clone());
+                        }
                     }
                     continue;
                 }

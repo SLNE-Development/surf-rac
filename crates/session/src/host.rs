@@ -531,6 +531,7 @@ async fn run(
     mut watch: ReconnectWatch,
 ) {
     let (incoming_tx, mut incoming_rx) = mpsc::unbounded_channel();
+    let gate = room::StreamGate::new();
     let mut signaling_open = true;
     let reason = loop {
         tokio::select! {
@@ -559,8 +560,12 @@ async fn run(
                     inner.on_data(Incoming { from: p.identity().0, topic, payload: payload.to_vec() }).await;
                 }
                 Some(RoomEvent::ByteStreamOpened { reader, topic, participant_identity }) => {
-                    if let Some(reader) = reader.take() {
-                        room::read_clipboard_stream(reader, topic, participant_identity.0, incoming_tx.clone());
+                    let from_viewer = participant_identity
+                        .0
+                        .parse()
+                        .is_ok_and(|viewer| lock(&inner.state).viewers.contains_key(&viewer));
+                    if let (true, Some(reader)) = (from_viewer, reader.take()) {
+                        room::read_clipboard_stream(reader, topic, participant_identity.0, &gate, incoming_tx.clone());
                     }
                 }
                 Some(RoomEvent::Reconnecting) => {

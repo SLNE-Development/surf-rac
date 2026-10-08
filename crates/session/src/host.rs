@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use livekit::options::{TrackPublishOptions, VideoEncoding};
+use livekit::options::{TrackPublishOptions, VideoCodec, VideoEncoderBackend, VideoEncoding};
 use livekit::prelude::*;
 use livekit::webrtc::prelude::{RtcVideoSource, VideoResolution};
 use livekit::webrtc::video_source::native::NativeVideoSource;
@@ -24,7 +24,7 @@ use crate::pinning::{KeyChanged, KnownKeys};
 use crate::reconnect::ReconnectWatch;
 use crate::room::{self, Incoming, JoinError};
 use crate::signaling::{SignalingClient, SignalingError, SignalingEvents};
-use crate::video::{self, Frame, FrameError};
+use crate::video::{self, EncodedFrame, Frame, FrameError, RateRequest, VideoInput};
 
 /// Host events buffered for the application.
 const EVENT_CAPACITY: usize = 1024;
@@ -54,7 +54,7 @@ const JOIN_WINDOW: Duration = Duration::from_secs(70);
 const MAX_FRAMERATE: f64 = 30.0;
 
 /// Highest bitrate the video track is encoded at, in bits per second.
-const MAX_BITRATE: u64 = 4_000_000;
+pub const MAX_BITRATE: u64 = 8_000_000;
 
 /// Something that happened in a host session.
 #[derive(Debug)]
@@ -149,8 +149,10 @@ struct Inner {
     keys: Arc<DeviceKeys>,
     /// Pinned viewer keys.
     known: Arc<Mutex<KnownKeys>>,
-    /// Source of the published video track.
-    source: NativeVideoSource,
+    /// The published video track and its source.
+    video: Mutex<Video>,
+    /// Serializes switches of the video input.
+    video_switch: tokio::sync::Mutex<()>,
     /// Frame-encryption keys.
     key_provider: livekit::e2ee::key_provider::KeyProvider,
     /// Serializes media key rotations.
@@ -163,6 +165,16 @@ struct Inner {
     events: mpsc::Sender<HostEvent>,
     /// The event loop task.
     task: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// The host's published video track.
+struct Video {
+    /// Source the track is fed from.
+    source: NativeVideoSource,
+    /// What the source takes.
+    input: VideoInput,
+    /// The track's publication ID.
+    sid: TrackSid,
 }
 
 /// Requests and viewers of a host session.
@@ -355,25 +367,9 @@ impl HostSession {
                 JoinError::Rejected => StartError::MediaUnavailable("token rejected".into()),
                 JoinError::Unavailable(reason) => StartError::MediaUnavailable(reason),
             })?;
-        let source = NativeVideoSource::new(VideoResolution { width, height }, true);
-        let track =
-            LocalVideoTrack::create_video_track("screen", RtcVideoSource::Native(source.clone()));
-        lk_room
-            .local_participant()
-            .publish_track(
-                LocalTrack::Video(track),
-                TrackPublishOptions {
-                    source: TrackSource::Screenshare,
-                    video_encoding: Some(VideoEncoding {
-                        max_bitrate: MAX_BITRATE,
-                        max_framerate: MAX_FRAMERATE,
-                    }),
-                    simulcast: false,
-                    ..Default::default()
-                },
-            )
+        let video = publish_video(&lk_room, VideoInput::Raw, width, height)
             .await
-            .map_err(|e| StartError::MediaUnavailable(e.to_string()))?;
+            .map_err(StartError::MediaUnavailable)?;
         tracing::info!(device_id = %device, "hosting started");
 
         let (events, events_rx) = mpsc::channel(EVENT_CAPACITY);
@@ -383,7 +379,8 @@ impl HostSession {
             room: lk_room,
             keys,
             known,
-            source,
+            video: Mutex::new(video),
+            video_switch: tokio::sync::Mutex::new(()),
             key_provider,
             rotate_lock: tokio::sync::Mutex::new(()),
             state: Mutex::new(State {
@@ -468,11 +465,95 @@ impl HostSession {
             .await
     }
 
-    /// Publishes one frame on the video track.
+    /// Publishes one raw frame on the video track.
+    ///
+    /// Fails with [`FrameError::WrongInput`] while the track takes encoded frames.
     pub fn publish_frame(&self, frame: &Frame) -> Result<(), FrameError> {
         frame.validate()?;
-        self.inner.source.capture_frame(&video::to_livekit(frame));
+        let source = self.source_for(VideoInput::Raw)?;
+        source.capture_frame(&video::to_livekit(frame));
         Ok(())
+    }
+
+    /// Publishes one H.264 access unit on the video track.
+    ///
+    /// Fails with [`FrameError::WrongInput`] while the track takes raw frames, and
+    /// with [`FrameError::ZeroSize`] for an empty picture or payload.
+    pub fn publish_encoded(&self, frame: &EncodedFrame<'_>) -> Result<(), FrameError> {
+        if frame.width == 0 || frame.height == 0 || frame.data.is_empty() {
+            return Err(FrameError::ZeroSize);
+        }
+        let source = self.source_for(VideoInput::Encoded)?;
+        source.capture_encoded_frame(&video::to_livekit_encoded(frame));
+        Ok(())
+    }
+
+    /// Returns what the video track is currently fed with.
+    pub fn video_input(&self) -> VideoInput {
+        lock(&self.inner.video).input
+    }
+
+    /// Replaces the video track with one fed by `input` at `width` x `height`.
+    ///
+    /// Does nothing when the track already takes `input`. Viewers subscribe to
+    /// the new track on their own; frame encryption keys are unchanged.
+    pub async fn set_video_input(
+        &self,
+        input: VideoInput,
+        width: u32,
+        height: u32,
+    ) -> Result<(), StartError> {
+        let _switch = self.inner.video_switch.lock().await;
+        let old = {
+            let video = lock(&self.inner.video);
+            if video.input == input {
+                return Ok(());
+            }
+            video.sid.clone()
+        };
+        self.inner
+            .room
+            .local_participant()
+            .unpublish_track(&old)
+            .await
+            .map_err(|e| StartError::MediaUnavailable(e.to_string()))?;
+        let video = publish_video(&self.inner.room, input, width, height)
+            .await
+            .map_err(StartError::MediaUnavailable)?;
+        tracing::info!(device_id = %self.inner.device, ?input, "video input switched");
+        *lock(&self.inner.video) = video;
+        Ok(())
+    }
+
+    /// Returns and clears whether the network asked the external encoder for a keyframe.
+    ///
+    /// Always false while the track takes raw frames.
+    pub fn take_keyframe_request(&self) -> bool {
+        let video = lock(&self.inner.video);
+        video.input == VideoInput::Encoded && video.source.take_keyframe_request()
+    }
+
+    /// Returns and clears the latest rate the network asked the external encoder for.
+    ///
+    /// Always `None` while the track takes raw frames.
+    pub fn take_rate_request(&self) -> Option<RateRequest> {
+        let video = lock(&self.inner.video);
+        if video.input != VideoInput::Encoded {
+            return None;
+        }
+        video.source.take_rate_control_request().map(|r| RateRequest {
+            bitrate_bps: r.target_bitrate_bps,
+            framerate: r.framerate_fps,
+        })
+    }
+
+    /// Returns the video source when the track takes `input`.
+    fn source_for(&self, input: VideoInput) -> Result<NativeVideoSource, FrameError> {
+        let video = lock(&self.inner.video);
+        if video.input != input {
+            return Err(FrameError::WrongInput);
+        }
+        Ok(video.source.clone())
     }
 
     /// Sends `msg` to `viewer`.
@@ -498,6 +579,51 @@ impl HostSession {
         let _ = self.inner.room.close().await;
         tracing::info!(device_id = %self.inner.device, "hosting stopped");
     }
+}
+
+/// Publishes a `width` x `height` H.264 screen track in `room` fed by `input`.
+async fn publish_video(
+    room: &Room,
+    input: VideoInput,
+    width: u32,
+    height: u32,
+) -> Result<Video, String> {
+    let resolution = VideoResolution { width, height };
+    let (source, backend) = match input {
+        VideoInput::Raw => (
+            NativeVideoSource::new(resolution, true),
+            VideoEncoderBackend::Auto,
+        ),
+        VideoInput::Encoded => (
+            NativeVideoSource::new_encoded(resolution),
+            VideoEncoderBackend::PreEncoded,
+        ),
+    };
+    let track =
+        LocalVideoTrack::create_video_track("screen", RtcVideoSource::Native(source.clone()));
+    let publication = room
+        .local_participant()
+        .publish_track(
+            LocalTrack::Video(track),
+            TrackPublishOptions {
+                source: TrackSource::Screenshare,
+                video_codec: VideoCodec::H264,
+                video_encoding: Some(VideoEncoding {
+                    max_bitrate: MAX_BITRATE,
+                    max_framerate: MAX_FRAMERATE,
+                }),
+                video_encoder: backend,
+                simulcast: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Video {
+        source,
+        input,
+        sid: publication.sid(),
+    })
 }
 
 impl Inner {

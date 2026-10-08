@@ -12,7 +12,7 @@ use sqlx::PgPool;
 use surf_rac_protocol::data::{ClipboardKind, DataMessage};
 use surf_rac_session::host::HostEvent;
 use surf_rac_session::viewer::ViewerEvent;
-use surf_rac_session::{EndReason, SessionConfig};
+use surf_rac_session::{EndReason, FrameError, SessionConfig, VideoInput};
 
 #[sqlx::test(migrations = "../server/migrations")]
 async fn viewer_receives_video(pool: PgPool) {
@@ -265,4 +265,49 @@ async fn clipboard_upload_does_not_delay_input(pool: PgPool) {
     )
     .await;
     upload.await.unwrap().unwrap();
+}
+
+#[sqlx::test(migrations = "../server/migrations")]
+async fn viewer_keeps_receiving_across_size_change(pool: PgPool) {
+    let env = TestEnv::start(pool).await;
+    let (h, v) = (env.device("host", 1).await, env.device("viewer", 2).await);
+    let (host, mut host_events) = start_host(&h, SessionConfig::default()).await;
+    let pending = request(&v, h.id, SessionConfig::default());
+    let (_viewer, mut events) = accept_next(&host, &mut host_events, pending).await;
+    let feed = common::feed_frames_resizing(&host, (640, 480), Duration::from_secs(3), (800, 600));
+    let frames = common::collect_sized(&mut events, Duration::from_secs(12)).await;
+    feed.abort();
+    assert!(
+        frames.iter().any(|(w, h, _)| (*w, *h) == (640, 480)),
+        "no 640x480 frames before the switch"
+    );
+    let after = frames
+        .iter()
+        .filter(|(w, h, s)| (*w, *h) == (800, 600) && s.is_some())
+        .count();
+    assert!(after >= 10, "only {after} stamped 800x600 frames after the switch");
+}
+
+#[sqlx::test(migrations = "../server/migrations")]
+async fn encoded_input_rejects_raw_frames_and_switches_back(pool: PgPool) {
+    let env = TestEnv::start(pool).await;
+    let (h, v) = (env.device("host", 1).await, env.device("viewer", 2).await);
+    let (host, mut host_events) = start_host(&h, SessionConfig::default()).await;
+    let pending = request(&v, h.id, SessionConfig::default());
+    let (_viewer, mut events) = accept_next(&host, &mut host_events, pending).await;
+    assert_eq!(host.video_input(), VideoInput::Raw);
+
+    host.set_video_input(VideoInput::Encoded, 640, 480).await.unwrap();
+    assert_eq!(host.video_input(), VideoInput::Encoded);
+    assert_eq!(
+        host.publish_frame(&common::stamp::stamp_frame(640, 480, common::stamp::now_micros())),
+        Err(FrameError::WrongInput)
+    );
+
+    host.set_video_input(VideoInput::Raw, 640, 480).await.unwrap();
+    assert_eq!(host.video_input(), VideoInput::Raw);
+    let feed = feed_frames(&host);
+    let stamps = collect_stamps(&mut events, Duration::from_secs(15)).await;
+    feed.abort();
+    assert!(stamps.len() >= 10, "only {} stamped frames after switching back", stamps.len());
 }

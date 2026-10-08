@@ -310,3 +310,43 @@ impl TestEnv {
         }
     }
 }
+
+/// Publishes stamped frames on `host` at 30 fps: `width` x `height` until `switch_after`
+/// has passed, then `then_width` x `then_height`, until the returned task is aborted.
+pub fn feed_frames_resizing(
+    host: &HostSession,
+    (width, height): (u32, u32),
+    switch_after: Duration,
+    (then_width, then_height): (u32, u32),
+) -> JoinHandle<()> {
+    let host = host.clone();
+    tokio::spawn(async move {
+        let started = tokio::time::Instant::now();
+        let mut tick = tokio::time::interval(Duration::from_millis(33));
+        loop {
+            tick.tick().await;
+            let (w, h) = if started.elapsed() < switch_after {
+                (width, height)
+            } else {
+                (then_width, then_height)
+            };
+            host.publish_frame(&stamp::stamp_frame(w, h, stamp::now_micros()))
+                .expect("publish frame");
+        }
+    })
+}
+
+/// Collects the size and stamp of every frame `events` delivers within `wait`.
+pub async fn collect_sized(
+    events: &mut Receiver<ViewerEvent>,
+    wait: Duration,
+) -> Vec<(u32, u32, Option<i64>)> {
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut out = Vec::new();
+    while let Ok(Some(ev)) = tokio::time::timeout_at(deadline, events.recv()).await {
+        if let ViewerEvent::VideoFrame(frame) = ev {
+            out.push((frame.width, frame.height, stamp::read_stamp(&frame)));
+        }
+    }
+    out
+}

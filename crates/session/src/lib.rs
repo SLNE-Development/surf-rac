@@ -22,4 +22,4 @@ pub use channel::{CRYPTO_FAILURE_LIMIT, SendError};
 pub use config::{EndReason, MAX_VIEWERS, SessionConfig};
 pub use crypto::{CryptoError, DeviceKeys, PublicKey, SessionKey};
 pub use pinning::{KeyChanged, KnownKeys};
-pub use video::{Frame, FrameError, PixelFormat};
+pub use video::{EncodedFrame, Frame, FrameError, PixelFormat, RateRequest, VideoInput};

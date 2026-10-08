@@ -1,8 +1,43 @@
 //! Raw video frames and their conversion to and from LiveKit frames.
 
 use livekit::webrtc::prelude::{
-    BoxVideoBuffer, BoxVideoFrame, I420Buffer, NV12Buffer, VideoBuffer, VideoFrame, VideoRotation,
+    BoxVideoBuffer, BoxVideoFrame, I420Buffer, NV12Buffer, VideoBuffer, VideoFrame, VideoResolution,
+    VideoRotation,
 };
+use livekit::webrtc::video_frame::{EncodedFrameType, EncodedVideoCodec, EncodedVideoFrame};
+
+/// What a host's video track is fed with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoInput {
+    /// Uncompressed frames that libwebrtc encodes.
+    Raw,
+    /// H.264 access units encoded before they reach the session.
+    Encoded,
+}
+
+/// One H.264 access unit in Annex-B format.
+#[derive(Debug, Clone, Copy)]
+pub struct EncodedFrame<'a> {
+    /// Width of the encoded picture in pixels.
+    pub width: u32,
+    /// Height of the encoded picture in pixels.
+    pub height: u32,
+    /// Capture time in microseconds.
+    pub timestamp_us: i64,
+    /// Whether the access unit is an IDR frame.
+    pub keyframe: bool,
+    /// The Annex-B bytes, including SPS and PPS before an IDR.
+    pub data: &'a [u8],
+}
+
+/// Bitrate and frame rate the network can currently carry, for an external encoder.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RateRequest {
+    /// Target bitrate in bits per second.
+    pub bitrate_bps: u64,
+    /// Target frame rate in frames per second.
+    pub framerate: f64,
+}
 
 /// Layout of a frame's pixel data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +89,9 @@ pub enum FrameError {
         /// Bytes the frame has.
         actual: usize,
     },
+    /// The frame is raw while the track takes encoded frames, or the other way round.
+    #[error("frame kind does not match the track's video input")]
+    WrongInput,
 }
 
 impl Frame {
@@ -108,6 +146,25 @@ pub(crate) fn to_livekit(frame: &Frame) -> VideoFrame<BoxVideoBuffer> {
     let mut out = VideoFrame::new(VideoRotation::VideoRotation0, buffer);
     out.timestamp_us = frame.timestamp_us;
     out
+}
+
+/// Describes an encoded access unit as a LiveKit encoded frame.
+pub(crate) fn to_livekit_encoded<'a>(frame: &EncodedFrame<'a>) -> EncodedVideoFrame<'a> {
+    EncodedVideoFrame {
+        codec: EncodedVideoCodec::H264,
+        payload: frame.data,
+        timestamp_us: frame.timestamp_us,
+        frame_type: if frame.keyframe {
+            EncodedFrameType::Key
+        } else {
+            EncodedFrameType::Delta
+        },
+        resolution: VideoResolution {
+            width: frame.width,
+            height: frame.height,
+        },
+        frame_metadata: None,
+    }
 }
 
 /// Copies a received LiveKit frame into a tightly packed I420 [`Frame`].

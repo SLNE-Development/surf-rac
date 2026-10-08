@@ -36,6 +36,9 @@ const KEY_RING_SIZE: u8 = 16;
 /// How long remaining viewers get to install a rotated media key before the host switches to it.
 const KEY_SWITCH_DELAY: Duration = Duration::from_millis(500);
 
+/// Shortest time between two refusals the host sends to the same viewer.
+const REFUSAL_INTERVAL: Duration = Duration::from_secs(2);
+
 /// How long an accepted viewer may take to join before its slot is freed.
 const JOIN_WINDOW: Duration = Duration::from_secs(70);
 
@@ -157,6 +160,8 @@ struct State {
     media_key: SessionKey,
     /// Key index of the current media key.
     media_index: u8,
+    /// When each viewer was last sent a refusal.
+    refused: HashMap<DeviceId, Instant>,
 }
 
 /// An unanswered session request.
@@ -180,6 +185,17 @@ struct Viewer {
 }
 
 impl State {
+    /// Returns whether `viewer` may be sent a refusal at `now`, and records it if so.
+    fn may_refuse(&mut self, viewer: DeviceId, now: Instant) -> bool {
+        self.refused
+            .retain(|_, at| now.duration_since(*at) < REFUSAL_INTERVAL);
+        if self.refused.contains_key(&viewer) {
+            return false;
+        }
+        self.refused.insert(viewer, now);
+        true
+    }
+
     /// Frees the slots of accepted viewers that never joined within [`JOIN_WINDOW`].
     fn purge_stale(&mut self, now: Instant) {
         self.viewers
@@ -261,6 +277,7 @@ impl HostSession {
                 viewers: HashMap::new(),
                 media_key,
                 media_index: 0,
+                refused: HashMap::new(),
             }),
             send_lock: tokio::sync::Mutex::new(()),
             events,
@@ -424,56 +441,64 @@ impl Inner {
 
     /// Handles a session request from `viewer`.
     ///
-    /// Requests from a viewer already in the room, or with a session ID or
-    /// viewer that is already pending, are denied. A viewer that was accepted
-    /// but never joined may request again; accepting that request replaces
-    /// its old slot.
+    /// Requests with a malformed key, from a viewer already in the room, with a
+    /// session ID or viewer that is already pending, or beyond [`MAX_PENDING`]
+    /// are refused, as are viewers whose key differs from the pinned one. Each
+    /// viewer is told about a refusal at most once per [`REFUSAL_INTERVAL`];
+    /// further requests in that interval are dropped without an answer. A
+    /// viewer that was accepted but never joined may request again; accepting
+    /// that request replaces its old slot.
     async fn on_request(&self, viewer: DeviceId, session_id: String, key: String) {
-        let Ok(key) = PublicKey::from_base64(&key) else {
-            let _ = self.respond(viewer, &session_id, Some(DenyReason::Denied)).await;
-            return;
-        };
-        let refusal = {
-            let mut st = lock(&self.state);
-            let duplicate = st.pending.contains_key(&session_id)
-                || st.viewers.get(&viewer).is_some_and(|v| v.joined)
-                || st.pending.values().any(|p| p.viewer == viewer);
-            if duplicate || st.pending.len() >= MAX_PENDING {
-                Some(Err(DenyReason::Denied))
-            } else {
-                match lock(&self.known).check(viewer, &key) {
-                    Err(changed) => Some(Ok(changed)),
-                    Ok(()) => {
-                        st.pending
-                            .insert(session_id.clone(), Pending { viewer, key });
-                        None
+        let decision = match PublicKey::from_base64(&key) {
+            Err(_) => Err(DenyReason::Denied),
+            Ok(key) => {
+                let mut st = lock(&self.state);
+                let duplicate = st.pending.contains_key(&session_id)
+                    || st.viewers.get(&viewer).is_some_and(|v| v.joined)
+                    || st.pending.values().any(|p| p.viewer == viewer);
+                if duplicate || st.pending.len() >= MAX_PENDING {
+                    Err(DenyReason::Denied)
+                } else {
+                    match lock(&self.known).check(viewer, &key) {
+                        Err(changed) => Ok(Err(changed)),
+                        Ok(()) => {
+                            st.pending
+                                .insert(session_id.clone(), Pending { viewer, key });
+                            Ok(Ok(key.fingerprint()))
+                        }
                     }
                 }
             }
         };
-        match refusal {
-            None => {
-                tracing::info!(viewer = %viewer, %session_id, "session requested");
-                let _ = self
-                    .events
-                    .send(HostEvent::ViewerRequested {
-                        session_id,
-                        viewer,
-                        fingerprint: key.fingerprint(),
-                    })
-                    .await;
-            }
-            Some(Err(reason)) => {
-                tracing::info!(viewer = %viewer, %session_id, "duplicate session request denied");
-                let _ = self.respond(viewer, &session_id, Some(reason)).await;
-            }
-            Some(Ok(changed)) => {
+        if let Ok(Ok(fingerprint)) = decision {
+            tracing::info!(viewer = %viewer, %session_id, "session requested");
+            let _ = self
+                .events
+                .send(HostEvent::ViewerRequested {
+                    session_id,
+                    viewer,
+                    fingerprint,
+                })
+                .await;
+            return;
+        }
+        let may_refuse = lock(&self.state).may_refuse(viewer, Instant::now());
+        if !may_refuse {
+            return;
+        }
+        match decision {
+            Ok(Err(changed)) => {
                 tracing::warn!(viewer = %viewer, %session_id, "viewer key changed, request refused");
                 let _ = self.events.send(HostEvent::KeyChanged(changed)).await;
                 let _ = self
                     .respond(viewer, &session_id, Some(DenyReason::KeyChanged))
                     .await;
             }
+            Err(reason) => {
+                tracing::info!(viewer = %viewer, %session_id, "session request refused");
+                let _ = self.respond(viewer, &session_id, Some(reason)).await;
+            }
+            Ok(Ok(_)) => {}
         }
     }
 

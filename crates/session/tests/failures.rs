@@ -247,3 +247,40 @@ async fn livekit_unreachable(pool: PgPool) {
     .await
     .expect("signaling still works");
 }
+
+#[sqlx::test(migrations = "../server/migrations")]
+async fn request_flood_does_not_exhaust_host(pool: PgPool) {
+    let env = TestEnv::start(pool).await;
+    let (h, attacker, v) = (
+        env.device("host", 1).await,
+        env.device("attacker", 2).await,
+        env.device("viewer", 3).await,
+    );
+    let (host, mut host_events) = start_host(&h, SessionConfig::default()).await;
+    let mut attacker_events = attacker.signaling.subscribe();
+    let key = attacker.keys.public_key().to_base64();
+    for i in 0..150 {
+        attacker
+            .signaling
+            .send(ClientMessage::SessionRequest {
+                to: h.id,
+                session_id: format!("flood-{i}"),
+                viewer_public_key: key.clone(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut answers = 0;
+    while let Ok(Some(msg)) =
+        tokio::time::timeout(Duration::from_secs(2), attacker_events.recv()).await
+    {
+        if matches!(msg, ServerMessage::SessionResponse { .. }) {
+            answers += 1;
+        }
+    }
+    assert!(answers <= 5, "host answered {answers} flooded requests");
+    while host_events.try_recv().is_ok() {}
+    let pending = request(&v, h.id, SessionConfig::default());
+    accept_next(&host, &mut host_events, pending).await;
+}

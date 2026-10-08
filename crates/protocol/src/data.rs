@@ -51,7 +51,8 @@ pub enum DataMessage {
     },
     /// A key was pressed or released.
     Key {
-        /// Platform-independent key code.
+        /// Windows set-1 scan code in the low byte, with `0x100` set for
+        /// E0-extended keys; `0x45` is Pause.
         code: u32,
         /// True when pressed, false when released.
         down: bool,
@@ -68,7 +69,7 @@ pub enum DataMessage {
 }
 
 /// A pointer button.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MouseButton {
     /// Primary button.
     Left,
@@ -106,6 +107,26 @@ pub enum Control {
         /// The requested mode.
         mode: QualityMode,
     },
+    /// What the receiving viewer may currently do on the host.
+    InputState(InputState),
+    /// A viewer asks the host to turn follow mode on or off.
+    SetFollow {
+        /// True to follow where the host is working.
+        on: bool,
+    },
+}
+
+/// A viewer's input permissions and the host-wide input status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct InputState {
+    /// Whether the viewer may move, click and scroll with the real cursor.
+    pub pointer: bool,
+    /// Whether the viewer may type.
+    pub keyboard: bool,
+    /// Whether all remote input is locked out because the host is using its input.
+    pub locked: bool,
+    /// Whether the shared monitor follows where the host is working.
+    pub follow: bool,
 }
 
 /// Most monitors a [`ScreenState`] lists.
@@ -236,6 +257,8 @@ impl fmt::Debug for Control {
             Control::SetQuality { mode } => {
                 f.debug_struct("SetQuality").field("mode", mode).finish()
             }
+            Control::InputState(state) => f.debug_tuple("InputState").field(state).finish(),
+            Control::SetFollow { on } => f.debug_struct("SetFollow").field("on", on).finish(),
         }
     }
 }
@@ -385,6 +408,23 @@ mod tests {
             .encode()[..4],
             [1, 4, 0, 2]
         );
+    }
+
+    #[test]
+    fn input_control_variants_round_trip_and_append() {
+        let state = DataMessage::Control(Control::InputState(InputState {
+            pointer: true,
+            keyboard: false,
+            locked: true,
+            follow: false,
+        }));
+        assert_eq!(DataMessage::decode(&state.encode()).unwrap(), state);
+        assert_eq!(state.encode(), [1, 4, 5, 1, 0, 1, 0]);
+        let follow = DataMessage::Control(Control::SetFollow { on: true });
+        assert_eq!(DataMessage::decode(&follow.encode()).unwrap(), follow);
+        assert_eq!(follow.encode(), [1, 4, 6, 1]);
+        assert!(follow.is_reliable());
+        assert_eq!(follow.topic(), TOPIC_INPUT);
     }
 
     #[test]

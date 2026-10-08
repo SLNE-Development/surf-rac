@@ -1,0 +1,23 @@
+[package]
+name = "surf-rac-session"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+surf-rac-protocol.workspace = true
+livekit.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+hmac.workspace = true
+rand.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+futures-util.workspace = true

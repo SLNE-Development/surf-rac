@@ -1,0 +1,17 @@
+port: 7880
+log_level: info
+rtc:
+  tcp_port: 7881
+  port_range_start: 50000
+  port_range_end: 50100
+  use_external_ip: false
+turn:
+  enabled: true
+  udp_port: 3478
+  relay_range_start: 50101
+  relay_range_end: 50200
+keys:
+  surfractest: surf-rac-test-secret-0123456789abcdef
+room:
+  max_participants: 6
+  empty_timeout: 30

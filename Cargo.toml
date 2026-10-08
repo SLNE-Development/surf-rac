@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/protocol", "crates/server"]
+members = ["crates/protocol", "crates/server", "crates/session"]
 
 [workspace.package]
 edition = "2024"
@@ -10,14 +10,20 @@ publish = false
 
 [workspace.dependencies]
 surf-rac-protocol = { path = "crates/protocol" }
+surf-rac-server = { path = "crates/server" }
 anyhow = "1"
 argon2 = "0.5"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
+chacha20poly1305 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
+hex = "0.4"
+hkdf = "0.12"
 hmac = "0.12"
+livekit = { version = "=0.9.3", features = ["rustls-tls-webpki-roots"] }
+postcard = { version = "1", features = ["use-std"] }
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
@@ -30,6 +36,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal
 tokio-tungstenite = "0.26"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 # Optimise dependencies in debug builds so argon2 hashing stays fast in tests.
 [profile.dev.package."*"]

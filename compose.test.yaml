@@ -12,8 +12,15 @@ services:
     tmpfs:
       - /var/lib/postgresql/data
 
+  livekit:
+    image: livekit/livekit-server:v1.13.7
+    command: ["--config", "/etc/livekit.yaml"]
+    volumes:
+      - ./deploy/livekit/livekit.test.yaml:/etc/livekit.yaml:ro
+
   test:
-    image: rust:1.88-bookworm
+    build:
+      context: deploy/test
     working_dir: /work
     volumes:
       - .:/work
@@ -21,14 +28,27 @@ services:
       - cargo-target:/work/target
     environment:
       DATABASE_URL: postgres://postgres:postgres@db/postgres
+      LIVEKIT_URL: ws://livekit:7880
+      LIVEKIT_API_KEY: surfractest
+      LIVEKIT_API_SECRET: surf-rac-test-secret-0123456789abcdef
       CARGO_TERM_COLOR: never
       # More parallel tests exhaust sqlx's shared test-database pool and stall for 30 s.
       RUST_TEST_THREADS: "8"
     depends_on:
       db:
         condition: service_healthy
+      livekit:
+        condition: service_started
     command: ["cargo", "test", "--workspace"]
 
 volumes:
   cargo-registry:
   cargo-target:
+
+# LiveKit's embedded TURN does not relay to private addresses, so the test network
+# uses a non-private range to make forced-relay sessions possible.
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 198.18.0.0/24

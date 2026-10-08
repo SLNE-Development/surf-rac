@@ -160,7 +160,9 @@ struct State {
     media_key: SessionKey,
     /// Key index of the current media key.
     media_index: u8,
-    /// Key index the host's track is encrypted with; trails `media_index` during a rotation.
+    /// Key the host's track is encrypted with; differs from `media_key` during a rotation.
+    active_key: SessionKey,
+    /// Key index of `active_key`.
     active_index: u8,
     /// When each viewer was last sent a refusal.
     refused: HashMap<DeviceId, Instant>,
@@ -187,6 +189,18 @@ struct Viewer {
 }
 
 impl State {
+    /// Returns the media keys a newly joined viewer needs, as `(index, key)`.
+    ///
+    /// That is the key the host encrypts with now and, while a rotation is
+    /// under way, also the key it is about to switch to.
+    fn join_keys(&self) -> Vec<(u8, [u8; 32])> {
+        let mut keys = vec![(self.active_index, *self.active_key.as_bytes())];
+        if self.media_index != self.active_index {
+            keys.push((self.media_index, *self.media_key.as_bytes()));
+        }
+        keys
+    }
+
     /// Returns whether `viewer` may be sent a refusal at `now`, and records it if so.
     fn may_refuse(&mut self, viewer: DeviceId, now: Instant) -> bool {
         self.refused
@@ -277,6 +291,7 @@ impl HostSession {
             state: Mutex::new(State {
                 pending: HashMap::new(),
                 viewers: HashMap::new(),
+                active_key: media_key.clone(),
                 media_key,
                 media_index: 0,
                 active_index: 0,
@@ -505,24 +520,25 @@ impl Inner {
         }
     }
 
-    /// Hands the media key to `viewer` once it is in the room.
+    /// Hands the media key, and during a rotation also the next one, to `viewer` once it is in the room.
     async fn on_viewer_active(&self, viewer: DeviceId) {
-        let key_msg = {
+        let keys = {
             let mut st = lock(&self.state);
-            let index = st.media_index;
-            let key = *st.media_key.as_bytes();
+            let keys = st.join_keys();
             match st.viewers.get_mut(&viewer) {
                 Some(v) if !v.joined => {
                     v.joined = true;
-                    Some(DataMessage::Control(Control::MediaKey { index, key }))
+                    keys
                 }
-                _ => None,
+                _ => return,
             }
         };
-        let Some(msg) = key_msg else { return };
-        if let Err(err) = self.send(viewer, &msg).await {
-            tracing::warn!(viewer = %viewer, error = %err, "sending media key failed");
-            return;
+        for (index, key) in keys {
+            let msg = DataMessage::Control(Control::MediaKey { index, key });
+            if let Err(err) = self.send(viewer, &msg).await {
+                tracing::warn!(viewer = %viewer, error = %err, "sending media key failed");
+                return;
+            }
         }
         tracing::info!(viewer = %viewer, "viewer joined");
         let _ = self.events.send(HostEvent::ViewerJoined { viewer }).await;
@@ -671,7 +687,11 @@ fn spawn_rotation(inner: &Arc<Inner>) {
         inner
             .key_provider
             .set_key(&own, i32::from(index), key.to_vec());
-        lock(&inner.state).active_index = index;
+        {
+            let mut st = lock(&inner.state);
+            st.active_index = index;
+            st.active_key = SessionKey::from_bytes(key);
+        }
         sync_own_key_index(&inner.room, &own, index);
         tracing::info!(device_id = %inner.device, index, "media key rotated");
     });
@@ -707,6 +727,28 @@ mod tests {
             .publish_track(LocalTrack::Video(track), TrackPublishOptions::default())
             .await
             .unwrap();
+    }
+
+    fn state(media_index: u8, active_index: u8) -> State {
+        State {
+            pending: HashMap::new(),
+            viewers: HashMap::new(),
+            media_key: SessionKey::from_bytes([media_index; 32]),
+            media_index,
+            active_key: SessionKey::from_bytes([active_index; 32]),
+            active_index,
+            refused: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn joining_viewer_gets_active_key_only_when_settled() {
+        assert_eq!(state(2, 2).join_keys(), vec![(2, [2; 32])]);
+    }
+
+    #[test]
+    fn joining_viewer_gets_both_keys_during_rotation() {
+        assert_eq!(state(3, 2).join_keys(), vec![(2, [2; 32]), (3, [3; 32])]);
     }
 
     #[tokio::test(flavor = "multi_thread")]

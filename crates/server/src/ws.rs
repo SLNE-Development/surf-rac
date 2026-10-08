@@ -8,10 +8,13 @@
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use futures_util::{SinkExt, StreamExt};
 use surf_rac_protocol::{ClientMessage, DeviceId, ServerMessage, WsErrorCode};
 
 use crate::devices;
+use crate::livekit::{self, Role};
 use crate::presence;
 use crate::sessions::{self, AuthUser};
 use crate::state::AppState;
@@ -193,15 +196,12 @@ fn handle_text(
             kind,
             data,
         } => {
-            let len = session_id.chars().count();
-            if len == 0 || len > MAX_SESSION_ID_CHARS {
-                return Some(error(
-                    WsErrorCode::BadMessage,
-                    "session_id must be 1 to 64 characters",
-                ));
+            if !valid_session_id(&session_id) {
+                return Some(bad_session_id());
             }
             tracing::debug!(from = %device, %to, ?kind, "signal");
-            let delivered = state.hub.send(
+            relay(
+                state,
                 to,
                 ServerMessage::Signal {
                     from: device,
@@ -209,8 +209,91 @@ fn handle_text(
                     kind,
                     data,
                 },
-            );
-            (!delivered).then(|| error(WsErrorCode::TargetOffline, "target device is offline"))
+            )
+        }
+        ClientMessage::SessionRequest {
+            to,
+            session_id,
+            viewer_public_key,
+        } => {
+            if !valid_session_id(&session_id) {
+                return Some(bad_session_id());
+            }
+            if !valid_public_key(&viewer_public_key) {
+                return Some(bad_public_key());
+            }
+            tracing::info!(viewer = %device, host = %to, %session_id, "session requested");
+            relay(
+                state,
+                to,
+                ServerMessage::SessionRequest {
+                    from: device,
+                    session_id,
+                    viewer_public_key,
+                },
+            )
+        }
+        ClientMessage::SessionResponse {
+            to,
+            session_id,
+            accepted,
+            reason,
+            host_public_key,
+        } => {
+            if !valid_session_id(&session_id) {
+                return Some(bad_session_id());
+            }
+            if host_public_key.as_deref().is_some_and(|k| !valid_public_key(k)) {
+                return Some(bad_public_key());
+            }
+            tracing::info!(host = %device, viewer = %to, %session_id, accepted, "session answered");
+            relay(
+                state,
+                to,
+                ServerMessage::SessionResponse {
+                    from: device,
+                    session_id,
+                    accepted,
+                    reason,
+                    host_public_key,
+                },
+            )
+        }
+        ClientMessage::HostTokenRequest => {
+            let room = livekit::room_for(device);
+            tracing::info!(device_id = %device, "host token issued");
+            Some(ServerMessage::HostToken {
+                url: state.config.livekit_url.clone(),
+                token: join_token(state, &room, device, Role::Host),
+                room,
+            })
+        }
+        ClientMessage::ViewerTokenRequest {
+            session_id,
+            viewer_device_id,
+        } => {
+            if !valid_session_id(&session_id) {
+                return Some(bad_session_id());
+            }
+            if viewer_device_id == device {
+                return Some(error(
+                    WsErrorCode::Forbidden,
+                    "a device cannot be a viewer of its own room",
+                ));
+            }
+            let room = livekit::room_for(device);
+            tracing::info!(host = %device, viewer = %viewer_device_id, %session_id, "viewer token issued");
+            relay(
+                state,
+                viewer_device_id,
+                ServerMessage::ViewerToken {
+                    from: device,
+                    session_id,
+                    url: state.config.livekit_url.clone(),
+                    token: join_token(state, &room, viewer_device_id, Role::Viewer),
+                    room,
+                },
+            )
         }
         ClientMessage::Ping => Some(ServerMessage::Pong),
         ClientMessage::TurnRequest => {
@@ -225,14 +308,52 @@ fn handle_text(
                 urls: config.turn_urls.clone(),
             })
         }
-        ClientMessage::SessionRequest { .. }
-        | ClientMessage::SessionResponse { .. }
-        | ClientMessage::HostTokenRequest
-        | ClientMessage::ViewerTokenRequest { .. } => Some(error(
-            WsErrorCode::BadMessage,
-            "message type not supported",
-        )),
     }
+}
+
+/// Queues `msg` for `to`; returns a `target_offline` error when it cannot be delivered.
+fn relay(state: &AppState, to: DeviceId, msg: ServerMessage) -> Option<ServerMessage> {
+    let delivered = state.hub.send(to, msg);
+    (!delivered).then(|| error(WsErrorCode::TargetOffline, "target device is offline"))
+}
+
+/// Returns whether `session_id` has 1 to [`MAX_SESSION_ID_CHARS`] characters.
+fn valid_session_id(session_id: &str) -> bool {
+    (1..=MAX_SESSION_ID_CHARS).contains(&session_id.chars().count())
+}
+
+/// Returns whether `key` is standard base64 of exactly 32 bytes.
+fn valid_public_key(key: &str) -> bool {
+    STANDARD.decode(key).is_ok_and(|bytes| bytes.len() == 32)
+}
+
+/// Builds the error for an invalid session ID.
+fn bad_session_id() -> ServerMessage {
+    error(
+        WsErrorCode::BadMessage,
+        "session_id must be 1 to 64 characters",
+    )
+}
+
+/// Builds the error for an invalid public key.
+fn bad_public_key() -> ServerMessage {
+    error(
+        WsErrorCode::BadMessage,
+        "public key must be base64 of 32 bytes",
+    )
+}
+
+/// Mints a LiveKit join token for `identity` in `room` with the server's API key.
+fn join_token(state: &AppState, room: &str, identity: DeviceId, role: Role) -> String {
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    livekit::token(
+        &state.config.livekit_api_key,
+        &state.config.livekit_api_secret,
+        room,
+        identity,
+        role,
+        now,
+    )
 }
 
 /// Tracks re-validation results of one connection.

@@ -22,6 +22,12 @@ use x25519_dalek::StaticSecret;
 /// HKDF info prefix of session keys.
 const KDF_INFO: &[u8] = b"surf-rac session v1";
 
+/// HKDF info prefix of keys that seal an unattended password.
+const PASSWORD_KDF_INFO: &[u8] = b"surf-rac-password-v1";
+
+/// Topic the sealed password is bound to.
+const PASSWORD_TOPIC: &str = "password";
+
 /// Length of the nonce prefixed to sealed data.
 const NONCE_LEN: usize = 12;
 
@@ -251,6 +257,70 @@ pub fn open(
         .map_err(|_| CryptoError::Decrypt)
 }
 
+/// Derives the key that seals the unattended password of a session request.
+///
+/// Viewer and host get the same key: each passes its own key pair and the
+/// other's public key. Fails with [`CryptoError::LowOrderPoint`] when the peer
+/// key yields an all-zero shared secret.
+fn password_key(
+    own: &DeviceKeys,
+    peer: &PublicKey,
+    session_id: &str,
+    viewer: DeviceId,
+    host: DeviceId,
+) -> Result<SessionKey, CryptoError> {
+    let shared = own
+        .secret
+        .diffie_hellman(&x25519_dalek::PublicKey::from(peer.0));
+    if !shared.was_contributory() {
+        return Err(CryptoError::LowOrderPoint);
+    }
+    let mut info = PASSWORD_KDF_INFO.to_vec();
+    info.extend_from_slice(session_id.as_bytes());
+    info.extend_from_slice(viewer.to_string().as_bytes());
+    info.extend_from_slice(host.to_string().as_bytes());
+    let mut key = [0u8; 32];
+    Hkdf::<Sha256>::new(None, shared.as_bytes())
+        .expand(&info, &mut key)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    Ok(SessionKey(key))
+}
+
+/// Seals `password` so that only `host_key`'s owner can read it in `session_id`.
+///
+/// `own` is the viewer's key pair. Returns standard base64 of the nonce
+/// followed by the ciphertext, as carried in a session request.
+pub fn seal_password(
+    own: &DeviceKeys,
+    host_key: &PublicKey,
+    session_id: &str,
+    viewer: DeviceId,
+    host: DeviceId,
+    password: &str,
+) -> Result<String, CryptoError> {
+    let key = password_key(own, host_key, session_id, viewer, host)?;
+    Ok(STANDARD.encode(seal(&key, PASSWORD_TOPIC, session_id, password.as_bytes())))
+}
+
+/// Opens a password sealed with [`seal_password`] for this host.
+///
+/// `own` is the host's key pair and `viewer_key` the key the request came
+/// with. Fails with [`CryptoError::Decrypt`] when the text is not base64, was
+/// sealed for another key, session or device pair, was altered, or is not UTF-8.
+pub fn open_password(
+    own: &DeviceKeys,
+    viewer_key: &PublicKey,
+    session_id: &str,
+    viewer: DeviceId,
+    host: DeviceId,
+    sealed: &str,
+) -> Result<String, CryptoError> {
+    let key = password_key(own, viewer_key, session_id, viewer, host)?;
+    let bytes = STANDARD.decode(sealed).map_err(|_| CryptoError::Decrypt)?;
+    let plain = open(&key, PASSWORD_TOPIC, session_id, &bytes)?;
+    String::from_utf8(plain).map_err(|_| CryptoError::Decrypt)
+}
+
 /// Returns 32 random bytes for use as a host nonce.
 pub fn random_nonce() -> [u8; 32] {
     let mut nonce = [0u8; 32];
@@ -281,6 +351,49 @@ mod tests {
             DeviceId::new(123_456_789).unwrap(),
             DeviceId::new(223_456_789).unwrap(),
         )
+    }
+
+    #[test]
+    fn password_round_trips_between_viewer_and_host() {
+        let (host, viewer) = (DeviceKeys::generate(), DeviceKeys::generate());
+        let (hid, vid) = ids();
+        let sealed = seal_password(&viewer, &host.public_key(), "s1", vid, hid, "hunter22").unwrap();
+        let opened = open_password(&host, &viewer.public_key(), "s1", vid, hid, &sealed).unwrap();
+        assert_eq!(opened, "hunter22");
+    }
+
+    #[test]
+    fn password_sealed_for_another_key_does_not_open() {
+        let (host, viewer, other) = (DeviceKeys::generate(), DeviceKeys::generate(), DeviceKeys::generate());
+        let (hid, vid) = ids();
+        let sealed = seal_password(&viewer, &other.public_key(), "s1", vid, hid, "pw").unwrap();
+        assert_eq!(
+            open_password(&host, &viewer.public_key(), "s1", vid, hid, &sealed),
+            Err(CryptoError::Decrypt)
+        );
+    }
+
+    #[test]
+    fn password_is_bound_to_session_and_devices() {
+        let (host, viewer) = (DeviceKeys::generate(), DeviceKeys::generate());
+        let (hid, vid) = ids();
+        let sealed = seal_password(&viewer, &host.public_key(), "s1", vid, hid, "pw").unwrap();
+        assert!(open_password(&host, &viewer.public_key(), "s2", vid, hid, &sealed).is_err());
+        assert!(open_password(&host, &viewer.public_key(), "s1", hid, vid, &sealed).is_err());
+    }
+
+    #[test]
+    fn tampered_or_garbage_password_fails() {
+        let (host, viewer) = (DeviceKeys::generate(), DeviceKeys::generate());
+        let (hid, vid) = ids();
+        let sealed = seal_password(&viewer, &host.public_key(), "s1", vid, hid, "pw").unwrap();
+        let mut bytes = STANDARD.decode(&sealed).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        let tampered = STANDARD.encode(bytes);
+        assert!(open_password(&host, &viewer.public_key(), "s1", vid, hid, &tampered).is_err());
+        for garbage in ["", "not base64!", "AAAA"] {
+            assert!(open_password(&host, &viewer.public_key(), "s1", vid, hid, garbage).is_err());
+        }
     }
 
     #[test]

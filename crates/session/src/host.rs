@@ -67,6 +67,10 @@ pub enum HostEvent {
         viewer: DeviceId,
         /// Fingerprint of the viewer's public key.
         fingerprint: String,
+        /// The viewer's public key.
+        viewer_key: PublicKey,
+        /// The unattended password the viewer sealed for this host, if it offered one.
+        password: Option<String>,
     },
     /// A viewer presented a key that differs from its pinned key; its request was refused.
     KeyChanged(KeyChanged),
@@ -753,7 +757,13 @@ impl Inner {
     /// further requests in that interval are dropped without an answer. A
     /// viewer that was accepted but never joined may request again; accepting
     /// that request replaces its old slot.
-    async fn on_request(&self, viewer: DeviceId, session_id: String, key: String) {
+    async fn on_request(
+        &self,
+        viewer: DeviceId,
+        session_id: String,
+        key: String,
+        password: Option<String>,
+    ) {
         self.expire_requests().await;
         let decision = match PublicKey::from_base64(&key) {
             Err(_) => Err(DenyReason::Denied),
@@ -776,20 +786,22 @@ impl Inner {
                                     requested_at: Instant::now(),
                                 },
                             );
-                            Ok(Ok(key.fingerprint()))
+                            Ok(Ok(key))
                         }
                     }
                 }
             }
         };
-        if let Ok(Ok(fingerprint)) = decision {
+        if let Ok(Ok(viewer_key)) = decision {
             tracing::info!(viewer = %viewer, %session_id, "session requested");
             let _ = self
                 .events
                 .send(HostEvent::ViewerRequested {
                     session_id,
                     viewer,
-                    fingerprint,
+                    fingerprint: viewer_key.fingerprint(),
+                    viewer_key,
+                    password,
                 })
                 .await;
             return;
@@ -889,8 +901,8 @@ async fn run(
     let reason = loop {
         tokio::select! {
             msg = signaling.recv(), if signaling_open => match msg {
-                Some(ServerMessage::SessionRequest { from, session_id, viewer_public_key, .. }) => {
-                    inner.on_request(from, session_id, viewer_public_key).await;
+                Some(ServerMessage::SessionRequest { from, session_id, viewer_public_key, password }) => {
+                    inner.on_request(from, session_id, viewer_public_key, password).await;
                 }
                 Some(_) => {}
                 None => {

@@ -31,6 +31,25 @@ const KEY_RING_SIZE: u8 = 16;
 /// Viewer events buffered for the application; frames beyond this are dropped.
 const EVENT_CAPACITY: usize = 64;
 
+/// Optional inputs of a session request.
+#[derive(Clone, Default)]
+pub struct RequestOptions {
+    /// Unattended password offered to the host; sent only when a host key is known.
+    pub password: Option<String>,
+    /// Host public key the password is sealed for when no key is pinned for the host yet.
+    pub host_key: Option<PublicKey>,
+}
+
+impl std::fmt::Debug for RequestOptions {
+    /// Writes the options without the password.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RequestOptions")
+            .field("password", &self.password.as_ref().map(|_| ".."))
+            .field("host_key", &self.host_key)
+            .finish()
+    }
+}
+
 /// Something that happened in a viewer session.
 #[derive(Debug)]
 pub enum ViewerEvent {
@@ -118,15 +137,44 @@ impl ViewerSession {
         host: DeviceId,
         config: SessionConfig,
     ) -> Result<(ViewerSession, mpsc::Receiver<ViewerEvent>), RequestError> {
+        Self::request_with(signaling, keys, known, host, RequestOptions::default(), config).await
+    }
+
+    /// Requests a session with `host` like [`ViewerSession::request`], offering
+    /// the unattended password in `options`.
+    ///
+    /// The password is sealed for the key pinned for `host`, or for
+    /// `options.host_key` when none is pinned; without either it is not sent.
+    pub async fn request_with(
+        signaling: SignalingClient,
+        keys: Arc<DeviceKeys>,
+        known: Arc<Mutex<KnownKeys>>,
+        host: DeviceId,
+        options: RequestOptions,
+        config: SessionConfig,
+    ) -> Result<(ViewerSession, mpsc::Receiver<ViewerEvent>), RequestError> {
         let viewer = signaling.device_id();
         let session_id = new_session_id();
+        let password = match options.password.as_deref() {
+            None => None,
+            Some(password) => {
+                let host_key = lock(&known).get(host).copied().or(options.host_key);
+                match host_key {
+                    None => None,
+                    Some(key) => Some(
+                        crypto::seal_password(&keys, &key, &session_id, viewer, host, password)
+                            .map_err(|_| RequestError::Denied)?,
+                    ),
+                }
+            }
+        };
         let mut sig_events = signaling.subscribe();
         signaling
             .send(ClientMessage::SessionRequest {
                 to: host,
                 session_id: session_id.clone(),
                 viewer_public_key: keys.public_key().to_base64(),
-                password: None,
+                password,
             })
             .await?;
         tracing::info!(%host, %session_id, "session requested");

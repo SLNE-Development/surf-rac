@@ -143,6 +143,7 @@ async fn remote_host() {
                     session_id,
                     viewer,
                     fingerprint,
+                    ..
                 } => {
                     println!("viewer {viewer} requests session (key {fingerprint}), accepting");
                     host.accept(&session_id).await.expect("accept");

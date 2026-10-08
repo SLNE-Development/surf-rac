@@ -50,6 +50,11 @@ impl KnownKeys {
         self.keys.insert(device, key);
     }
 
+    /// Returns every pinned device and its key.
+    pub fn entries(&self) -> impl Iterator<Item = (DeviceId, PublicKey)> + '_ {
+        self.keys.iter().map(|(device, key)| (*device, *key))
+    }
+
     /// Returns the key pinned for `device`, if any.
     pub fn get(&self, device: DeviceId) -> Option<&PublicKey> {
         self.keys.get(&device)

@@ -15,6 +15,62 @@ use surf_rac_session::viewer::ViewerEvent;
 use surf_rac_session::{EndReason, FrameError, SessionConfig, VideoInput};
 
 #[sqlx::test(migrations = "../server/migrations")]
+async fn password_reaches_host(pool: PgPool) {
+    use std::sync::Arc;
+    use surf_rac_session::crypto::open_password;
+    use surf_rac_session::viewer::{RequestOptions, ViewerSession};
+
+    let env = TestEnv::start(pool).await;
+    let (h, v) = (env.device("host", 1).await, env.device("viewer", 2).await);
+    let (_host, mut host_events) = start_host(&h, SessionConfig::default()).await;
+
+    let options = RequestOptions {
+        password: Some("hunter22".into()),
+        host_key: Some(h.keys.public_key()),
+    };
+    let (signaling, keys, known) = (v.signaling.clone(), Arc::clone(&v.keys), Arc::clone(&v.known));
+    let host_id = h.id;
+    let _pending = tokio::spawn(async move {
+        ViewerSession::request_with(signaling, keys, known, host_id, options, SessionConfig::default())
+            .await
+    });
+    let ev = host_event(&mut host_events, Duration::from_secs(10), |e| {
+        matches!(e, HostEvent::ViewerRequested { .. })
+    })
+    .await;
+    let HostEvent::ViewerRequested {
+        session_id,
+        viewer,
+        viewer_key,
+        password,
+        ..
+    } = ev
+    else {
+        unreachable!()
+    };
+    let sealed = password.expect("sealed password relayed");
+    assert_eq!(viewer_key, v.keys.public_key());
+    let opened = open_password(&h.keys, &viewer_key, &session_id, viewer, h.id, &sealed).unwrap();
+    assert_eq!(opened, "hunter22");
+}
+
+#[sqlx::test(migrations = "../server/migrations")]
+async fn request_without_options_carries_no_password(pool: PgPool) {
+    let env = TestEnv::start(pool).await;
+    let (h, v) = (env.device("host", 1).await, env.device("viewer", 2).await);
+    let (_host, mut host_events) = start_host(&h, SessionConfig::default()).await;
+    let _pending = request(&v, h.id, SessionConfig::default());
+    let ev = host_event(&mut host_events, Duration::from_secs(10), |e| {
+        matches!(e, HostEvent::ViewerRequested { .. })
+    })
+    .await;
+    let HostEvent::ViewerRequested { password, .. } = ev else {
+        unreachable!()
+    };
+    assert!(password.is_none());
+}
+
+#[sqlx::test(migrations = "../server/migrations")]
 async fn viewer_receives_video(pool: PgPool) {
     let env = TestEnv::start(pool).await;
     let (h, v) = (env.device("host", 1).await, env.device("viewer", 2).await);

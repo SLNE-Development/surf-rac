@@ -1,5 +1,5 @@
 # Test image: Rust toolchain plus what the prebuilt libwebrtc of the LiveKit SDK needs to link.
-FROM rust:1.88-bookworm
+FROM rust:1.95-bookworm
 RUN apt-get update \
  && apt-get install -y --no-install-recommends lsb-release wget gnupg software-properties-common \
     libglib2.0-dev libclang-dev pkg-config libjpeg62-turbo-dev libx11-dev libxext-dev \

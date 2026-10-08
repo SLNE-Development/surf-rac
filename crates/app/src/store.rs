@@ -103,7 +103,10 @@ pub struct Settings {
     /// Whether a correct unattended password admits a viewer without a prompt.
     pub unattended: bool,
     /// Argon2id hash of the unattended password, if one is set.
-    #[serde(deserialize_with = "lenient_secret", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        deserialize_with = "lenient_secret",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub password_hash: Option<Secret>,
     /// Whether new sessions start with clipboard sync on.
     pub clipboard_default: bool,
@@ -132,15 +135,24 @@ pub struct State {
     /// Username of the logged-in account.
     pub account: Option<String>,
     /// Session token of the logged-in account.
-    #[serde(deserialize_with = "lenient_secret", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        deserialize_with = "lenient_secret",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub session_token: Option<Secret>,
     /// This device's ID once registered.
     pub device_id: Option<DeviceId>,
     /// This device's secret once registered.
-    #[serde(deserialize_with = "lenient_secret", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        deserialize_with = "lenient_secret",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub device_secret: Option<Secret>,
     /// This device's X25519 private key, standard base64 of 32 bytes.
-    #[serde(deserialize_with = "lenient_secret", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        deserialize_with = "lenient_secret",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub device_key: Option<Secret>,
     /// Public keys pinned per peer device, standard base64.
     pub known_keys: BTreeMap<DeviceId, String>,
@@ -252,7 +264,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("surf-rac-{name}-{}-{nanos}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("surf-rac-{name}-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -278,7 +291,8 @@ mod tests {
                 s.device_id = Some(id(123_456_789));
                 s.device_secret = Some(Secret::new("device-secret"));
                 s.known_keys.insert(id(223_456_789), "AAAA".into());
-                s.saved_passwords.insert(id(223_456_789), Secret::new("hunter22"));
+                s.saved_passwords
+                    .insert(id(223_456_789), Secret::new("hunter22"));
                 s.settings.unattended = true;
             })
             .unwrap();

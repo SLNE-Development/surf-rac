@@ -21,17 +21,25 @@ async fn account_device_and_contacts(pool: PgPool) {
     let api = Api::new(&env.http);
 
     let code = invite(&env).await;
-    api.register(&code, "alice", "correct horse battery").await.unwrap();
+    api.register(&code, "alice", "correct horse battery")
+        .await
+        .unwrap();
     assert!(matches!(
         api.register(&code, "alice2", "correct horse battery").await,
         Err(ApiError::Invalid(_) | ApiError::Unauthorized | ApiError::Conflict(_))
     ));
-    assert_eq!(api.login("alice", "wrong password!").await, Err(ApiError::Unauthorized));
+    assert_eq!(
+        api.login("alice", "wrong password!").await,
+        Err(ApiError::Unauthorized)
+    );
     let token = api.login("alice", "correct horse battery").await.unwrap();
     let api = api.with_token(Some(token));
 
     let fingerprint = format!("{:064x}", 7);
-    let device = api.register_device(&fingerprint, "laptop", None).await.unwrap();
+    let device = api
+        .register_device(&fingerprint, "laptop", None)
+        .await
+        .unwrap();
     assert!(!device.rebound);
     let again = api
         .register_device(&fingerprint, "laptop", Some(device.device_id))
@@ -39,7 +47,9 @@ async fn account_device_and_contacts(pool: PgPool) {
         .unwrap();
     assert_eq!(again.device_id, device.device_id);
 
-    let key = surf_rac_session::DeviceKeys::generate().public_key().to_base64();
+    let key = surf_rac_session::DeviceKeys::generate()
+        .public_key()
+        .to_base64();
     api.put_public_key(device.device_id, &key).await.unwrap();
     let presence = api.presence(device.device_id).await.unwrap();
     assert_eq!(presence.public_key.as_deref(), Some(key.as_str()));

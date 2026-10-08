@@ -97,7 +97,9 @@ pub struct Api {
 impl std::fmt::Debug for Api {
     /// Writes the base URL without the token.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Api").field("base", &self.base).finish_non_exhaustive()
+        f.debug_struct("Api")
+            .field("base", &self.base)
+            .finish_non_exhaustive()
     }
 }
 
@@ -140,13 +142,19 @@ impl Api {
     }
 
     /// Creates an account with an invite code.
-    pub async fn register(&self, invite: &str, username: &str, password: &str) -> Result<(), ApiError> {
+    pub async fn register(
+        &self,
+        invite: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<(), ApiError> {
         let body = RegisterRequest {
             invite_code: invite.into(),
             username: username.into(),
             password: password.into(),
         };
-        self.send(self.http.post(self.url("/v1/register")).json(&body)).await?;
+        self.send(self.http.post(self.url("/v1/register")).json(&body))
+            .await?;
         Ok(())
     }
 
@@ -156,7 +164,9 @@ impl Api {
             username: username.into(),
             password: password.into(),
         };
-        let res: LoginResponse = self.json(self.http.post(self.url("/v1/login")).json(&body)).await?;
+        let res: LoginResponse = self
+            .json(self.http.post(self.url("/v1/login")).json(&body))
+            .await?;
         Ok(res.token)
     }
 
@@ -178,7 +188,8 @@ impl Api {
             name: name.into(),
             device_id,
         };
-        self.json(self.http.post(self.url("/v1/devices")).json(&body)).await
+        self.json(self.http.post(self.url("/v1/devices")).json(&body))
+            .await
     }
 
     /// Lists the account's devices.
@@ -188,7 +199,8 @@ impl Api {
 
     /// Removes one of the account's devices.
     pub async fn delete_device(&self, id: DeviceId) -> Result<(), ApiError> {
-        self.send(self.http.delete(self.url(&format!("/v1/devices/{id}")))).await?;
+        self.send(self.http.delete(self.url(&format!("/v1/devices/{id}"))))
+            .await?;
         Ok(())
     }
 
@@ -197,7 +209,8 @@ impl Api {
         let body = PutPublicKeyRequest {
             public_key: public_key.into(),
         };
-        self.put(&format!("/v1/devices/{id}/public-key"), &body).await
+        self.put(&format!("/v1/devices/{id}/public-key"), &body)
+            .await
     }
 
     /// Lists the account's contacts with their presence.
@@ -207,19 +220,23 @@ impl Api {
 
     /// Adds a contact or changes its alias.
     pub async fn put_contact(&self, id: DeviceId, alias: &str) -> Result<(), ApiError> {
-        let body = PutContactRequest { alias: alias.into() };
+        let body = PutContactRequest {
+            alias: alias.into(),
+        };
         self.put(&format!("/v1/contacts/{id}"), &body).await
     }
 
     /// Removes a contact.
     pub async fn delete_contact(&self, id: DeviceId) -> Result<(), ApiError> {
-        self.send(self.http.delete(self.url(&format!("/v1/contacts/{id}")))).await?;
+        self.send(self.http.delete(self.url(&format!("/v1/contacts/{id}"))))
+            .await?;
         Ok(())
     }
 
     /// Returns whether a device is online and its published public key.
     pub async fn presence(&self, id: DeviceId) -> Result<PresenceInfo, ApiError> {
-        self.json(self.http.get(self.url(&format!("/v1/presence/{id}")))).await
+        self.json(self.http.get(self.url(&format!("/v1/presence/{id}"))))
+            .await
     }
 
     /// Returns the absolute URL of `path`.
@@ -247,7 +264,10 @@ impl Api {
             Some(token) => req.bearer_auth(token),
             None => req,
         };
-        let res = req.send().await.map_err(|e| ApiError::Network(e.to_string()))?;
+        let res = req
+            .send()
+            .await
+            .map_err(|e| ApiError::Network(e.to_string()))?;
         if res.status().is_success() {
             return Ok(res);
         }
@@ -262,25 +282,54 @@ mod tests {
     use super::*;
 
     fn body(code: &str) -> Vec<u8> {
-        serde_json::json!({"error": code, "message": "msg"}).to_string().into_bytes()
+        serde_json::json!({"error": code, "message": "msg"})
+            .to_string()
+            .into_bytes()
     }
 
     #[test]
     fn ws_url_follows_scheme() {
-        assert_eq!(Api::new("https://rac.slne.dev/").ws_url(), "wss://rac.slne.dev");
-        assert_eq!(Api::new("http://127.0.0.1:8080").ws_url(), "ws://127.0.0.1:8080");
+        assert_eq!(
+            Api::new("https://rac.slne.dev/").ws_url(),
+            "wss://rac.slne.dev"
+        );
+        assert_eq!(
+            Api::new("http://127.0.0.1:8080").ws_url(),
+            "ws://127.0.0.1:8080"
+        );
     }
 
     #[test]
     fn error_codes_map_to_errors() {
-        assert_eq!(error_from(401, &body("unauthorized")), ApiError::Unauthorized);
-        assert_eq!(error_from(409, &body("conflict")), ApiError::Conflict("msg".into()));
-        assert_eq!(error_from(423, &body("locked")), ApiError::Locked("msg".into()));
-        assert_eq!(error_from(429, &body("rate_limited")), ApiError::RateLimited);
-        assert_eq!(error_from(400, &body("bad_request")), ApiError::Invalid("msg".into()));
-        assert_eq!(error_from(403, &body("forbidden")), ApiError::Invalid("msg".into()));
+        assert_eq!(
+            error_from(401, &body("unauthorized")),
+            ApiError::Unauthorized
+        );
+        assert_eq!(
+            error_from(409, &body("conflict")),
+            ApiError::Conflict("msg".into())
+        );
+        assert_eq!(
+            error_from(423, &body("locked")),
+            ApiError::Locked("msg".into())
+        );
+        assert_eq!(
+            error_from(429, &body("rate_limited")),
+            ApiError::RateLimited
+        );
+        assert_eq!(
+            error_from(400, &body("bad_request")),
+            ApiError::Invalid("msg".into())
+        );
+        assert_eq!(
+            error_from(403, &body("forbidden")),
+            ApiError::Invalid("msg".into())
+        );
         assert_eq!(error_from(404, &body("not_found")), ApiError::NotFound);
-        assert_eq!(error_from(500, &body("internal")), ApiError::Server("msg".into()));
+        assert_eq!(
+            error_from(500, &body("internal")),
+            ApiError::Server("msg".into())
+        );
     }
 
     #[test]
@@ -289,7 +338,10 @@ mod tests {
         assert_eq!(error_from(404, b""), ApiError::NotFound);
         assert_eq!(error_from(429, b""), ApiError::RateLimited);
         assert_eq!(error_from(418, b""), ApiError::Invalid("HTTP 418".into()));
-        assert_eq!(error_from(502, b"bad gateway"), ApiError::Server("HTTP 502".into()));
+        assert_eq!(
+            error_from(502, b"bad gateway"),
+            ApiError::Server("HTTP 502".into())
+        );
     }
 
     #[test]

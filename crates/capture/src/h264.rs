@@ -9,6 +9,31 @@ pub const NAL_SPS: u8 = 7;
 /// NAL unit type of a picture parameter set.
 pub const NAL_PPS: u8 = 8;
 
+/// Why the hardware encoder failed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum EncodeError {
+    /// This machine has no hardware H.264 encoder.
+    #[error("no hardware H.264 encoder")]
+    NoHardware,
+    /// The encoder did not ask for input in time.
+    #[error("hardware encoder stalled")]
+    Stalled,
+    /// A Media Foundation call failed with this HRESULT.
+    #[error("media foundation error {0:#010x}")]
+    Hresult(u32),
+}
+
+/// One encoded H.264 access unit in Annex-B format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodedAu {
+    /// The Annex-B bytes; SPS and PPS precede every IDR.
+    pub data: Vec<u8>,
+    /// Whether the access unit is an IDR frame.
+    pub keyframe: bool,
+    /// Capture time of the frame it encodes, in microseconds.
+    pub timestamp_us: i64,
+}
+
 /// Returns the NAL unit types in an Annex-B byte stream, in order.
 pub fn nal_types(au: &[u8]) -> Vec<u8> {
     let mut types = Vec::new();

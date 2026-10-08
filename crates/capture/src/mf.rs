@@ -30,6 +30,7 @@ use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMe
 use windows::Win32::System::Variant::VARIANT;
 use windows::core::{GUID, Interface, PWSTR};
 
+pub use crate::h264::{EncodeError, EncodedAu};
 use crate::h264::{NAL_SPS, nal_types};
 
 /// Longest time one call waits for the encoder to accept input.
@@ -41,36 +42,11 @@ const OUTPUT_WAIT: Duration = Duration::from_millis(30);
 /// Media Foundation time units (100 ns) per microsecond.
 const UNITS_PER_US: i64 = 10;
 
-/// Why the hardware encoder failed.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum EncodeError {
-    /// This machine has no hardware H.264 encoder.
-    #[error("no hardware H.264 encoder")]
-    NoHardware,
-    /// The encoder did not ask for input in time.
-    #[error("hardware encoder stalled")]
-    Stalled,
-    /// A Media Foundation call failed with this HRESULT.
-    #[error("media foundation error {0:#010x}")]
-    Hresult(u32),
-}
-
 impl From<windows::core::Error> for EncodeError {
     /// Keeps the HRESULT of a failed Media Foundation call.
     fn from(e: windows::core::Error) -> Self {
         EncodeError::Hresult(e.code().0 as u32)
     }
-}
-
-/// One encoded H.264 access unit in Annex-B format.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EncodedAu {
-    /// The Annex-B bytes; SPS and PPS precede every IDR.
-    pub data: Vec<u8>,
-    /// Whether the access unit is an IDR frame.
-    pub keyframe: bool,
-    /// Capture time of the frame it encodes, in microseconds.
-    pub timestamp_us: i64,
 }
 
 /// A hardware H.264 encoder for NV12 frames of one size.

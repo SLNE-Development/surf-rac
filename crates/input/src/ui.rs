@@ -55,8 +55,17 @@ const WM_GHOSTS: u32 = WM_APP + 1;
 /// Message that ends the UI thread.
 const WM_STOP: u32 = WM_APP + 2;
 
-/// Ghosts to draw: color slot and desktop position of each, shared with the UI thread.
-type SharedGhosts = Arc<Mutex<Vec<(u8, i32, i32)>>>;
+/// Ghosts to draw, shared with the UI thread.
+#[derive(Debug, Default)]
+struct Ghosts {
+    /// Color slot and desktop position of each ghost.
+    list: Mutex<Vec<(u8, i32, i32)>>,
+    /// Whether a redraw message is already queued for the overlay.
+    redraw_pending: AtomicBool,
+}
+
+/// Ghosts shared between the UI thread and its owner.
+type SharedGhosts = Arc<Ghosts>;
 
 /// What the UI thread observed, readable from any thread.
 #[derive(Debug)]
@@ -188,7 +197,7 @@ impl UiThread {
     /// Fails when a hook or the overlay window cannot be created.
     pub fn start(base: Instant) -> Result<UiThread, String> {
         let signals = Arc::new(Signals::new(base));
-        let ghosts = Arc::new(Mutex::new(Vec::new()));
+        let ghosts = Arc::new(Ghosts::default());
         let (ready_tx, ready_rx) = mpsc::channel();
         let thread = {
             let signals = Arc::clone(&signals);
@@ -219,11 +228,18 @@ impl UiThread {
     }
 
     /// Replaces the ghosts the overlay draws: color slot and desktop position each.
+    ///
+    /// At most one redraw is queued at a time, and nothing is posted once the
+    /// UI thread has stopped.
     pub fn set_ghosts(&self, ghosts: Vec<(u8, i32, i32)>) {
-        *self.ghosts.lock().unwrap_or_else(|e| e.into_inner()) = ghosts;
-        // SAFETY: posting to a window owned by the UI thread; a destroyed window only fails the post.
-        unsafe {
-            let _ = PostMessageW(Some(self.window()), WM_GHOSTS, WPARAM(0), LPARAM(0));
+        *self.ghosts.list.lock().unwrap_or_else(|e| e.into_inner()) = ghosts;
+        if !self.signals.alive() || self.ghosts.redraw_pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // SAFETY: posting to the window the running UI thread owns.
+        let posted = unsafe { PostMessageW(Some(self.window()), WM_GHOSTS, WPARAM(0), LPARAM(0)) };
+        if posted.is_err() {
+            self.ghosts.redraw_pending.store(false, Ordering::Release);
         }
     }
 
@@ -241,14 +257,22 @@ impl UiThread {
 
 impl Drop for UiThread {
     /// Destroys the overlay, removes the hooks and waits for the thread to end.
+    ///
+    /// When the stop request cannot be posted to a running thread, the thread
+    /// is left to end on its own instead of being waited for.
     fn drop(&mut self) {
-        // SAFETY: posting to a window owned by the UI thread.
-        unsafe {
-            let _ = PostMessageW(Some(self.window()), WM_STOP, WPARAM(0), LPARAM(0));
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        if self.signals.alive() {
+            // SAFETY: posting to the window the running UI thread owns.
+            let posted = unsafe { PostMessageW(Some(self.window()), WM_STOP, WPARAM(0), LPARAM(0)) };
+            if posted.is_err() && !thread.is_finished() {
+                tracing::warn!("input UI thread did not take the stop request");
+                return;
+            }
         }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        let _ = thread.join();
     }
 }
 
@@ -286,6 +310,9 @@ fn run(signals: Arc<Signals>, ghosts: SharedGhosts, ready: mpsc::Sender<Result<i
             WINEVENT_OUTOFCONTEXT,
         )
     };
+    if foreground.is_invalid() {
+        tracing::warn!("foreground tracking unavailable; follow mode reacts to the mouse only");
+    }
     let hwnd = match create_overlay() {
         Ok(hwnd) => hwnd,
         Err(e) => {
@@ -299,7 +326,7 @@ fn run(signals: Arc<Signals>, ghosts: SharedGhosts, ready: mpsc::Sender<Result<i
     let mut msg = MSG::default();
     // SAFETY: standard message loop on the thread that owns the window and hooks.
     unsafe {
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
             DispatchMessageW(&msg);
         }
     }
@@ -435,7 +462,7 @@ fn current_ghosts() -> Vec<(u8, i32, i32)> {
     GHOSTS.with(|g| {
         g.borrow()
             .as_ref()
-            .map(|g| g.lock().unwrap_or_else(|e| e.into_inner()).clone())
+            .map(|g| g.list.lock().unwrap_or_else(|e| e.into_inner()).clone())
             .unwrap_or_default()
     })
 }
@@ -446,6 +473,11 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
     unsafe {
         match msg {
             WM_GHOSTS => {
+                GHOSTS.with(|g| {
+                    if let Some(g) = g.borrow().as_ref() {
+                        g.redraw_pending.store(false, Ordering::Release);
+                    }
+                });
                 if current_ghosts().is_empty() {
                     let _ = ShowWindow(hwnd, SW_HIDE);
                 } else {

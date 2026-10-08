@@ -11,7 +11,7 @@ use axum::extract::ws::{Message, WebSocket};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use futures_util::{SinkExt, StreamExt};
-use surf_rac_protocol::{ClientMessage, DeviceId, ServerMessage, WsErrorCode};
+use surf_rac_protocol::{ClientMessage, DeviceId, MAX_SEALED_PASSWORD_LEN, ServerMessage, WsErrorCode};
 
 use crate::devices;
 use crate::livekit::{self, Role};
@@ -215,12 +215,16 @@ fn handle_text(
             to,
             session_id,
             viewer_public_key,
+            password,
         } => {
             if !valid_session_id(&session_id) {
                 return Some(bad_session_id());
             }
             if !valid_public_key(&viewer_public_key) {
                 return Some(bad_public_key());
+            }
+            if password.as_ref().is_some_and(|p| p.len() > MAX_SEALED_PASSWORD_LEN) {
+                return Some(error(WsErrorCode::BadMessage, "password too long"));
             }
             tracing::info!(viewer = %device, host = %to, %session_id, "session requested");
             relay(
@@ -230,6 +234,7 @@ fn handle_text(
                     from: device,
                     session_id,
                     viewer_public_key,
+                    password,
                 },
             )
         }

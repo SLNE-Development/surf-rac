@@ -889,7 +889,7 @@ async fn run(
     let reason = loop {
         tokio::select! {
             msg = signaling.recv(), if signaling_open => match msg {
-                Some(ServerMessage::SessionRequest { from, session_id, viewer_public_key }) => {
+                Some(ServerMessage::SessionRequest { from, session_id, viewer_public_key, .. }) => {
                     inner.on_request(from, session_id, viewer_public_key).await;
                 }
                 Some(_) => {}

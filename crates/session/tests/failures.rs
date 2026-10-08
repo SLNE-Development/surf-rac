@@ -275,6 +275,7 @@ async fn request_flood_does_not_exhaust_host(pool: PgPool) {
                 to: h.id,
                 session_id: format!("flood-{i}"),
                 viewer_public_key: key.clone(),
+                password: None,
             })
             .await
             .unwrap();

@@ -20,6 +20,9 @@ pub const HEADER_DEVICE_SECRET: &str = "x-device-secret";
 /// Largest WebSocket message, in bytes, the server accepts.
 pub const MAX_WS_MESSAGE_BYTES: usize = 65_536;
 
+/// Longest sealed unattended password, in base64 characters, a session request may carry.
+pub const MAX_SEALED_PASSWORD_LEN: usize = 1024;
+
 /// Smallest valid device ID.
 const DEVICE_ID_MIN: u32 = 100_000_000;
 
@@ -275,6 +278,10 @@ pub enum ClientMessage {
         session_id: String,
         /// The viewer device's X25519 public key, standard base64 of 32 bytes.
         viewer_public_key: String,
+        /// The unattended password sealed for the host, standard base64 of nonce and
+        /// ciphertext, at most [`MAX_SEALED_PASSWORD_LEN`] characters; absent when none is offered.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        password: Option<String>,
     },
     /// Answer a session request from viewer `to`; relayed as a server `session_response`.
     SessionResponse {
@@ -337,6 +344,9 @@ pub enum ServerMessage {
         session_id: String,
         /// The viewer device's X25519 public key, standard base64 of 32 bytes.
         viewer_public_key: String,
+        /// The unattended password sealed for this device, as the viewer sent it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        password: Option<String>,
     },
     /// A host answered this device's session request.
     SessionResponse {
@@ -532,6 +542,30 @@ mod tests {
         let raw = json!({"type":"session_request","to":"123456789","session_id":"s1","viewer_public_key":"AAAA"});
         let msg: ClientMessage = serde_json::from_value(raw.clone()).unwrap();
         assert!(matches!(msg, ClientMessage::SessionRequest { .. }));
+        assert_eq!(serde_json::to_value(&msg).unwrap(), raw);
+    }
+
+    #[test]
+    fn session_request_omits_absent_password() {
+        let msg = ServerMessage::SessionRequest {
+            from: DeviceId::new(123_456_789).unwrap(),
+            session_id: "s1".into(),
+            viewer_public_key: "AAAA".into(),
+            password: None,
+        };
+        let value = serde_json::to_value(&msg).unwrap();
+        assert!(value.get("password").is_none());
+    }
+
+    #[test]
+    fn session_request_round_trips_password() {
+        let raw = json!({"type":"session_request","to":"123456789","session_id":"s1",
+                         "viewer_public_key":"AAAA","password":"c2VhbGVk"});
+        let msg: ClientMessage = serde_json::from_value(raw.clone()).unwrap();
+        let ClientMessage::SessionRequest { password, .. } = &msg else {
+            panic!("not a session request");
+        };
+        assert_eq!(password.as_deref(), Some("c2VhbGVk"));
         assert_eq!(serde_json::to_value(&msg).unwrap(), raw);
     }
 

@@ -56,6 +56,7 @@ async fn relays_session_request(pool: PgPool) {
             to: b.id,
             session_id: "s1".into(),
             viewer_public_key: a.keys.public_key().to_base64(),
+            password: None,
         })
         .await
         .unwrap();

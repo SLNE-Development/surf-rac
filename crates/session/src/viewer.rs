@@ -126,6 +126,7 @@ impl ViewerSession {
                 to: host,
                 session_id: session_id.clone(),
                 viewer_public_key: keys.public_key().to_base64(),
+                password: None,
             })
             .await?;
         tracing::info!(%host, %session_id, "session requested");

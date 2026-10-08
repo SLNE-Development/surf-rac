@@ -45,6 +45,43 @@ async fn session_request_is_relayed_with_sender(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn session_request_relays_sealed_password(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let mut alice = app.online_device("alice", 1).await;
+    let mut bob = app.online_device("bob", 2).await;
+    send(
+        &mut bob.ws,
+        json!({"type":"session_request","to":alice.id,"session_id":"s1",
+               "viewer_public_key":key_b64(),"password":"c2VhbGVk"}),
+    )
+    .await;
+    let got = recv_type(&mut alice.ws, "session_request").await;
+    assert_eq!(got["password"], "c2VhbGVk");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn session_request_rejects_oversized_password(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let mut alice = app.online_device("alice", 1).await;
+    let mut bob = app.online_device("bob", 2).await;
+    let long = "A".repeat(surf_rac_protocol::MAX_SEALED_PASSWORD_LEN + 1);
+    send(
+        &mut bob.ws,
+        json!({"type":"session_request","to":alice.id,"session_id":"s1",
+               "viewer_public_key":key_b64(),"password":long}),
+    )
+    .await;
+    assert_eq!(recv_type(&mut bob.ws, "error").await["code"], "bad_message");
+    send(
+        &mut bob.ws,
+        json!({"type":"session_request","to":alice.id,"session_id":"s2","viewer_public_key":key_b64()}),
+    )
+    .await;
+    let got = recv_type(&mut alice.ws, "session_request").await;
+    assert_eq!(got["session_id"], "s2", "the oversized request must not be relayed");
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn session_request_rejects_bad_key(pool: PgPool) {
     let app = common::spawn(pool).await;
     let alice = app.online_device("alice", 1).await;

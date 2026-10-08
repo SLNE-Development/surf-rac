@@ -522,8 +522,7 @@ impl HostSession {
         let video = publish_video(&self.inner.room, &own, index, input, width, height)
             .await
             .map_err(StartError::MediaUnavailable)?;
-        let index = lock(&self.inner.state).active_index;
-        sync_own_key_index(&self.inner.room, &own, index);
+        self.inner.sync_key_index();
         tracing::info!(device_id = %self.inner.device, ?input, "video input switched");
         *lock(&self.inner.video) = video;
         Ok(())
@@ -637,6 +636,15 @@ async fn publish_video(
 }
 
 impl Inner {
+    /// Makes every frame cryptor of the host's tracks encrypt with the active key.
+    ///
+    /// Runs under the state lock, like the rotation that changes the active
+    /// key, so a sync can never move cryptors back to a key that was retired.
+    fn sync_key_index(&self) {
+        let st = lock(&self.state);
+        sync_own_key_index(&self.room, &room::identity(self.device), st.active_index);
+    }
+
     /// Answers `viewer`'s request `session_id`: accepted with the session's
     /// host nonce, or refused with a reason.
     async fn respond(
@@ -922,8 +930,7 @@ async fn run(
                     }
                 }
                 Some(RoomEvent::LocalTrackPublished { .. } | RoomEvent::LocalTrackRepublished { .. }) => {
-                    let index = lock(&inner.state).active_index;
-                    sync_own_key_index(&inner.room, &room::identity(inner.device), index);
+                    inner.sync_key_index();
                 }
                 Some(RoomEvent::Reconnecting) => {
                     watch.reconnecting();
@@ -995,8 +1002,8 @@ fn spawn_rotation(inner: &Arc<Inner>) {
             let mut st = lock(&inner.state);
             st.active_index = index;
             st.active_key = SessionKey::from_bytes(key);
+            sync_own_key_index(&inner.room, &own, index);
         }
-        sync_own_key_index(&inner.room, &own, index);
         tracing::info!(device_id = %inner.device, index, "media key rotated");
         drop(_serial);
         for viewer in failed {

@@ -3,8 +3,9 @@
 //! The sealed plaintext of a message is a 9-byte header followed by the
 //! encoded [`DataMessage`]: one byte naming the sender's side, then a
 //! big-endian `u64` counter that the sender increases per topic. The receiver
-//! rejects messages from its own side and counters it has already seen or
-//! that fall behind its replay window.
+//! rejects messages from its own side. On reliable topics it accepts only
+//! counters above the highest one seen; on the lossy pointer topic it also
+//! accepts each counter once within a window behind the highest.
 
 use surf_rac_protocol::data::{
     DataMessage, DecodeError, MAX_CLIPBOARD_BYTES, TOPIC_CLIPBOARD, TOPIC_INPUT, TOPIC_POINTER,
@@ -83,8 +84,11 @@ struct ReplayWindow {
 }
 
 impl ReplayWindow {
-    /// Records `counter` and returns whether it was new and within the window.
-    fn accept(&mut self, counter: u64) -> bool {
+    /// Records `counter` and returns whether it is accepted.
+    ///
+    /// With `ordered`, only counters above the highest seen are accepted;
+    /// otherwise each counter within the window is accepted once.
+    fn accept(&mut self, counter: u64, ordered: bool) -> bool {
         match self.highest {
             None => {
                 self.highest = Some(counter);
@@ -102,6 +106,7 @@ impl ReplayWindow {
                 self.highest = Some(counter);
                 true
             }
+            Some(_) if ordered => false,
             Some(high) => {
                 let age = high - counter;
                 if age >= REPLAY_WINDOW || self.seen & (1 << age) != 0 {
@@ -190,7 +195,7 @@ impl PeerChannel {
             return Inbound::Dropped;
         }
         let counter = u64::from_be_bytes(plaintext[1..HEADER_LEN].try_into().expect("8 bytes"));
-        if !self.received[slot].accept(counter) {
+        if !self.received[slot].accept(counter, topic != TOPIC_POINTER) {
             return Inbound::Dropped;
         }
         match DataMessage::decode(&plaintext[HEADER_LEN..]) {
@@ -280,6 +285,19 @@ mod tests {
         let far = raw(Side::Viewer, 200, TOPIC_POINTER, &DataMessage::PointerMove { x: 0, y: 0, monitor: 0 }.encode());
         assert!(matches!(rx.open(TOPIC_POINTER, &far), Inbound::Message(_)));
         assert_eq!(rx.open(TOPIC_POINTER, &late), Inbound::Dropped);
+    }
+
+    #[test]
+    fn reliable_topics_reject_reordering() {
+        let (mut tx, mut rx) = pair();
+        let first = tx.seal(&DataMessage::Key { code: 30, down: true }).unwrap();
+        let second = tx.seal(&DataMessage::Key { code: 30, down: false }).unwrap();
+        assert!(matches!(rx.open(TOPIC_INPUT, &second), Inbound::Message(_)));
+        assert_eq!(rx.open(TOPIC_INPUT, &first), Inbound::Dropped);
+        let c1 = tx.seal(&DataMessage::Clipboard { kind: ClipboardKind::Text, bytes: b"a".to_vec() }).unwrap();
+        let c2 = tx.seal(&DataMessage::Clipboard { kind: ClipboardKind::Text, bytes: b"b".to_vec() }).unwrap();
+        assert!(matches!(rx.open(TOPIC_CLIPBOARD, &c2), Inbound::Message(_)));
+        assert_eq!(rx.open(TOPIC_CLIPBOARD, &c1), Inbound::Dropped);
     }
 
     #[test]

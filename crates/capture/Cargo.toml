@@ -27,9 +27,11 @@ surf-rac-server.workspace = true
 base64.workspace = true
 chrono.workspace = true
 hmac.workspace = true
+png = "0.17"
 rand.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber.workspace = true

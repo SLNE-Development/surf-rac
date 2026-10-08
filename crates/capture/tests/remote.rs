@@ -9,6 +9,14 @@
 //!
 //! `passthrough_e2ee_reaches_viewer` sends hardware-encoded H.264 through the
 //! pass-through track to a viewer on the same machine.
+//!
+//! For a real desktop share, run `remote_share_host` on the machine to share;
+//! it prints its device ID and, with `SURF_RAC_HOST_ID_FILE`, also writes it to
+//! that file. Then run `remote_share_viewer` with `SURF_RAC_HOST_ID` (or the
+//! same `SURF_RAC_HOST_ID_FILE`). The viewer prints the screen state, saves a
+//! received frame to `SURF_RAC_FRAME_PNG` (default `frame.png`), switches to
+//! the Speed mode and, with two or more monitors, to the second monitor.
+//! `SURF_RAC_DURATION` sets how long the host stays up in seconds (default 120).
 
 #![cfg(windows)]
 
@@ -20,10 +28,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::{host_event, viewer_event};
+use livekit::webrtc::native::yuv_helper;
 use rand::Rng;
 use serde_json::{Value, json};
 use surf_rac_capture::mf::{EncodeError, MfEncoder};
+use surf_rac_capture::{ScreenShare, ShareOptions};
 use surf_rac_protocol::DeviceId;
+use surf_rac_protocol::data::{Control, DataMessage, QualityMode, ScreenState};
+use surf_rac_session::Frame;
 use surf_rac_session::host::{HostEvent, HostSession};
 use surf_rac_session::signaling::SignalingClient;
 use surf_rac_session::viewer::{ViewerEvent, ViewerSession};
@@ -231,4 +243,193 @@ async fn passthrough_e2ee_reaches_viewer() {
     delete_device(&client, &server, &token, v.id).await;
     assert!(outcome.0 >= 100, "only {} patterned frames in 10 s", outcome.0);
     assert!(outcome.1 >= 1, "the host never saw a keyframe request");
+}
+
+/// Writes `frame` as an RGBA PNG to `path`.
+fn save_png(frame: &Frame, path: &str) {
+    let (w, h) = (frame.width, frame.height);
+    let luma = (w * h) as usize;
+    let chroma = luma / 4;
+    let (y, rest) = frame.data.split_at(luma);
+    let (u, v) = rest.split_at(chroma);
+    let mut rgba = vec![0u8; luma * 4];
+    yuv_helper::i420_to_abgr(y, w, u, w / 2, v, w / 2, &mut rgba, w * 4, w as i32, h as i32);
+    let file = std::fs::File::create(path).expect("create png");
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder
+        .write_header()
+        .expect("png header")
+        .write_image_data(&rgba)
+        .expect("png data");
+}
+
+/// Waits up to 15 s for a screen state matching `pred`.
+async fn state_where(
+    events: &mut tokio::sync::mpsc::Receiver<ViewerEvent>,
+    pred: impl Fn(&ScreenState) -> bool,
+) -> ScreenState {
+    let ev = viewer_event(events, Duration::from_secs(15), |e| {
+        matches!(e, ViewerEvent::DataReceived(DataMessage::Control(Control::ScreenState(s))) if pred(s))
+    })
+    .await;
+    let ViewerEvent::DataReceived(DataMessage::Control(Control::ScreenState(s))) = ev else {
+        unreachable!()
+    };
+    s
+}
+
+/// Collects video frames for `wait`; returns their count and the last one.
+async fn frames_for(
+    events: &mut tokio::sync::mpsc::Receiver<ViewerEvent>,
+    wait: Duration,
+) -> (usize, Option<Frame>) {
+    let deadline = tokio::time::Instant::now() + wait;
+    let (mut count, mut last) = (0, None);
+    while let Ok(Some(ev)) = tokio::time::timeout_at(deadline, events.recv()).await {
+        if let ViewerEvent::VideoFrame(f) = ev {
+            count += 1;
+            last = Some(f);
+        }
+    }
+    (count, last)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a deployed server and an account; shares this machine's screen"]
+async fn remote_share_host() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("surf_rac_capture=debug,surf_rac_session=info")
+        .try_init();
+    let server = common::env("SURF_RAC_SERVER");
+    let duration = std::env::var("SURF_RAC_DURATION")
+        .ok()
+        .and_then(|d| d.parse().ok())
+        .unwrap_or(120);
+    let client = reqwest::Client::new();
+    let token = login(&client, &server).await;
+    let dev = register_device(&client, &server, &token, "share-host").await;
+    println!("HOST DEVICE ID: {}", dev.id);
+    if let Ok(path) = std::env::var("SURF_RAC_HOST_ID_FILE") {
+        std::fs::write(path, dev.id.to_string()).expect("write host id file");
+    }
+    let signaling = SignalingClient::connect(&ws_url(&server), &token, dev.id, &dev.secret)
+        .await
+        .expect("host signaling");
+    let (host, mut events) = HostSession::start(
+        signaling,
+        Arc::new(DeviceKeys::generate()),
+        Arc::new(Mutex::new(KnownKeys::default())),
+        1280,
+        720,
+        SessionConfig::default(),
+    )
+    .await
+    .expect("host start");
+    let share = ScreenShare::start(host.clone(), ShareOptions::default())
+        .await
+        .expect("share start");
+    println!("screen state: {:?}", share.state());
+    let run = async {
+        while let Some(ev) = events.recv().await {
+            match ev {
+                HostEvent::ViewerRequested { session_id, viewer, .. } => {
+                    println!("viewer {viewer} requests a session, accepting");
+                    host.accept(&session_id).await.expect("accept");
+                }
+                HostEvent::ViewerJoined { viewer } => share.viewer_joined(viewer),
+                HostEvent::DataReceived {
+                    viewer,
+                    message: DataMessage::Control(control),
+                } => share.handle_control(viewer, &control),
+                HostEvent::DataReceived { .. } => {}
+                other => println!("host event: {other:?}"),
+            }
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(duration), run).await;
+    share.stop().await;
+    host.close().await;
+    delete_device(&client, &server, &token, dev.id).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a running remote_share_host"]
+async fn remote_share_viewer() {
+    let server = common::env("SURF_RAC_SERVER");
+    let host: DeviceId = match std::env::var("SURF_RAC_HOST_ID_FILE") {
+        Ok(path) => std::fs::read_to_string(path).expect("read host id file"),
+        Err(_) => common::env("SURF_RAC_HOST_ID"),
+    }
+    .trim()
+    .parse()
+    .expect("host device ID");
+    let png_path = std::env::var("SURF_RAC_FRAME_PNG").unwrap_or_else(|_| "frame.png".into());
+    let client = reqwest::Client::new();
+    let token = login(&client, &server).await;
+    let dev = register_device(&client, &server, &token, "share-viewer").await;
+    let outcome = async {
+        let signaling = SignalingClient::connect(&ws_url(&server), &token, dev.id, &dev.secret)
+            .await
+            .expect("viewer signaling");
+        let started = Instant::now();
+        let (viewer, mut events) = ViewerSession::request(
+            signaling,
+            Arc::new(DeviceKeys::generate()),
+            Arc::new(Mutex::new(KnownKeys::default())),
+            host,
+            SessionConfig::default(),
+        )
+        .await
+        .expect("session request");
+        viewer_event(&mut events, Duration::from_secs(30), |e| matches!(e, ViewerEvent::Connected)).await;
+        println!("connected after {} ms", started.elapsed().as_millis());
+        let state = state_where(&mut events, |_| true).await;
+        println!("screen state: {state:?}");
+
+        let (_, first) = frames_for(&mut events, Duration::from_secs(3)).await;
+        let first = first.expect("no frame within 3 s");
+        save_png(&first, &png_path);
+        println!("saved a {}x{} frame to {png_path}", first.width, first.height);
+        let (count, _) = frames_for(&mut events, Duration::from_secs(10)).await;
+        println!("received {count} frames in 10 s ({:.1} fps) in {:?}", count as f64 / 10.0, state.mode);
+
+        viewer
+            .send(&DataMessage::Control(Control::SetQuality { mode: QualityMode::Speed }))
+            .await
+            .expect("send");
+        state_where(&mut events, |s| s.mode == QualityMode::Speed).await;
+        let (speed_count, speed) = frames_for(&mut events, Duration::from_secs(10)).await;
+        let speed = speed.expect("no frame in Speed mode");
+        println!(
+            "Speed mode: {speed_count} frames in 10 s ({:.1} fps) at {}x{}",
+            speed_count as f64 / 10.0,
+            speed.width,
+            speed.height
+        );
+        assert!(speed.width.max(speed.height) <= 1280, "Speed frame {}x{}", speed.width, speed.height);
+
+        if state.monitors.len() >= 2 {
+            let target = if state.selected == 0 { 1 } else { 0 };
+            viewer
+                .send(&DataMessage::Control(Control::SelectMonitor { index: target }))
+                .await
+                .expect("send");
+            let switched = state_where(&mut events, |s| s.selected == target).await;
+            let (_, other) = frames_for(&mut events, Duration::from_secs(3)).await;
+            let other = other.expect("no frame after the monitor switch");
+            println!(
+                "switched to monitor {} ({:?}), frames now {}x{}",
+                target, switched.monitors[usize::from(target)].name, other.width, other.height
+            );
+        } else {
+            println!("one monitor only; monitor switch not exercised");
+        }
+        viewer.hangup().await;
+        count
+    }
+    .await;
+    delete_device(&client, &server, &token, dev.id).await;
+    assert!(outcome >= 100, "only {outcome} frames in 10 s");
 }

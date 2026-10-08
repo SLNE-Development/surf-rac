@@ -2,15 +2,15 @@
 //! signals into the arbiter and carries out its actions.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use surf_rac_capture::{MonitorRect, ScreenShare, ShareHandle};
 use surf_rac_protocol::DeviceId;
 use surf_rac_protocol::data::{Control, DataMessage, InputState};
 use surf_rac_session::host::{HostEvent, HostSession};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::arbiter::{Action, Arbiter, Grants, InputStatus};
@@ -78,15 +78,57 @@ impl Share for ShareHandle {
     }
 }
 
-/// A request to the arbitration task that must not be dropped.
+/// Input states waiting to be sent: only the latest one per viewer is kept.
+#[derive(Debug, Default)]
+struct Outbox {
+    /// The latest unsent state of each viewer.
+    pending: Mutex<BTreeMap<DeviceId, InputState>>,
+    /// Wakes the sender when states are pending or the outbox closed.
+    wake: Notify,
+    /// Set when no further states will be queued.
+    closed: AtomicBool,
+}
+
+impl Outbox {
+    /// Queues `state` for `viewer`, replacing an unsent older one.
+    fn push(&self, viewer: DeviceId, state: InputState) {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).insert(viewer, state);
+        self.wake.notify_one();
+    }
+
+    /// Takes every pending state.
+    fn take(&self) -> BTreeMap<DeviceId, InputState> {
+        std::mem::take(&mut *self.pending.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Marks the outbox closed and wakes the sender so it can finish.
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.wake.notify_one();
+    }
+
+    /// Waits for pending states and returns them; `None` once closed and empty.
+    async fn next(&self) -> Option<BTreeMap<DeviceId, InputState>> {
+        loop {
+            let batch = self.take();
+            if !batch.is_empty() {
+                return Some(batch);
+            }
+            if self.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            self.wake.notified().await;
+        }
+    }
+}
+
+/// A host-side request to the arbitration task; never dropped.
 #[derive(Debug)]
 enum Command {
     /// A viewer joined.
     Joined(DeviceId),
     /// A viewer left.
     Left(DeviceId),
-    /// A control message from a viewer.
-    Message(DeviceId, DataMessage),
     /// The host changed a viewer's grants.
     Grants(DeviceId, Grants),
     /// The host turned follow mode on or off.
@@ -103,7 +145,7 @@ pub struct InputHost {
     input: mpsc::Sender<(DeviceId, DataMessage)>,
     /// The latest status.
     status: watch::Receiver<InputStatus>,
-    /// Input messages dropped because the queue was full.
+    /// Viewer messages dropped because the queue was full.
     dropped: Arc<AtomicU64>,
     /// The arbitration task.
     task: JoinHandle<()>,
@@ -134,7 +176,7 @@ impl InputHost {
     fn start_with<P: Platform, S: Share>(host: HostSession, share: S, platform: P) -> InputHost {
         let (control, control_rx) = mpsc::unbounded_channel();
         let (input, input_rx) = mpsc::channel(INPUT_CAPACITY);
-        let (sends, mut sends_rx) = mpsc::unbounded_channel::<(DeviceId, InputState)>();
+        let outbox = Arc::new(Outbox::default());
         let (status_tx, status) = watch::channel(InputStatus::default());
         let dropped = Arc::new(AtomicU64::new(0));
         let task = tokio::spawn(run(
@@ -142,15 +184,17 @@ impl InputHost {
             share,
             control_rx,
             input_rx,
-            sends,
+            Arc::clone(&outbox),
             status_tx,
             Arc::clone(&dropped),
         ));
         let sender = tokio::spawn(async move {
-            while let Some((viewer, state)) = sends_rx.recv().await {
-                let msg = DataMessage::Control(Control::InputState(state));
-                if let Err(e) = host.send(viewer, &msg).await {
-                    tracing::debug!(viewer = %viewer, error = %e, "input state not sent");
+            while let Some(batch) = outbox.next().await {
+                for (viewer, state) in batch {
+                    let msg = DataMessage::Control(Control::InputState(state));
+                    if let Err(e) = host.send(viewer, &msg).await {
+                        tracing::debug!(viewer = %viewer, error = %e, "input state not sent");
+                    }
                 }
             }
         });
@@ -167,7 +211,7 @@ impl InputHost {
 
     /// Takes a host session event: joins, leaves, input and follow requests.
     ///
-    /// Other events are ignored. Input messages are dropped when the queue is full.
+    /// Other events are ignored. Viewer messages are dropped when the queue is full.
     pub fn handle_event(&self, event: &HostEvent) {
         match event {
             HostEvent::ViewerJoined { viewer } => {
@@ -180,11 +224,9 @@ impl InputHost {
                 DataMessage::PointerMove { .. }
                 | DataMessage::PointerButton { .. }
                 | DataMessage::Wheel { .. }
-                | DataMessage::Key { .. } => {
+                | DataMessage::Key { .. }
+                | DataMessage::Control(Control::SetFollow { .. }) => {
                     enqueue(&self.input, &self.dropped, *viewer, message.clone());
-                }
-                DataMessage::Control(Control::SetFollow { .. }) => {
-                    let _ = self.control.send(Command::Message(*viewer, message.clone()));
                 }
                 _ => {}
             },
@@ -207,7 +249,8 @@ impl InputHost {
         self.status.clone()
     }
 
-    /// Releases everything viewers hold, hides ghosts and ends arbitration.
+    /// Releases everything viewers hold, tells them input is locked, hides
+    /// ghosts and ends arbitration.
     pub async fn stop(self) {
         let _ = self.control.send(Command::Stop);
         let _ = self.task.await;
@@ -267,7 +310,7 @@ struct Runner<P: Platform, S: Share> {
     /// Shown ghosts by viewer.
     ghosts: BTreeMap<DeviceId, (u8, i32, i32)>,
     /// Input states to send.
-    sends: mpsc::UnboundedSender<(DeviceId, InputState)>,
+    outbox: Arc<Outbox>,
     /// Publishes the status.
     status: watch::Sender<InputStatus>,
     /// The last host input instant passed to the arbiter.
@@ -335,9 +378,7 @@ impl<P: Platform, S: Share> Runner<P, S> {
                         None => self.ghosts.remove(&viewer),
                     };
                 }
-                Action::Send(viewer, state) => {
-                    let _ = self.sends.send((viewer, state));
-                }
+                Action::Send(viewer, state) => self.outbox.push(viewer, state),
                 Action::SelectMonitor(index) => self.share.select_monitor(index),
                 input => self.platform.perform(&input),
             }
@@ -362,23 +403,15 @@ impl<P: Platform, S: Share> Runner<P, S> {
         let out = match cmd {
             Command::Joined(viewer) => self.arbiter.viewer_joined(viewer, now),
             Command::Left(viewer) => self.arbiter.viewer_left(viewer, now),
-            Command::Message(viewer, msg) => self.arbiter.message(viewer, &msg, &self.geometry, now),
             Command::Grants(viewer, grants) => self.arbiter.set_grants(viewer, grants, now),
             Command::Follow(on) => self.arbiter.set_follow(on, now),
-            Command::Stop => {
-                let viewers: Vec<DeviceId> = self.arbiter.status(now).viewers.into_keys().collect();
-                for viewer in viewers {
-                    let out = self.arbiter.viewer_left(viewer, now);
-                    self.apply(out, now);
-                }
-                return false;
-            }
+            Command::Stop => return false,
         };
         self.apply(out, now);
         true
     }
 
-    /// Applies one viewer input message.
+    /// Applies one viewer message.
     fn input(&mut self, viewer: DeviceId, msg: &DataMessage, now: Instant) {
         let started = Instant::now();
         self.poll(now);
@@ -397,10 +430,12 @@ impl<P: Platform, S: Share> Runner<P, S> {
         self.apply(out, now);
         if now.duration_since(self.stats_at) >= STATS_INTERVAL {
             let dropped = dropped.swap(0, Ordering::Relaxed);
-            if self.handled > 0 || dropped > 0 {
+            let invalid = self.arbiter.take_invalid();
+            if self.handled > 0 || dropped > 0 || invalid > 0 {
                 tracing::debug!(
                     handled = self.handled,
                     dropped,
+                    invalid,
                     slowest_us = self.slowest.as_micros() as u64,
                     "remote input stats"
                 );
@@ -412,16 +447,34 @@ impl<P: Platform, S: Share> Runner<P, S> {
     }
 }
 
+impl<P: Platform, S: Share> Drop for Runner<P, S> {
+    /// Locks remote input, releases everything viewers hold and hides every
+    /// ghost, also when the task is cancelled; then closes the outbox.
+    fn drop(&mut self) {
+        let now = now();
+        self.degraded.get_or_insert_with(|| "remote input stopped".into());
+        let out = self.arbiter.set_degraded(now);
+        self.apply(out, now);
+        let viewers: Vec<DeviceId> = self.arbiter.status(now).viewers.into_keys().collect();
+        for viewer in viewers {
+            let out = self.arbiter.viewer_left(viewer, now);
+            self.apply(out, now);
+        }
+        self.outbox.close();
+    }
+}
+
 /// Runs arbitration until [`Command::Stop`] arrives or the host is dropped.
 ///
-/// Lifecycle and control commands take priority over queued input, so a
-/// viewer's join is applied before its first input.
+/// Host commands come first so a viewer's join is applied before its first
+/// input; the tick comes before viewer messages so a flood of them cannot
+/// stall lockout expiry, geometry refresh or host input detection.
 async fn run<P: Platform, S: Share>(
     platform: P,
     share: S,
     mut control: mpsc::UnboundedReceiver<Command>,
     mut input: mpsc::Receiver<(DeviceId, DataMessage)>,
-    sends: mpsc::UnboundedSender<(DeviceId, InputState)>,
+    outbox: Arc<Outbox>,
     status: watch::Sender<InputStatus>,
     dropped: Arc<AtomicU64>,
 ) {
@@ -433,7 +486,7 @@ async fn run<P: Platform, S: Share>(
         arbiter: Arbiter::new(),
         geometry,
         ghosts: BTreeMap::new(),
-        sends,
+        outbox,
         status,
         host_input: None,
         mouse_seq: 0,
@@ -455,13 +508,10 @@ async fn run<P: Platform, S: Share>(
                         return;
                     }
                 }
-                None => {
-                    r.command(Command::Stop, now());
-                    return;
-                }
+                None => return,
             },
-            Some((viewer, msg)) = input.recv() => r.input(viewer, &msg, now()),
             _ = ticker.tick() => r.tick(now(), &dropped),
+            Some((viewer, msg)) = input.recv() => r.input(viewer, &msg, now()),
         }
     }
 }
@@ -612,8 +662,8 @@ mod tests {
         control: mpsc::UnboundedSender<Command>,
         /// Viewer input.
         input: mpsc::Sender<(DeviceId, DataMessage)>,
-        /// Input states the task sent.
-        sends: mpsc::UnboundedReceiver<(DeviceId, InputState)>,
+        /// Input states the task queued.
+        outbox: Arc<Outbox>,
         /// The published status.
         status: watch::Receiver<InputStatus>,
         /// The fake platform.
@@ -630,18 +680,18 @@ mod tests {
         let share = FakeShare::default();
         let (control, control_rx) = mpsc::unbounded_channel();
         let (input, input_rx) = mpsc::channel(INPUT_CAPACITY);
-        let (sends_tx, sends) = mpsc::unbounded_channel();
+        let outbox = Arc::new(Outbox::default());
         let (status_tx, status) = watch::channel(InputStatus::default());
         let task = tokio::spawn(run(
             fake.clone(),
             share.clone(),
             control_rx,
             input_rx,
-            sends_tx,
+            Arc::clone(&outbox),
             status_tx,
             Arc::new(AtomicU64::new(0)),
         ));
-        Harness { control, input, sends, status, fake, share, task }
+        Harness { control, input, outbox, status, fake, share, task }
     }
 
     /// Returns a test device ID.
@@ -656,9 +706,9 @@ mod tests {
         }
     }
 
-    /// Returns every input state sent so far.
+    /// Returns the latest queued input state of every viewer and clears the queue.
     fn drain(h: &mut Harness) -> Vec<(DeviceId, InputState)> {
-        std::iter::from_fn(|| h.sends.try_recv().ok()).collect()
+        h.outbox.take().into_iter().collect()
     }
 
     #[tokio::test(start_paused = true)]
@@ -691,11 +741,57 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn join_applies_before_queued_input() {
+        let h = harness();
+        h.input.send((v(1), DataMessage::Key { code: 0x1E, down: true })).await.unwrap();
+        h.control.send(Command::Joined(v(1))).unwrap();
+        settle().await;
+        assert_eq!(h.fake.0.lock().unwrap().performed, [Action::Key { code: 0x1E, down: true }]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leave_through_task_releases_and_hides() {
+        let h = harness();
+        h.control.send(Command::Joined(v(1))).unwrap();
+        h.control.send(Command::Joined(v(2))).unwrap();
+        h.control.send(Command::Grants(v(2), Grants { pointer: false, keyboard: true })).unwrap();
+        settle().await;
+        h.input.send((v(1), DataMessage::PointerButton { button: MouseButton::Left, down: true })).await.unwrap();
+        h.input.send((v(2), DataMessage::PointerMove { x: 1, y: 2, monitor: 0 })).await.unwrap();
+        settle().await;
+        h.control.send(Command::Left(v(1))).unwrap();
+        h.control.send(Command::Left(v(2))).unwrap();
+        settle().await;
+        let state = h.fake.0.lock().unwrap();
+        assert_eq!(state.performed.last(), Some(&Action::Button { button: MouseButton::Left, down: false }));
+        assert!(state.ghosts.is_empty());
+        assert!(h.status.borrow().viewers.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn follow_flood_is_bounded_and_coalesced() {
+        let mut h = harness();
+        h.control.send(Command::Joined(v(1))).unwrap();
+        h.control.send(Command::Joined(v(2))).unwrap();
+        settle().await;
+        drain(&mut h);
+        for i in 0..200 {
+            let msg = DataMessage::Control(Control::SetFollow { on: i % 2 == 0 });
+            h.input.send((v(1), msg)).await.unwrap();
+        }
+        settle().await;
+        let sent = drain(&mut h);
+        assert_eq!(sent.len(), 2, "one pending state per viewer");
+        assert!(sent.iter().all(|(_, s)| !s.follow));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn follow_selects_through_share() {
         let h = harness();
         h.control.send(Command::Joined(v(1))).unwrap();
-        h.control
-            .send(Command::Message(v(1), DataMessage::Control(Control::SetFollow { on: true })))
+        h.input
+            .send((v(1), DataMessage::Control(Control::SetFollow { on: true })))
+            .await
             .unwrap();
         settle().await;
         assert!(h.status.borrow().follow);
@@ -723,7 +819,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn ghosts_reach_platform_and_stop_releases() {
-        let h = harness();
+        let mut h = harness();
         h.control.send(Command::Joined(v(1))).unwrap();
         h.control.send(Command::Grants(v(1), Grants { pointer: false, keyboard: true })).unwrap();
         settle().await;
@@ -731,11 +827,31 @@ mod tests {
         h.input.send((v(1), DataMessage::Key { code: 0x2A, down: true })).await.unwrap();
         settle().await;
         assert_eq!(h.fake.0.lock().unwrap().ghosts, [(0, 1930, 20)]);
+        drain(&mut h);
         h.control.send(Command::Stop).unwrap();
-        h.task.await.unwrap();
-        let state = h.fake.0.lock().unwrap();
-        assert!(state.ghosts.is_empty());
-        assert_eq!(state.performed.last(), Some(&Action::Key { code: 0x2A, down: false }));
+        (&mut h.task).await.unwrap();
+        {
+            let state = h.fake.0.lock().unwrap();
+            assert!(state.ghosts.is_empty());
+            assert_eq!(state.performed.last(), Some(&Action::Key { code: 0x2A, down: false }));
+        }
+        assert!(drain(&mut h).iter().all(|(_, s)| s.locked), "viewers not told input is locked");
+        assert!(h.outbox.next().await.is_none(), "outbox not closed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_task_releases_holds() {
+        let h = harness();
+        h.control.send(Command::Joined(v(1))).unwrap();
+        settle().await;
+        h.input.send((v(1), DataMessage::Key { code: 0x2A, down: true })).await.unwrap();
+        settle().await;
+        h.task.abort();
+        let _ = h.task.await;
+        assert_eq!(
+            h.fake.0.lock().unwrap().performed.last(),
+            Some(&Action::Key { code: 0x2A, down: false })
+        );
     }
 
     #[tokio::test]

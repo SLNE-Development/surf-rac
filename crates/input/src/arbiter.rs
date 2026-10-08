@@ -149,6 +149,8 @@ pub struct Arbiter {
     degraded: bool,
     /// Whether follow mode is on.
     follow: bool,
+    /// Messages dropped as invalid since the last [`Arbiter::take_invalid`].
+    invalid: u64,
 }
 
 impl Arbiter {
@@ -267,6 +269,7 @@ impl Arbiter {
     /// inject become ghost pointer moves.
     pub fn message(&mut self, viewer: DeviceId, msg: &DataMessage, geometry: &[MonitorRect], now: Instant) -> Vec<Action> {
         let Some(v) = self.viewers.get(&viewer) else {
+            self.invalid += 1;
             return Vec::new();
         };
         let grants = v.grants;
@@ -276,6 +279,7 @@ impl Arbiter {
         match *msg {
             DataMessage::PointerMove { x, y, monitor } => {
                 let Some(at) = geometry.get(usize::from(monitor)).and_then(|r| clamp(r, x, y)) else {
+                    self.invalid += 1;
                     return out;
                 };
                 let v = self.viewers.get_mut(&viewer).expect("viewer checked above");
@@ -316,6 +320,7 @@ impl Arbiter {
                 }
                 self.keys.retain(|_, holders| !holders.is_empty());
             }
+            DataMessage::Key { code, .. } if code > MAX_KEY_CODE => self.invalid += 1,
             DataMessage::Control(Control::SetFollow { on }) => self.follow = on,
             _ => {}
         }
@@ -338,6 +343,12 @@ impl Arbiter {
         }
         out.extend(self.sync(now));
         out
+    }
+
+    /// Returns how many messages were dropped as invalid (unknown viewer, unknown
+    /// monitor, oversized key code) since the last call, and resets the count.
+    pub fn take_invalid(&mut self) -> u64 {
+        std::mem::take(&mut self.invalid)
     }
 
     /// Returns the current status; `degraded` is left `None` for the caller to fill in.
@@ -692,6 +703,18 @@ mod tests {
         assert_eq!(a.message(v(1), &key(0x200, true), &geo(), t0), []);
         assert_eq!(a.message(v(1), &key(u32::MAX, true), &geo(), t0), []);
         assert_eq!(a.message(v(1), &key(MAX_KEY_CODE, true), &geo(), t0).len(), 1);
+        assert_eq!(a.take_invalid(), 2);
+        assert_eq!(a.take_invalid(), 0);
+    }
+
+    #[test]
+    fn invalid_messages_counted() {
+        let (mut a, t0) = two();
+        a.message(v(9), &key(0x1E, true), &geo(), t0);
+        a.message(v(1), &mv(1, 1, 7), &geo(), t0);
+        a.set_grants(v(1), Grants { pointer: true, keyboard: false }, t0);
+        a.message(v(1), &key(0x1E, true), &geo(), t0);
+        assert_eq!(a.take_invalid(), 2, "a key without the grant is not invalid");
     }
 
     #[test]

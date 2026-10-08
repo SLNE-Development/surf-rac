@@ -160,6 +160,8 @@ struct State {
     media_key: SessionKey,
     /// Key index of the current media key.
     media_index: u8,
+    /// Key index the host's track is encrypted with; trails `media_index` during a rotation.
+    active_index: u8,
     /// When each viewer was last sent a refusal.
     refused: HashMap<DeviceId, Instant>,
 }
@@ -277,6 +279,7 @@ impl HostSession {
                 viewers: HashMap::new(),
                 media_key,
                 media_index: 0,
+                active_index: 0,
                 refused: HashMap::new(),
             }),
             send_lock: tokio::sync::Mutex::new(()),
@@ -610,6 +613,10 @@ async fn run(
                         room::read_clipboard_stream(reader, topic, participant_identity.0, &gate, incoming_tx.clone());
                     }
                 }
+                Some(RoomEvent::LocalTrackPublished { .. } | RoomEvent::LocalTrackRepublished { .. }) => {
+                    let index = lock(&inner.state).active_index;
+                    sync_own_key_index(&inner.room, &room::identity(inner.device), index);
+                }
                 Some(RoomEvent::Reconnecting) => {
                     watch.reconnecting();
                     tracing::info!(device_id = %inner.device, "media reconnecting");
@@ -664,16 +671,63 @@ fn spawn_rotation(inner: &Arc<Inner>) {
         inner
             .key_provider
             .set_key(&own, i32::from(index), key.to_vec());
-        for ((identity, _), cryptor) in inner.room.e2ee_manager().frame_cryptors() {
-            if identity == own {
-                cryptor.set_key_index(i32::from(index));
-            }
-        }
+        lock(&inner.state).active_index = index;
+        sync_own_key_index(&inner.room, &own, index);
         tracing::info!(device_id = %inner.device, index, "media key rotated");
     });
+}
+
+/// Makes every frame cryptor of `own`'s published tracks encrypt with key `index`.
+fn sync_own_key_index(lk_room: &Room, own: &ParticipantIdentity, index: u8) {
+    for ((identity, _), cryptor) in lk_room.e2ee_manager().frame_cryptors() {
+        if &identity == own {
+            cryptor.set_key_index(i32::from(index));
+        }
+    }
 }
 
 /// Locks `m`, recovering from a poisoned lock.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use livekit::webrtc::prelude::{RtcVideoSource, VideoResolution};
+
+    use super::*;
+    use crate::testutil::{env, mint_token, room_name, unix_now};
+
+    /// Publishes a fresh video track named `name` on `lk_room`.
+    async fn publish(lk_room: &Room, name: &str) {
+        let source = NativeVideoSource::new(VideoResolution { width: 64, height: 64 }, true);
+        let track = LocalVideoTrack::create_video_track(name, RtcVideoSource::Native(source));
+        lk_room
+            .local_participant()
+            .publish_track(LocalTrack::Video(track), TrackPublishOptions::default())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn new_cryptors_take_current_key_index() {
+        let now = unix_now();
+        let own = room::identity(DeviceId::new(123_456_789).unwrap());
+        let token = mint_token(&room_name(), &own.0, now, now + 60);
+        let keys = room::key_provider();
+        keys.set_key(&own, 0, vec![1; 32]);
+        keys.set_key(&own, 3, vec![2; 32]);
+        let (lk_room, _events) = room::connect(&env("LIVEKIT_URL"), &token, &keys, false)
+            .await
+            .unwrap();
+        publish(&lk_room, "first").await;
+        sync_own_key_index(&lk_room, &own, 3);
+        publish(&lk_room, "second").await;
+        let before: Vec<i32> = lk_room.e2ee_manager().frame_cryptors().values().map(|c| c.key_index()).collect();
+        assert!(before.contains(&0), "a new cryptor starts at index 0: {before:?}");
+        sync_own_key_index(&lk_room, &own, 3);
+        let after: Vec<i32> = lk_room.e2ee_manager().frame_cryptors().values().map(|c| c.key_index()).collect();
+        assert_eq!(after, vec![3, 3]);
+        lk_room.close().await.unwrap();
+    }
 }

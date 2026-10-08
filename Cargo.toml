@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/protocol", "crates/server", "crates/session"]
+members = ["crates/capture", "crates/protocol", "crates/server", "crates/session"]
 
 [workspace.package]
 edition = "2024"
@@ -11,6 +11,7 @@ publish = false
 [workspace.dependencies]
 surf-rac-protocol = { path = "crates/protocol" }
 surf-rac-server = { path = "crates/server" }
+surf-rac-session = { path = "crates/session" }
 anyhow = "1"
 argon2 = "0.5"
 axum = { version = "0.8", features = ["ws"] }

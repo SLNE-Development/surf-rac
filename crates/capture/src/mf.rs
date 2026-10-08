@@ -2,8 +2,9 @@
 //!
 //! Hardware encoder MFTs are asynchronous: they ask for input and announce
 //! output through events. [`MfEncoder`] drives them from one thread by
-//! polling those events, feeding one NV12 frame per call and returning every
-//! access unit that is ready.
+//! polling those events: [`MfEncoder::encode`] feeds one NV12 frame and
+//! [`MfEncoder::poll`] collects access units as they become ready, without
+//! waiting for the encoder.
 
 use std::time::{Duration, Instant};
 
@@ -35,9 +36,6 @@ use crate::h264::{NAL_SPS, nal_types};
 
 /// Longest time one call waits for the encoder to accept input.
 const INPUT_TIMEOUT: Duration = Duration::from_millis(200);
-
-/// Longest time one call waits for the encoded output of the frame it fed.
-const OUTPUT_WAIT: Duration = Duration::from_millis(30);
 
 /// Media Foundation time units (100 ns) per microsecond.
 const UNITS_PER_US: i64 = 10;
@@ -73,6 +71,30 @@ pub struct MfEncoder {
     provides_samples: bool,
     /// Size of an output buffer when this side allocates them.
     output_size: u32,
+    /// Keeps Media Foundation started; declared last so it is released after
+    /// every Media Foundation object above.
+    _runtime: MfRuntime,
+}
+
+/// A started Media Foundation platform, shut down on drop.
+struct MfRuntime;
+
+impl MfRuntime {
+    /// Starts Media Foundation on this thread.
+    fn start() -> Result<MfRuntime, EncodeError> {
+        // SAFETY: MFStartup has no preconditions; every success is paired with
+        // one MFShutdown in drop.
+        unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL)? };
+        Ok(MfRuntime)
+    }
+}
+
+impl Drop for MfRuntime {
+    /// Shuts Media Foundation down once.
+    fn drop(&mut self) {
+        // SAFETY: pairs the MFStartup in start.
+        let _ = unsafe { MFShutdown() };
+    }
 }
 
 impl MfEncoder {
@@ -84,48 +106,39 @@ impl MfEncoder {
         // every out pointer refers to a live local.
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-            MFStartup(MF_VERSION, MFSTARTUP_FULL)?;
-            let activate = match first_hardware_encoder() {
-                Ok(Some(a)) => a,
-                Ok(None) => {
-                    let _ = MFShutdown();
-                    return Err(EncodeError::NoHardware);
-                }
+            let runtime = MfRuntime::start()?;
+            let activate = first_hardware_encoder()?.ok_or(EncodeError::NoHardware)?;
+            let opened = open(&activate, width, height, bitrate_bps, fps).and_then(|(transform, name)| {
+                let events = transform.cast::<IMFMediaEventGenerator>()?;
+                let codec = transform.cast::<ICodecAPI>()?;
+                let info = transform.GetOutputStreamInfo(0)?;
+                Ok((transform, name, events, codec, info))
+            });
+            let (transform, name, events, codec, info) = match opened {
+                Ok(parts) => parts,
                 Err(e) => {
-                    let _ = MFShutdown();
+                    let _ = activate.ShutdownObject();
                     return Err(e);
                 }
             };
-            match open(&activate, width, height, bitrate_bps, fps) {
-                Ok((transform, name)) => {
-                    let events = transform.cast::<IMFMediaEventGenerator>()?;
-                    let codec = transform.cast::<ICodecAPI>()?;
-                    let info = transform.GetOutputStreamInfo(0)?;
-                    let flags = info.dwFlags as i32;
-                    let provides_samples = flags
-                        & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0
-                            | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0)
-                        != 0;
-                    Ok(MfEncoder {
-                        transform,
-                        events,
-                        codec,
-                        activate,
-                        name,
-                        width,
-                        height,
-                        frame_duration: 10_000_000 / i64::from(fps.max(1)),
-                        need_input: 0,
-                        provides_samples,
-                        output_size: info.cbSize.max(width * height * 3 / 2),
-                    })
-                }
-                Err(e) => {
-                    let _ = activate.ShutdownObject();
-                    let _ = MFShutdown();
-                    Err(e)
-                }
-            }
+            let flags = info.dwFlags as i32;
+            let provides_samples = flags
+                & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0)
+                != 0;
+            Ok(MfEncoder {
+                transform,
+                events,
+                codec,
+                activate,
+                name,
+                width,
+                height,
+                frame_duration: 10_000_000 / i64::from(fps.max(1)),
+                need_input: 0,
+                provides_samples,
+                output_size: info.cbSize.max(width * height * 3 / 2),
+                _runtime: runtime,
+            })
         }
     }
 
@@ -139,10 +152,11 @@ impl MfEncoder {
         (self.width, self.height)
     }
 
-    /// Encodes one tightly packed NV12 frame captured at `timestamp_us`.
+    /// Feeds one tightly packed NV12 frame captured at `timestamp_us`.
     ///
-    /// Returns every access unit that became ready, which may include earlier
-    /// frames or none at all while the encoder is still working.
+    /// Waits only until the encoder accepts input, then returns the access
+    /// units that are ready, usually those of earlier frames; the output of
+    /// this frame follows from later calls or [`MfEncoder::poll`].
     /// `force_keyframe` makes this frame an IDR.
     ///
     /// # Panics
@@ -187,18 +201,14 @@ impl MfEncoder {
             self.transform.ProcessInput(0, &sample, 0)?;
         }
         self.need_input -= 1;
-        let deadline = Instant::now() + OUTPUT_WAIT;
-        let fed = out.len();
-        loop {
-            let handled = self.pump(&mut out)?;
-            let done = out[fed..].iter().any(|au| au.timestamp_us >= timestamp_us);
-            if done || Instant::now() >= deadline {
-                break;
-            }
-            if !handled {
-                std::thread::sleep(Duration::from_micros(500));
-            }
-        }
+        while self.pump(&mut out)? {}
+        Ok(out)
+    }
+
+    /// Returns the access units that became ready, without feeding a frame or waiting.
+    pub fn poll(&mut self) -> Result<Vec<EncodedAu>, EncodeError> {
+        let mut out = Vec::new();
+        while self.pump(&mut out)? {}
         Ok(out)
     }
 
@@ -312,7 +322,8 @@ impl MfEncoder {
 }
 
 impl Drop for MfEncoder {
-    /// Ends the stream and releases the encoder.
+    /// Ends the stream and shuts the encoder down; Media Foundation itself is
+    /// released after the remaining fields.
     fn drop(&mut self) {
         // SAFETY: COM calls on owned objects during teardown; errors are ignored.
         unsafe {
@@ -324,7 +335,6 @@ impl Drop for MfEncoder {
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
             let _ = self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
             let _ = self.activate.ShutdownObject();
-            let _ = MFShutdown();
         }
     }
 }

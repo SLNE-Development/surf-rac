@@ -15,6 +15,9 @@ pub enum EncodeError {
     /// This machine has no hardware H.264 encoder.
     #[error("no hardware H.264 encoder")]
     NoHardware,
+    /// The session's video track could not be switched to encoded input.
+    #[error("switching the video track failed: {0}")]
+    Track(String),
     /// The encoder did not ask for input in time.
     #[error("hardware encoder stalled")]
     Stalled,

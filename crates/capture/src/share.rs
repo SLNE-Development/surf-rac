@@ -15,7 +15,8 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::convert::{self, BgraFrame};
-use crate::h264::{EncodeError, EncodedAu};
+use crate::h264::EncodeError;
+use crate::hw::{HwFactory, HwWorker, Job};
 use crate::mode::{self, FRAME_RATE};
 use crate::source::{CaptureError, FrameSource};
 use crate::state::{Controller, Outgoing};
@@ -29,47 +30,11 @@ const BACKOFF_START: Duration = Duration::from_millis(250);
 /// Longest wait between capture retries.
 const BACKOFF_MAX: Duration = Duration::from_secs(5);
 
+/// How often the share logs its frame counters.
+const STATS_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Environment variable that forces the software encoder when set to `1`.
 pub const FORCE_SOFTWARE_ENV: &str = "SURF_RAC_FORCE_SOFTWARE_ENCODER";
-
-/// An H.264 encoder for frames of one size.
-pub(crate) trait HwEncoder {
-    /// Returns the encoder's display name.
-    fn name(&self) -> &str;
-    /// Returns the frame size it encodes.
-    fn size(&self) -> (u32, u32);
-    /// Encodes one NV12 frame; returns the access units that are ready.
-    fn encode(&mut self, nv12: &[u8], timestamp_us: i64, force_keyframe: bool) -> Result<Vec<EncodedAu>, EncodeError>;
-    /// Sets the target bitrate in bits per second.
-    fn set_bitrate(&mut self, bitrate_bps: u64) -> Result<(), EncodeError>;
-}
-
-#[cfg(windows)]
-impl HwEncoder for crate::mf::MfEncoder {
-    /// Returns the Media Foundation encoder's name.
-    fn name(&self) -> &str {
-        self.adapter_name()
-    }
-
-    /// Returns the size the encoder was opened for.
-    fn size(&self) -> (u32, u32) {
-        crate::mf::MfEncoder::size(self)
-    }
-
-    /// Forwards to [`crate::mf::MfEncoder::encode`].
-    fn encode(&mut self, nv12: &[u8], timestamp_us: i64, force_keyframe: bool) -> Result<Vec<EncodedAu>, EncodeError> {
-        crate::mf::MfEncoder::encode(self, nv12, timestamp_us, force_keyframe)
-    }
-
-    /// Forwards to [`crate::mf::MfEncoder::set_bitrate`].
-    fn set_bitrate(&mut self, bitrate_bps: u64) -> Result<(), EncodeError> {
-        crate::mf::MfEncoder::set_bitrate(self, bitrate_bps)
-    }
-}
-
-/// Opens a hardware encoder for `width` x `height` at a bitrate.
-pub(crate) type HwFactory =
-    Box<dyn FnMut(u32, u32, u64) -> Result<Box<dyn HwEncoder>, EncodeError> + Send>;
 
 /// Settings a share starts with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -132,7 +97,7 @@ impl ScreenShare {
             let hardware: Option<HwFactory> = (!forced).then(|| {
                 Box::new(|w, h, bps| {
                     crate::mf::MfEncoder::new(w, h, bps, FRAME_RATE)
-                        .map(|e| Box::new(e) as Box<dyn HwEncoder>)
+                        .map(|e| Box::new(e) as Box<dyn crate::hw::HwEncoder>)
                 }) as HwFactory
             });
             let make_source = || {
@@ -290,7 +255,8 @@ pub(crate) trait VideoSink: Send + 'static {
     fn take_rate_request(&self) -> Option<RateRequest>;
 }
 
-/// Publishes on a host session from the capture thread.
+/// Publishes on a host session from the capture and encoding threads.
+#[derive(Clone)]
 struct HostSink {
     /// The session.
     host: HostSession,
@@ -324,6 +290,53 @@ impl VideoSink for HostSink {
     /// Forwards to [`HostSession::take_rate_request`].
     fn take_rate_request(&self) -> Option<RateRequest> {
         self.host.take_rate_request()
+    }
+}
+
+/// Frame counters and processing times since the last stats log line.
+#[derive(Debug)]
+pub(crate) struct Stats {
+    /// Frames the source delivered.
+    captured: u32,
+    /// Ticks skipped because the previous frame took too long.
+    dropped: u32,
+    /// Time from captured frame to published frame, per frame.
+    process: Vec<Duration>,
+    /// Start of the current period.
+    since: Instant,
+}
+
+impl Stats {
+    /// Starts counting at `now`.
+    pub(crate) fn new(now: Instant) -> Stats {
+        Stats {
+            captured: 0,
+            dropped: 0,
+            process: Vec::new(),
+            since: now,
+        }
+    }
+
+    /// Returns the median processing time of the current period.
+    pub(crate) fn median(&self) -> Option<Duration> {
+        let mut times = self.process.clone();
+        times.sort_unstable();
+        times.get(times.len() / 2).copied()
+    }
+
+    /// Logs the counters when 10 s have passed since the last line, then starts over.
+    fn log_if_due(&mut self, now: Instant) {
+        if now.duration_since(self.since) < STATS_INTERVAL {
+            return;
+        }
+        tracing::debug!(
+            captured = self.captured,
+            published = self.process.len(),
+            dropped = self.dropped,
+            median_process_ms = self.median().map_or(0.0, |d| d.as_secs_f64() * 1000.0),
+            "screen share stats"
+        );
+        *self = Stats::new(now);
     }
 }
 
@@ -373,19 +386,19 @@ pub(crate) struct ShareLoop<K: VideoSink> {
     retry_at: Option<Instant>,
     /// When the monitor list is refreshed next.
     next_enumerate: Instant,
-    /// Opens hardware encoders; `None` once the share encodes in software.
+    /// Opens hardware encoders until the encoding thread takes it over.
     pub(crate) hardware: Option<HwFactory>,
-    /// The open hardware encoder.
-    hw: Option<Box<dyn HwEncoder>>,
-    /// What the session's track currently takes.
-    input: VideoInput,
+    /// The hardware encoding thread; `None` while encoding in software.
+    worker: Option<HwWorker>,
     /// Whether the next hardware frame must be a keyframe.
     force_keyframe: bool,
     /// The latest bitrate the network asked for.
     requested_bps: Option<u64>,
+    /// Frame counters for the periodic stats line.
+    stats: Stats,
 }
 
-impl<K: VideoSink> ShareLoop<K> {
+impl<K: VideoSink + Clone> ShareLoop<K> {
     /// Creates the loop and lists the monitors of `source` at `now`.
     pub(crate) fn new(
         mut source: Box<dyn FrameSource>,
@@ -422,10 +435,10 @@ impl<K: VideoSink> ShareLoop<K> {
             retry_at,
             next_enumerate: now + ENUMERATE_INTERVAL,
             hardware: None,
-            hw: None,
-            input: VideoInput::Raw,
+            worker: None,
             force_keyframe: false,
             requested_bps: None,
+            stats: Stats::new(now),
         }
     }
 
@@ -445,8 +458,11 @@ impl<K: VideoSink> ShareLoop<K> {
                 next_tick += interval;
                 let after = Instant::now();
                 if next_tick < after {
+                    let behind = after.duration_since(next_tick).as_micros() / interval.as_micros();
+                    self.stats.dropped += behind as u32 + 1;
                     next_tick = after + interval;
                 }
+                self.stats.log_if_due(after);
             }
             let wait = next_tick.saturating_duration_since(Instant::now());
             match commands.recv_timeout(wait) {
@@ -473,7 +489,6 @@ impl<K: VideoSink> ShareLoop<K> {
                 }
                 if let Control::SetQuality { mode } = control {
                     tracing::info!(?mode, "quality mode requested");
-                    self.apply_bitrate();
                 }
                 self.emit(out);
             }
@@ -498,7 +513,10 @@ impl<K: VideoSink> ShareLoop<K> {
                     let out = self.ctl.set_capture(CaptureState::Active);
                     self.emit(out);
                 }
+                self.stats.captured += 1;
+                let started = Instant::now();
                 self.publish(&frame);
+                self.stats.process.push(started.elapsed());
             }
             Ok(None) => {}
             Err(e) => self.fail(e, now),
@@ -545,61 +563,46 @@ impl<K: VideoSink> ShareLoop<K> {
         }
     }
 
-    /// Converts `frame` for the current mode and publishes it, on the hardware
-    /// encoder while one works and in software otherwise.
+    /// Converts `frame` for the current mode and publishes it: through the
+    /// hardware encoding thread while hardware encoding works, in software otherwise.
     fn publish(&mut self, frame: &BgraFrame) {
         let (w, h) = mode::target_size(self.ctl.state().mode, frame.width, frame.height);
         let timestamp_us = now_micros();
-        if self.hardware.is_some() {
-            match self.encode_hardware(frame, w, h, timestamp_us) {
-                Ok(()) => return,
-                Err(e) => self.fall_back(e, w, h),
+        if let Some(err) = self.worker.as_ref().and_then(HwWorker::failure) {
+            self.fall_back(err);
+        }
+        if self.worker.is_none() {
+            if let Some(factory) = self.hardware.take() {
+                self.worker = Some(HwWorker::start(factory, self.sink.clone()));
             }
+        }
+        if let Some(worker) = &self.worker {
+            if let Some(rate) = self.sink.take_rate_request() {
+                self.requested_bps = Some(rate.bitrate_bps);
+            }
+            let requested = self.sink.take_keyframe_request();
+            if requested {
+                tracing::debug!("keyframe requested by the network");
+            }
+            let force = requested | std::mem::take(&mut self.force_keyframe);
+            let job = Job {
+                nv12: convert::to_nv12(frame, w, h),
+                width: w,
+                height: h,
+                timestamp_us,
+                force_keyframe: force,
+                bitrate_bps: self.bitrate(),
+            };
+            if !worker.submit(job) {
+                self.stats.dropped += 1;
+                self.force_keyframe |= force;
+            }
+            return;
         }
         let raw = convert::to_i420(frame, w, h, timestamp_us);
         if let Err(e) = self.sink.publish_raw(&raw) {
             tracing::debug!(error = %e, "frame not published");
         }
-    }
-
-    /// Encodes `frame` at `w` x `h` on the hardware encoder and publishes the
-    /// access units, opening the encoder and switching the track when needed.
-    fn encode_hardware(&mut self, frame: &BgraFrame, w: u32, h: u32, timestamp_us: i64) -> Result<(), EncodeError> {
-        if self.hw.as_ref().map(|e| e.size()) != Some((w, h)) {
-            self.hw = None;
-            let bps = self.bitrate();
-            let factory = self.hardware.as_mut().ok_or(EncodeError::NoHardware)?;
-            let enc = factory(w, h, bps)?;
-            if self.input != VideoInput::Encoded {
-                tracing::info!(encoder = enc.name(), "encoder: hardware");
-                self.sink
-                    .switch_input(VideoInput::Encoded, w, h)
-                    .map_err(|_| EncodeError::Stalled)?;
-                self.input = VideoInput::Encoded;
-            }
-            self.hw = Some(enc);
-            self.force_keyframe = true;
-        }
-        if let Some(rate) = self.sink.take_rate_request() {
-            self.requested_bps = Some(rate.bitrate_bps);
-            self.apply_bitrate();
-        }
-        let force = self.sink.take_keyframe_request() | std::mem::take(&mut self.force_keyframe);
-        let nv12 = convert::to_nv12(frame, w, h);
-        let enc = self.hw.as_mut().ok_or(EncodeError::NoHardware)?;
-        for au in enc.encode(&nv12, timestamp_us, force)? {
-            let encoded = EncodedFrame {
-                width: w,
-                height: h,
-                timestamp_us: au.timestamp_us,
-                keyframe: au.keyframe,
-                data: &au.data,
-            };
-            if let Err(e) = self.sink.publish_encoded(&encoded) {
-                tracing::debug!(error = %e, "access unit not published");
-            }
-        }
-        Ok(())
     }
 
     /// Returns the bitrate the hardware encoder targets: the network's request,
@@ -609,30 +612,16 @@ impl<K: VideoSink> ShareLoop<K> {
         self.requested_bps.map_or(cap, |bps| bps.min(cap))
     }
 
-    /// Passes the current target bitrate to the open hardware encoder.
-    fn apply_bitrate(&mut self) {
-        let bps = self.bitrate();
-        if let Some(enc) = self.hw.as_mut() {
-            if let Err(e) = enc.set_bitrate(bps) {
-                tracing::debug!(error = %e, "bitrate change refused");
-            }
-        }
-    }
-
-    /// Stops using hardware encoding for the rest of the share after `err`.
-    fn fall_back(&mut self, err: EncodeError, w: u32, h: u32) {
-        self.hw = None;
+    /// Encodes in software for the rest of the share after the hardware encoder failed with `err`.
+    ///
+    /// The encoding thread has already switched the track back to raw frames.
+    fn fall_back(&mut self, err: EncodeError) {
+        self.worker = None;
         self.hardware = None;
         if err == EncodeError::NoHardware {
             tracing::info!("encoder: software (no hardware H.264 encoder)");
         } else {
             tracing::warn!(error = %err, "hardware encoder failed, switching to software");
-        }
-        if self.input != VideoInput::Raw {
-            match self.sink.switch_input(VideoInput::Raw, w, h) {
-                Ok(()) => self.input = VideoInput::Raw,
-                Err(e) => tracing::warn!(error = %e, "switching the track to raw frames failed"),
-            }
         }
     }
 
@@ -668,7 +657,18 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::h264::EncodedAu;
+    use crate::hw::HwEncoder;
     use crate::source::{SyntheticControl, SyntheticSource};
+
+    /// Waits up to 2 s for `cond` to hold.
+    fn wait_for(cond: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !cond() {
+            assert!(Instant::now() < deadline, "condition not met within 2 s");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
 
     /// Records what the loop publishes and plays back queued network requests.
     #[derive(Clone, Default)]
@@ -730,6 +730,10 @@ mod tests {
         forced: Arc<Mutex<Vec<bool>>>,
         /// Every bitrate set after opening.
         bitrates: Arc<Mutex<Vec<u64>>>,
+        /// Access units the next poll returns.
+        pending: Arc<Mutex<u32>>,
+        /// How long each encode call takes.
+        delay: Arc<Mutex<Duration>>,
     }
 
     /// An encoder that emits one access unit per frame and fails after `fail_after` frames.
@@ -758,6 +762,11 @@ mod tests {
         /// Emits one access unit, a keyframe when forced, or fails.
         fn encode(&mut self, _nv12: &[u8], ts: i64, force: bool) -> Result<Vec<EncodedAu>, EncodeError> {
             self.log.forced.lock().unwrap().push(force);
+            let delay = *self.log.delay.lock().unwrap();
+            let started = Instant::now();
+            while started.elapsed() < delay && !self.log.delay.lock().unwrap().is_zero() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
             if self.frames >= self.fail_after {
                 return Err(EncodeError::Hresult(0x8000_4005));
             }
@@ -767,6 +776,18 @@ mod tests {
                 keyframe: force,
                 timestamp_us: ts,
             }])
+        }
+
+        /// Returns the pending access units.
+        fn poll(&mut self) -> Result<Vec<EncodedAu>, EncodeError> {
+            let n = std::mem::take(&mut *self.log.pending.lock().unwrap());
+            Ok((0..n)
+                .map(|_| EncodedAu {
+                    data: vec![0, 0, 1, 0x41],
+                    keyframe: false,
+                    timestamp_us: 0,
+                })
+                .collect())
         }
 
         /// Records the bitrate.
@@ -813,6 +834,22 @@ mod tests {
     /// Returns a test device ID.
     fn dev(n: u32) -> DeviceId {
         DeviceId::new(100_000_000 + n).unwrap()
+    }
+
+    #[test]
+    fn stats_median_and_reset() {
+        let t0 = Instant::now();
+        let mut stats = Stats::new(t0);
+        assert_eq!(stats.median(), None);
+        for ms in [9, 1, 5] {
+            stats.process.push(Duration::from_millis(ms));
+        }
+        assert_eq!(stats.median(), Some(Duration::from_millis(5)));
+        stats.log_if_due(t0 + Duration::from_secs(1));
+        assert_eq!(stats.process.len(), 3);
+        stats.log_if_due(t0 + STATS_INTERVAL);
+        assert!(stats.process.is_empty());
+        assert_eq!(stats.since, t0 + STATS_INTERVAL);
     }
 
     #[test]
@@ -885,13 +922,19 @@ mod tests {
         assert_eq!(lp.retry_at.unwrap().duration_since(now), BACKOFF_START);
     }
 
+    /// Ticks `lp` at `now` and waits until the recorder holds `encoded` access units.
+    fn tick_encoded(lp: &mut ShareLoop<Recorder>, rec: &Recorder, now: Instant, encoded: usize) {
+        lp.tick(now);
+        wait_for(|| rec.encoded.lock().unwrap().len() >= encoded);
+    }
+
     #[test]
     fn hardware_publishes_encoded_with_keyframe_first() {
         let (mut lp, _, rec, _, t0) = setup();
         let log = FakeLog::default();
         lp.hardware = Some(fake_factory(u32::MAX, log.clone()));
-        lp.tick(t0);
-        lp.tick(t0);
+        tick_encoded(&mut lp, &rec, t0, 1);
+        tick_encoded(&mut lp, &rec, t0, 2);
         assert_eq!(*rec.switches.lock().unwrap(), [VideoInput::Encoded]);
         assert_eq!(*rec.encoded.lock().unwrap(), [(1920, 1080, true), (1920, 1080, false)]);
         assert!(rec.raw.lock().unwrap().is_empty());
@@ -903,20 +946,25 @@ mod tests {
         let (mut lp, _, rec, _, t0) = setup();
         let log = FakeLog::default();
         lp.hardware = Some(fake_factory(u32::MAX, log.clone()));
-        lp.tick(t0);
+        tick_encoded(&mut lp, &rec, t0, 1);
         *rec.rate.lock().unwrap() = Some(9_000_000);
-        lp.tick(t0);
+        tick_encoded(&mut lp, &rec, t0, 2);
         *rec.rate.lock().unwrap() = Some(3_000_000);
         *rec.keyframe.lock().unwrap() = true;
-        lp.tick(t0);
+        tick_encoded(&mut lp, &rec, t0, 3);
         lp.command(Command::Control(
             dev(1),
             Control::SetQuality {
-                mode: QualityMode::Quality,
+                mode: QualityMode::Speed,
             },
         ));
-        assert_eq!(*log.forced.lock().unwrap(), [true, false, true]);
-        assert_eq!(*log.bitrates.lock().unwrap(), [5_000_000, 3_000_000, 3_000_000]);
+        tick_encoded(&mut lp, &rec, t0, 4);
+        assert_eq!(*log.forced.lock().unwrap(), [true, false, true, true]);
+        assert_eq!(
+            *log.opened.lock().unwrap(),
+            [(1920, 1080, 5_000_000), (1280, 720, 2_500_000)]
+        );
+        assert_eq!(*log.bitrates.lock().unwrap(), [3_000_000]);
     }
 
     #[test]
@@ -924,10 +972,10 @@ mod tests {
         let (mut lp, _, rec, _, t0) = setup();
         let log = FakeLog::default();
         lp.hardware = Some(fake_factory(u32::MAX, log.clone()));
-        lp.tick(t0);
-        lp.tick(t0);
+        tick_encoded(&mut lp, &rec, t0, 1);
+        tick_encoded(&mut lp, &rec, t0, 2);
         lp.command(Command::Control(dev(1), Control::SelectMonitor { index: 1 }));
-        lp.tick(t0);
+        tick_encoded(&mut lp, &rec, t0, 3);
         assert_eq!(
             log.opened.lock().unwrap().iter().map(|o| (o.0, o.1)).collect::<Vec<_>>(),
             [(1920, 1080), (640, 480)]
@@ -937,29 +985,64 @@ mod tests {
     }
 
     #[test]
+    fn polling_publishes_pending_access_units() {
+        let (mut lp, _, rec, _, t0) = setup();
+        let log = FakeLog::default();
+        lp.hardware = Some(fake_factory(u32::MAX, log.clone()));
+        tick_encoded(&mut lp, &rec, t0, 1);
+        *log.pending.lock().unwrap() = 2;
+        wait_for(|| rec.encoded.lock().unwrap().len() == 3);
+    }
+
+    #[test]
+    fn busy_worker_drops_frames_and_keeps_the_keyframe() {
+        let (mut lp, _, rec, _, t0) = setup();
+        let log = FakeLog::default();
+        lp.hardware = Some(fake_factory(u32::MAX, log.clone()));
+        *log.delay.lock().unwrap() = Duration::from_millis(200);
+        lp.tick(t0);
+        wait_for(|| log.forced.lock().unwrap().len() == 1);
+        lp.tick(t0);
+        *rec.keyframe.lock().unwrap() = true;
+        lp.tick(t0);
+        assert_eq!(lp.stats.dropped, 1);
+        assert!(lp.force_keyframe, "the dropped frame's keyframe request was lost");
+        *log.delay.lock().unwrap() = Duration::ZERO;
+        wait_for(|| rec.encoded.lock().unwrap().len() == 2);
+        tick_encoded(&mut lp, &rec, t0, 3);
+        assert_eq!(*log.forced.lock().unwrap(), [true, false, true]);
+    }
+
+    #[test]
     fn hardware_error_falls_back_to_software() {
         let (mut lp, _, rec, _, t0) = setup();
         let log = FakeLog::default();
         lp.hardware = Some(fake_factory(2, log.clone()));
-        for _ in 0..5 {
-            lp.tick(t0);
-        }
+        tick_encoded(&mut lp, &rec, t0, 1);
+        tick_encoded(&mut lp, &rec, t0, 2);
+        lp.tick(t0);
+        wait_for(|| rec.switches.lock().unwrap().len() == 2);
+        lp.tick(t0);
+        lp.tick(t0);
         assert_eq!(*rec.switches.lock().unwrap(), [VideoInput::Encoded, VideoInput::Raw]);
         assert_eq!(rec.encoded.lock().unwrap().len(), 2);
-        assert_eq!(rec.raw.lock().unwrap().len(), 3);
+        assert_eq!(rec.raw.lock().unwrap().len(), 2);
         assert_eq!(log.opened.lock().unwrap().len(), 1);
-        assert!(lp.hardware.is_none());
+        assert!(lp.hardware.is_none() && lp.worker.is_none());
     }
 
     #[test]
     fn no_hardware_stays_software_without_switching() {
         let (mut lp, _, rec, _, t0) = setup();
         lp.hardware = Some(Box::new(|_, _, _| Err(EncodeError::NoHardware)));
-        lp.tick(t0);
-        lp.tick(t0);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while rec.raw.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "no raw frame within 2 s");
+            lp.tick(t0);
+            std::thread::sleep(Duration::from_millis(2));
+        }
         assert!(rec.switches.lock().unwrap().is_empty());
-        assert_eq!(rec.raw.lock().unwrap().len(), 2);
-        assert!(lp.hardware.is_none());
+        assert!(lp.hardware.is_none() && lp.worker.is_none());
     }
 
     #[test]
@@ -967,14 +1050,13 @@ mod tests {
         let (mut lp, control, rec, _, t0) = setup();
         let log = FakeLog::default();
         lp.hardware = Some(fake_factory(u32::MAX, log.clone()));
-        lp.tick(t0);
-        lp.tick(t0);
+        tick_encoded(&mut lp, &rec, t0, 1);
+        tick_encoded(&mut lp, &rec, t0, 2);
         control.fail_next(1);
         lp.tick(t0);
         let at = lp.retry_at.unwrap();
-        lp.tick(at);
+        tick_encoded(&mut lp, &rec, at, 3);
         assert_eq!(*log.forced.lock().unwrap(), [true, false, true]);
-        assert_eq!(rec.encoded.lock().unwrap().len(), 3);
     }
 
     #[test]

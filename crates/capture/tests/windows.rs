@@ -112,6 +112,17 @@ fn hardware(w: u32, h: u32) -> Option<MfEncoder> {
 /// Microseconds between frames at 30 fps.
 const FRAME_US: i64 = 33_333;
 
+/// Polls `enc` for up to 200 ms and returns the access units that come out.
+fn drain(enc: &mut MfEncoder) -> Vec<surf_rac_capture::mf::EncodedAu> {
+    let mut out = Vec::new();
+    let deadline = Instant::now() + Duration::from_millis(200);
+    while Instant::now() < deadline {
+        out.extend(enc.poll().unwrap());
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    out
+}
+
 #[test]
 fn encodes_idr_first() {
     let Some(mut enc) = hardware(1280, 720) else { return };
@@ -119,6 +130,7 @@ fn encodes_idr_first() {
     for n in 0..10 {
         aus.extend(enc.encode(&nv12_bar(1280, 720, n), i64::from(n) * FRAME_US, false).unwrap());
     }
+    aus.extend(drain(&mut enc));
     assert!(aus.len() >= 5, "only {} access units for 10 frames", aus.len());
     let first = &aus[0];
     let types = nal_types(&first.data);
@@ -139,6 +151,7 @@ fn forced_keyframe_within_two_frames() {
         let force = n == 15;
         aus.extend(enc.encode(&nv12_bar(1280, 720, n), i64::from(n) * FRAME_US, force).unwrap());
     }
+    aus.extend(drain(&mut enc));
     let key = aus
         .iter()
         .find(|au| au.keyframe && au.timestamp_us >= forced)
@@ -158,11 +171,34 @@ fn encode_median_under_15ms_1080p() {
         count += enc.encode(&frame, i64::from(n) * FRAME_US, false).unwrap().len();
         times.push(started.elapsed());
     }
+    count += drain(&mut enc).len();
     times.sort();
     let median = times[30];
     println!("hardware encode median {median:?}, {count} access units for 60 frames");
     assert!(count >= 55, "only {count} access units for 60 frames");
     assert!(median < Duration::from_millis(15), "median {median:?}");
+}
+
+#[test]
+fn paced_frames_keep_up_with_30_fps() {
+    let Some(mut enc) = hardware(1920, 1080) else { return };
+    let started = Instant::now();
+    let (mut count, mut busy) = (0, Duration::ZERO);
+    for n in 0..60u32 {
+        let frame = nv12_bar(1920, 1080, n);
+        let t = Instant::now();
+        count += enc.encode(&frame, i64::from(n) * FRAME_US, false).unwrap().len();
+        busy += t.elapsed();
+        let next = started + Duration::from_micros(33_333) * (n + 1);
+        while Instant::now() < next {
+            count += enc.poll().unwrap().len();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    count += drain(&mut enc).len();
+    println!("paced: {count} access units for 60 frames, encode calls {:?} on average", busy / 60);
+    assert!(count >= 58, "only {count} access units for 60 frames");
+    assert!(busy / 60 < Duration::from_millis(33), "encode calls take {:?} on average", busy / 60);
 }
 
 #[test]

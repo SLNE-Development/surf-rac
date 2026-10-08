@@ -5,6 +5,7 @@ pub mod convert;
 #[cfg(windows)]
 pub mod desktop;
 pub mod h264;
+mod hw;
 #[cfg(windows)]
 pub mod mf;
 pub mod mode;

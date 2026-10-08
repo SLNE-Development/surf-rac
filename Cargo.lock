@@ -3260,12 +3260,18 @@ name = "surf-rac-app"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
+ "hmac",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
+ "sqlx",
  "surf-rac-protocol",
+ "surf-rac-server",
  "surf-rac-session",
  "thiserror 2.0.21",
+ "tokio",
  "tracing",
  "windows",
 ]

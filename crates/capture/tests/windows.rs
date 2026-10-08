@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use surf_rac_capture::FrameSource;
 use surf_rac_capture::convert::{BgraFrame, to_i420};
 use surf_rac_capture::desktop::DesktopSource;
+use surf_rac_capture::h264::{NAL_IDR, NAL_SPS, nal_types};
+use surf_rac_capture::mf::{EncodeError, MfEncoder};
 use surf_rac_capture::mode::target_size;
 use surf_rac_protocol::data::QualityMode;
 
@@ -76,4 +78,97 @@ fn capture_and_convert_median_under_10ms() {
     let median = times[times.len() / 2];
     println!("capture + convert median {median:?} over {} frames", times.len());
     assert!(median < Duration::from_millis(10), "median {median:?}");
+}
+
+/// Returns a `w` x `h` NV12 frame with a white bar at a position set by `n`.
+fn nv12_bar(w: u32, h: u32, n: u32) -> Vec<u8> {
+    let (w, h) = (w as usize, h as usize);
+    let mut data = vec![16u8; w * h];
+    let x0 = (n as usize * 16) % w;
+    for row in data.chunks_mut(w) {
+        for px in row.iter_mut().skip(x0).take(64) {
+            *px = 235;
+        }
+    }
+    data.resize(w * h * 3 / 2, 128);
+    data
+}
+
+/// Creates a hardware encoder, or returns `None` and says so when this machine has none.
+fn hardware(w: u32, h: u32) -> Option<MfEncoder> {
+    match MfEncoder::new(w, h, 5_000_000, 30) {
+        Ok(enc) => {
+            println!("hardware encoder: {}", enc.adapter_name());
+            Some(enc)
+        }
+        Err(EncodeError::NoHardware) => {
+            eprintln!("no hardware H.264 encoder on this machine; skipped");
+            None
+        }
+        Err(e) => panic!("encoder: {e}"),
+    }
+}
+
+/// Microseconds between frames at 30 fps.
+const FRAME_US: i64 = 33_333;
+
+#[test]
+fn encodes_idr_first() {
+    let Some(mut enc) = hardware(1280, 720) else { return };
+    let mut aus = Vec::new();
+    for n in 0..10 {
+        aus.extend(enc.encode(&nv12_bar(1280, 720, n), i64::from(n) * FRAME_US, false).unwrap());
+    }
+    assert!(aus.len() >= 5, "only {} access units for 10 frames", aus.len());
+    let first = &aus[0];
+    let types = nal_types(&first.data);
+    assert!(first.keyframe, "first access unit is not a keyframe: {types:?}");
+    assert!(types.contains(&NAL_SPS) && types.contains(&NAL_IDR), "{types:?}");
+    assert!(aus[1..].iter().any(|au| !au.keyframe), "every access unit is a keyframe");
+}
+
+#[test]
+fn forced_keyframe_within_two_frames() {
+    let Some(mut enc) = hardware(1280, 720) else { return };
+    let mut aus = Vec::new();
+    for n in 0..15 {
+        aus.extend(enc.encode(&nv12_bar(1280, 720, n), i64::from(n) * FRAME_US, false).unwrap());
+    }
+    let forced = 15 * FRAME_US;
+    for n in 15..20 {
+        let force = n == 15;
+        aus.extend(enc.encode(&nv12_bar(1280, 720, n), i64::from(n) * FRAME_US, force).unwrap());
+    }
+    let key = aus
+        .iter()
+        .find(|au| au.keyframe && au.timestamp_us >= forced)
+        .expect("no keyframe after the request");
+    assert!(key.timestamp_us <= forced + FRAME_US, "keyframe at {} us", key.timestamp_us);
+    assert!(nal_types(&key.data).contains(&NAL_SPS));
+}
+
+#[test]
+fn encode_median_under_15ms_1080p() {
+    let Some(mut enc) = hardware(1920, 1080) else { return };
+    let mut times = Vec::new();
+    let mut count = 0;
+    for n in 0..60 {
+        let frame = nv12_bar(1920, 1080, n);
+        let started = Instant::now();
+        count += enc.encode(&frame, i64::from(n) * FRAME_US, false).unwrap().len();
+        times.push(started.elapsed());
+    }
+    times.sort();
+    let median = times[30];
+    println!("hardware encode median {median:?}, {count} access units for 60 frames");
+    assert!(count >= 55, "only {count} access units for 60 frames");
+    assert!(median < Duration::from_millis(15), "median {median:?}");
+}
+
+#[test]
+fn bitrate_change_is_accepted() {
+    let Some(mut enc) = hardware(640, 480) else { return };
+    enc.encode(&nv12_bar(640, 480, 0), 0, false).unwrap();
+    enc.set_bitrate(2_500_000).unwrap();
+    enc.encode(&nv12_bar(640, 480, 1), FRAME_US, false).unwrap();
 }

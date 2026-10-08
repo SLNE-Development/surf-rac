@@ -4,6 +4,9 @@
 pub mod convert;
 #[cfg(windows)]
 pub mod desktop;
+pub mod h264;
+#[cfg(windows)]
+pub mod mf;
 pub mod mode;
 pub mod share;
 pub mod source;

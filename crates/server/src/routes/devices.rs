@@ -1,11 +1,13 @@
 //! Device, contact and presence routes.
 
 use axum::Json;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use surf_rac_protocol::{
-    ContactInfo, DeviceId, DeviceInfo, PresenceInfo, PutContactRequest, RegisterDeviceRequest,
-    RegisterDeviceResponse,
+    ContactInfo, DeviceId, DeviceInfo, PresenceInfo, PutContactRequest, PutPublicKeyRequest,
+    RegisterDeviceRequest, RegisterDeviceResponse,
 };
 
 use crate::contacts;
@@ -111,6 +113,31 @@ pub async fn delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `PUT /v1/devices/{id}/public-key`: sets the X25519 public key of one of the caller's devices.
+pub async fn put_public_key(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(raw): Path<String>,
+    JsonBody(req): JsonBody<PutPublicKeyRequest>,
+) -> Result<StatusCode, ApiError> {
+    let id = parse_id(&raw)?;
+    let key: [u8; 32] = STANDARD
+        .decode(&req.public_key)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| ApiError::bad_request("public_key must be base64 of 32 bytes"))?;
+    match devices::owner(&state.db, id).await? {
+        None => return Err(ApiError::not_found()),
+        Some(owner) if owner != user.user_id => return Err(ApiError::forbidden()),
+        Some(_) => {}
+    }
+    if !devices::set_public_key(&state.db, user.user_id, id, &key).await? {
+        return Err(ApiError::not_found());
+    }
+    tracing::info!(username = %user.username, device_id = %id, "device public key set");
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// `GET /v1/contacts`: lists the caller's contacts with their online state.
 pub async fn list_contacts(
     State(state): State<AppState>,
@@ -159,7 +186,7 @@ pub async fn delete_contact(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `GET /v1/presence/{id}`: reports whether a device is online.
+/// `GET /v1/presence/{id}`: reports whether a device is online and its public key.
 pub async fn presence(
     State(state): State<AppState>,
     _user: AuthUser,
@@ -169,9 +196,10 @@ pub async fn presence(
     if !devices::exists(&state.db, id).await? {
         return Err(ApiError::not_found());
     }
+    let public_key = devices::public_key(&state.db, id).await?;
     Ok(Json(PresenceInfo {
         device_id: id,
         online: state.hub.is_online(id),
-        public_key: None,
+        public_key: public_key.map(|k| STANDARD.encode(k)),
     }))
 }

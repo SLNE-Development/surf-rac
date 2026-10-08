@@ -225,3 +225,29 @@ pub async fn owner(db: &PgPool, device: DeviceId) -> Result<Option<i64>, sqlx::E
         .fetch_optional(db)
         .await
 }
+
+/// Sets the public key of `device` if it belongs to `user_id`; returns whether it was set.
+pub async fn set_public_key(
+    db: &PgPool,
+    user_id: i64,
+    device: DeviceId,
+    key: &[u8; 32],
+) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query("update devices set public_key = $3 where id = $1 and user_id = $2")
+        .bind(i64::from(device.get()))
+        .bind(user_id)
+        .bind(&key[..])
+        .execute(db)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Returns the public key of `device`, if the device exists and has one.
+pub async fn public_key(db: &PgPool, device: DeviceId) -> Result<Option<Vec<u8>>, sqlx::Error> {
+    let key: Option<Option<Vec<u8>>> =
+        sqlx::query_scalar("select public_key from devices where id = $1")
+            .bind(i64::from(device.get()))
+            .fetch_optional(db)
+            .await?;
+    Ok(key.flatten())
+}

@@ -19,6 +19,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/logout", post(accounts::logout))
         .route("/v1/devices", post(devices::register).get(devices::list))
         .route("/v1/devices/{id}", axum::routing::delete(devices::delete))
+        .route("/v1/devices/{id}/public-key", put(devices::put_public_key))
         .route("/v1/contacts", get(devices::list_contacts))
         .route(
             "/v1/contacts/{id}",

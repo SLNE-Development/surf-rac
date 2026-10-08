@@ -84,7 +84,13 @@ All endpoints are under `/v1`. The wire types are defined in the
 
 - `POST /register`, `POST /login`, `POST /logout`
 - `POST /devices`, `GET /devices`, `DELETE /devices/{id}`
+- `PUT /devices/{id}/public-key`: sets the device's X25519 public key
+  (`{"public_key": "<base64 of 32 bytes>"}`); owner only
 - `GET /contacts`, `PUT /contacts/{id}`, `DELETE /contacts/{id}`
-- `GET /presence/{id}`
+- `GET /presence/{id}`: online state and, once set, the device's public key
 - `GET /ws`: WebSocket. Send `Authorization: Bearer <token>`, `X-Device-Id`
-  and `X-Device-Secret` on the upgrade request.
+  and `X-Device-Secret` on the upgrade request. Besides `signal` relaying it
+  carries session negotiation (`session_request`, `session_response`) and
+  LiveKit tokens: `host_token_request` returns a token for the device's own
+  room `host-<device_id>`; `viewer_token_request` sends a 60-second
+  subscribe-only token for that room to the named viewer.

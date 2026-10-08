@@ -359,3 +359,76 @@ async fn device_routes_require_auth(pool: PgPool) {
         assert_eq!(req.send().await.unwrap().status(), 401);
     }
 }
+
+/// Calls `PUT /v1/devices/{id}/public-key` for `token` with `key`.
+async fn put_key(app: &TestApp, token: &str, id: &str, key: &str) -> reqwest::Response {
+    app.client
+        .put(app.url(&format!("/v1/devices/{id}/public-key")))
+        .bearer_auth(token)
+        .json(&json!({"public_key": key}))
+        .send()
+        .await
+        .unwrap()
+}
+
+/// Returns the presence body of device `id` as seen by `token`.
+async fn presence_of(app: &TestApp, token: &str, id: &str) -> Value {
+    let res = app
+        .client
+        .get(app.url(&format!("/v1/presence/{id}")))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    res.json().await.unwrap()
+}
+
+/// Standard base64 of 32 bytes of `b`.
+fn b64_key(b: u8) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode([b; 32])
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn public_key_set_and_returned_on_presence(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let alice = app.register_and_login("alice").await;
+    let bob = app.register_and_login("bob").await;
+    let (id, _) = app.new_device(&alice, &fingerprint(1)).await;
+    assert_eq!(put_key(&app, &alice, &id, &b64_key(5)).await.status(), 204);
+    assert_eq!(presence_of(&app, &bob, &id).await["public_key"], b64_key(5).as_str());
+    assert_eq!(put_key(&app, &alice, &id, &b64_key(6)).await.status(), 204);
+    assert_eq!(presence_of(&app, &bob, &id).await["public_key"], b64_key(6).as_str());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn public_key_rejects_wrong_length(pool: PgPool) {
+    use base64::Engine;
+    let app = common::spawn(pool).await;
+    let alice = app.register_and_login("alice").await;
+    let (id, _) = app.new_device(&alice, &fingerprint(1)).await;
+    let short = base64::engine::general_purpose::STANDARD.encode([1u8; 31]);
+    assert_eq!(put_key(&app, &alice, &id, &short).await.status(), 400);
+    assert_eq!(put_key(&app, &alice, &id, "not base64!").await.status(), 400);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn public_key_of_other_account_forbidden(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let alice = app.register_and_login("alice").await;
+    let bob = app.register_and_login("bob").await;
+    let (id, _) = app.new_device(&alice, &fingerprint(1)).await;
+    assert_eq!(put_key(&app, &bob, &id, &b64_key(5)).await.status(), 403);
+    assert_eq!(put_key(&app, &bob, "123456789", &b64_key(5)).await.status(), 404);
+    assert!(presence_of(&app, &alice, &id).await.get("public_key").is_none());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn presence_without_key_omits_field(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let alice = app.register_and_login("alice").await;
+    let (id, _) = app.new_device(&alice, &fingerprint(1)).await;
+    let body = presence_of(&app, &alice, &id).await;
+    assert!(body.get("public_key").is_none(), "{body}");
+}

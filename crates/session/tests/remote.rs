@@ -9,6 +9,13 @@
 //!
 //! It registers two throwaway devices on the account, runs a host and a viewer
 //! session between them through the deployed server, and deletes the devices.
+//!
+//! For a test between two machines, run `remote_host` on one machine; it prints
+//! its device ID. Then run `remote_viewer` on the other with
+//! `SURF_RAC_HOST_ID=<that id>`. The host accepts the first request, streams a
+//! moving test pattern and echoes key messages; the viewer reports frames per
+//! second and data round-trip times. `SURF_RAC_DURATION` sets how long the host
+//! stays up in seconds (default 300).
 
 mod common;
 
@@ -69,11 +76,8 @@ async fn delete_device(client: &reqwest::Client, server: &str, token: &str, id: 
     println!("deleted device {id}: HTTP {}", res.status());
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs a deployed server and an account"]
-async fn session_through_deployed_server() {
-    let server = common::env("SURF_RAC_SERVER");
-    let client = reqwest::Client::new();
+/// Logs in to `server` with the account from the environment and returns the session token.
+async fn login(client: &reqwest::Client, server: &str) -> String {
     let res = client
         .post(format!("{server}/v1/login"))
         .json(&json!({"username": common::env("SURF_RAC_USERNAME"), "password": common::env("SURF_RAC_PASSWORD")}))
@@ -81,16 +85,148 @@ async fn session_through_deployed_server() {
         .await
         .unwrap();
     assert_eq!(res.status(), 200, "login");
-    let token = res.json::<Value>().await.unwrap()["token"]
+    res.json::<Value>().await.unwrap()["token"]
         .as_str()
         .unwrap()
-        .to_owned();
+        .to_owned()
+}
+
+/// Returns the WebSocket base URL of the HTTP base `server`.
+fn ws_url(server: &str) -> String {
+    server
+        .replacen("https://", "wss://", 1)
+        .replacen("http://", "ws://", 1)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a deployed server and an account; run on the first machine"]
+async fn remote_host() {
+    let server = common::env("SURF_RAC_SERVER");
+    let duration = std::env::var("SURF_RAC_DURATION")
+        .ok()
+        .and_then(|d| d.parse().ok())
+        .unwrap_or(300);
+    let client = reqwest::Client::new();
+    let token = login(&client, &server).await;
+    let dev = register_device(&client, &server, &token, "two-machine-host").await;
+    println!(
+        "HOST DEVICE ID: {}  (set SURF_RAC_HOST_ID to this on the viewer machine)",
+        dev.id
+    );
+    let signaling = SignalingClient::connect(&ws_url(&server), &token, dev.id, &dev.secret)
+        .await
+        .expect("host signaling");
+    let (host, mut events) = HostSession::start(
+        signaling,
+        Arc::new(DeviceKeys::generate()),
+        Arc::new(Mutex::new(KnownKeys::default())),
+        1280,
+        720,
+        SessionConfig::default(),
+    )
+    .await
+    .expect("host start");
+    let feed = {
+        let host = host.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(33));
+            loop {
+                tick.tick().await;
+                let _ = host.publish_frame(&stamp::stamp_frame(1280, 720, stamp::now_micros()));
+            }
+        })
+    };
+    let run = async {
+        while let Some(ev) = events.recv().await {
+            match ev {
+                HostEvent::ViewerRequested {
+                    session_id,
+                    viewer,
+                    fingerprint,
+                } => {
+                    println!("viewer {viewer} requests session (key {fingerprint}), accepting");
+                    host.accept(&session_id).await.expect("accept");
+                }
+                HostEvent::DataReceived {
+                    viewer,
+                    message: message @ DataMessage::Key { .. },
+                } => {
+                    let _ = host.send(viewer, &message).await;
+                }
+                HostEvent::DataReceived { .. } => {}
+                other => println!("host event: {other:?}"),
+            }
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(duration), run).await;
+    feed.abort();
+    host.close().await;
+    delete_device(&client, &server, &token, dev.id).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a running remote_host; run on the second machine"]
+async fn remote_viewer() {
+    let server = common::env("SURF_RAC_SERVER");
+    let host: DeviceId = common::env("SURF_RAC_HOST_ID")
+        .parse()
+        .expect("SURF_RAC_HOST_ID");
+    let client = reqwest::Client::new();
+    let token = login(&client, &server).await;
+    let dev = register_device(&client, &server, &token, "two-machine-viewer").await;
+    let outcome = async {
+        let signaling = SignalingClient::connect(&ws_url(&server), &token, dev.id, &dev.secret)
+            .await
+            .expect("viewer signaling");
+        let started = std::time::Instant::now();
+        let (viewer, mut events) = ViewerSession::request(
+            signaling,
+            Arc::new(DeviceKeys::generate()),
+            Arc::new(Mutex::new(KnownKeys::default())),
+            host,
+            SessionConfig::default(),
+        )
+        .await
+        .expect("session request");
+        viewer_event(&mut events, Duration::from_secs(30), |e| matches!(e, ViewerEvent::Connected)).await;
+        println!("connected after {} ms", started.elapsed().as_millis());
+        let frames = collect_stamps(&mut events, Duration::from_secs(10)).await;
+        println!("received {} stamped 1280x720 frames in 10 s ({:.1} fps)", frames.len(), frames.len() as f64 / 10.0);
+        let mut rtts = Vec::new();
+        for code in 0..20u32 {
+            let sent = std::time::Instant::now();
+            viewer.send(&DataMessage::Key { code, down: true }).await.expect("send");
+            viewer_event(&mut events, Duration::from_secs(5), |e| {
+                matches!(e, ViewerEvent::DataReceived(DataMessage::Key { code: c, .. }) if *c == code)
+            })
+            .await;
+            rtts.push(sent.elapsed().as_micros() as i64);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        rtts.sort_unstable();
+        println!(
+            "data round trip through the SFU: median {} ms, max {} ms (one way about half)",
+            rtts[rtts.len() / 2] / 1000,
+            rtts[rtts.len() - 1] / 1000
+        );
+        viewer.hangup().await;
+        frames.len()
+    }
+    .await;
+    delete_device(&client, &server, &token, dev.id).await;
+    assert!(outcome >= 100, "only {outcome} frames in 10 s");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a deployed server and an account"]
+async fn session_through_deployed_server() {
+    let server = common::env("SURF_RAC_SERVER");
+    let client = reqwest::Client::new();
+    let token = login(&client, &server).await;
 
     let host_dev = register_device(&client, &server, &token, "smoke-host").await;
     let viewer_dev = register_device(&client, &server, &token, "smoke-viewer").await;
-    let ws = server
-        .replacen("https://", "wss://", 1)
-        .replacen("http://", "ws://", 1);
+    let ws = ws_url(&server);
 
     let outcome = tokio::time::timeout(Duration::from_secs(120), async {
         let host_sig = SignalingClient::connect(&ws, &token, host_dev.id, &host_dev.secret)

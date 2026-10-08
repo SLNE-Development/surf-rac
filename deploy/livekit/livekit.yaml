@@ -1,0 +1,17 @@
+# LiveKit SFU for surf-rac on the VPS (31.70.103.18).
+# API keys come from the LIVEKIT_KEYS environment variable ("<key>: <secret>"),
+# the same key and secret the signaling server signs tokens with.
+port: 7880
+log_level: info
+rtc:
+  tcp_port: 7881
+  port_range_start: 50000
+  port_range_end: 60000
+  use_external_ip: true
+turn:
+  enabled: true
+  udp_port: 3478
+room:
+  max_participants: 6
+  empty_timeout: 300
+  departure_timeout: 20

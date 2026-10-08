@@ -1,0 +1,10 @@
+services:
+  livekit:
+    image: livekit/livekit-server:v1.13.7
+    command: ["--config", "/etc/livekit.yaml"]
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      LIVEKIT_KEYS: "${LIVEKIT_KEYS:?set LIVEKIT_KEYS to the key and secret of the signaling server}"
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro

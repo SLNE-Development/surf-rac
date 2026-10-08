@@ -30,6 +30,12 @@ const EVENT_CAPACITY: usize = 256;
 /// Unanswered session requests kept at once; further requests are denied.
 const MAX_PENDING: usize = 16;
 
+/// Number of media key indices the frame-encryption key ring holds.
+const KEY_RING_SIZE: u8 = 16;
+
+/// How long remaining viewers get to install a rotated media key before the host switches to it.
+const KEY_SWITCH_DELAY: Duration = Duration::from_millis(500);
+
 /// How long an accepted viewer may take to join before its slot is freed.
 const JOIN_WINDOW: Duration = Duration::from_secs(70);
 
@@ -127,6 +133,10 @@ struct Inner {
     known: Arc<Mutex<KnownKeys>>,
     /// Source of the published video track.
     source: NativeVideoSource,
+    /// Frame-encryption keys.
+    key_provider: livekit::e2ee::key_provider::KeyProvider,
+    /// Serializes media key rotations.
+    rotate_lock: tokio::sync::Mutex<()>,
     /// Requests and viewers.
     state: Mutex<State>,
     /// Serializes sealing and sending so each topic's counters leave in order.
@@ -244,6 +254,8 @@ impl HostSession {
             keys,
             known,
             source,
+            key_provider,
+            rotate_lock: tokio::sync::Mutex::new(()),
             state: Mutex::new(State {
                 pending: HashMap::new(),
                 viewers: HashMap::new(),
@@ -397,10 +409,15 @@ impl Inner {
     }
 
     /// Forgets `viewer` and reports that it left, if it was a viewer.
-    async fn remove_viewer(&self, viewer: DeviceId) {
+    ///
+    /// A viewer that had joined could still hold the media key, so the key is rotated.
+    async fn remove_viewer(self: &Arc<Self>, viewer: DeviceId) {
         let removed = lock(&self.state).viewers.remove(&viewer);
         if let Some(v) = removed {
             tracing::info!(viewer = %viewer, session_id = %v.session_id, "viewer left");
+            if v.joined {
+                spawn_rotation(self);
+            }
             let _ = self.events.send(HostEvent::ViewerLeft { viewer }).await;
         }
     }
@@ -484,7 +501,7 @@ impl Inner {
     }
 
     /// Opens a sealed payload from a participant and acts on it.
-    async fn on_data(&self, incoming: Incoming) {
+    async fn on_data(self: &Arc<Self>, incoming: Incoming) {
         let Ok(viewer) = incoming.from.parse::<DeviceId>() else {
             return;
         };
@@ -588,6 +605,47 @@ async fn run(
     tracing::info!(device_id = %inner.device, ?reason, "hosting ended");
     let _ = inner.room.close().await;
     let _ = inner.events.send(HostEvent::Ended { reason }).await;
+}
+
+/// Replaces the media key in the background.
+///
+/// The new key goes to every remaining joined viewer at the next key index;
+/// after [`KEY_SWITCH_DELAY`] the host encrypts with it. Viewers that left
+/// keep only older keys and cannot decrypt frames from then on.
+fn spawn_rotation(inner: &Arc<Inner>) {
+    let inner = Arc::clone(inner);
+    tokio::spawn(async move {
+        let _serial = inner.rotate_lock.lock().await;
+        let (index, key, remaining) = {
+            let mut st = lock(&inner.state);
+            st.media_index = (st.media_index + 1) % KEY_RING_SIZE;
+            st.media_key = SessionKey::random();
+            let remaining: Vec<DeviceId> = st
+                .viewers
+                .iter()
+                .filter(|(_, v)| v.joined)
+                .map(|(id, _)| *id)
+                .collect();
+            (st.media_index, *st.media_key.as_bytes(), remaining)
+        };
+        let msg = DataMessage::Control(Control::MediaKey { index, key });
+        for viewer in remaining {
+            if let Err(err) = inner.send(viewer, &msg).await {
+                tracing::warn!(viewer = %viewer, error = %err, "sending rotated media key failed");
+            }
+        }
+        tokio::time::sleep(KEY_SWITCH_DELAY).await;
+        let own = room::identity(inner.device);
+        inner
+            .key_provider
+            .set_key(&own, i32::from(index), key.to_vec());
+        for ((identity, _), cryptor) in inner.room.e2ee_manager().frame_cryptors() {
+            if identity == own {
+                cryptor.set_key_index(i32::from(index));
+            }
+        }
+        tracing::info!(device_id = %inner.device, index, "media key rotated");
+    });
 }
 
 /// Locks `m`, recovering from a poisoned lock.

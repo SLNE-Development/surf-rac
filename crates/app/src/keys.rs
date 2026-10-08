@@ -22,6 +22,13 @@ pub struct KeyTracker {
 }
 
 impl KeyTracker {
+    /// Creates a tracker with no keys held.
+    pub const fn new() -> Self {
+        Self {
+            down: BTreeSet::new(),
+        }
+    }
+
     /// Records that `code` went down; repeats are harmless.
     pub fn press(&mut self, code: u32) {
         self.down.insert(code);

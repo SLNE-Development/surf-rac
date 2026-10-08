@@ -296,6 +296,17 @@ impl Default for Snapshot {
     }
 }
 
+/// A cloneable sender of commands to the runtime.
+#[derive(Clone)]
+pub struct Commands(mpsc::UnboundedSender<Command>);
+
+impl Commands {
+    /// Sends a command; ignored once the runtime has stopped.
+    pub fn send(&self, command: Command) {
+        let _ = self.0.send(command);
+    }
+}
+
 /// A callback that asks the UI to redraw.
 pub type Repaint = Arc<dyn Fn() + Send + Sync>;
 
@@ -335,6 +346,11 @@ impl Runtime {
     /// Sends a command to the actor.
     pub fn command(&self, command: Command) {
         let _ = self.commands.send(command);
+    }
+
+    /// Returns a sender of commands that can be used from any thread.
+    pub fn commands(&self) -> Commands {
+        Commands(self.commands.clone())
     }
 
     /// Returns the latest snapshot.

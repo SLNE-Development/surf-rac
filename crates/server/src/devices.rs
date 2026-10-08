@@ -78,7 +78,8 @@ pub fn device_id(id: i64) -> DeviceId {
 /// With `device_id`, that device must belong to the account and gets the new
 /// fingerprint, name and secret. Without it, a device of the account with the
 /// same fingerprint is re-bound, and otherwise a new device with a random ID
-/// is created. Every path issues a fresh secret, invalidating the old one.
+/// is created. Every path issues a fresh secret, invalidating the old one, and
+/// a re-bind clears the device's public key until the device sets a new one.
 pub async fn register(
     db: &PgPool,
     user_id: i64,
@@ -100,8 +101,8 @@ pub async fn register(
             Some(_) => {}
         }
         sqlx::query(
-            "update devices set fingerprint_hash = $3, name = $4, secret_hash = $5 \
-             where id = $1 and user_id = $2",
+            "update devices set fingerprint_hash = $3, name = $4, secret_hash = $5, \
+             public_key = null where id = $1 and user_id = $2",
         )
         .bind(i64::from(id.get()))
         .bind(user_id)
@@ -123,7 +124,7 @@ pub async fn register(
 
     for _ in 0..ID_ATTEMPTS {
         let rebound: Option<i64> = sqlx::query_scalar(
-            "update devices set name = $3, secret_hash = $4 \
+            "update devices set name = $3, secret_hash = $4, public_key = null \
              where user_id = $1 and fingerprint_hash = $2 returning id",
         )
         .bind(user_id)

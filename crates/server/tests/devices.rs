@@ -432,3 +432,18 @@ async fn presence_without_key_omits_field(pool: PgPool) {
     let body = presence_of(&app, &alice, &id).await;
     assert!(body.get("public_key").is_none(), "{body}");
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn rebind_clears_public_key(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let alice = app.register_and_login("alice").await;
+    let (id, _) = app.new_device(&alice, &fingerprint(1)).await;
+    assert_eq!(put_key(&app, &alice, &id, &b64_key(5)).await.status(), 204);
+    register_ok(&app, &alice, &fingerprint(2), Some(&id)).await;
+    assert!(presence_of(&app, &alice, &id).await.get("public_key").is_none());
+
+    let (id2, _) = app.new_device(&alice, &fingerprint(3)).await;
+    assert_eq!(put_key(&app, &alice, &id2, &b64_key(6)).await.status(), 204);
+    register_ok(&app, &alice, &fingerprint(3), None).await;
+    assert!(presence_of(&app, &alice, &id2).await.get("public_key").is_none());
+}

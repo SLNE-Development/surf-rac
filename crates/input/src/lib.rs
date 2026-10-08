@@ -4,5 +4,7 @@
 
 pub mod arbiter;
 pub mod inject;
+#[cfg(windows)]
+pub mod ui;
 
 pub use arbiter::{Action, Arbiter, Grants, InputStatus, ViewerStatus};

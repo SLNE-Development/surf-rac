@@ -3281,6 +3281,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "surf-rac-input"
+version = "0.1.0"
+dependencies = [
+ "surf-rac-capture",
+ "surf-rac-protocol",
+ "surf-rac-session",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "windows",
+]
+
+[[package]]
 name = "surf-rac-protocol"
 version = "0.1.0"
 dependencies = [

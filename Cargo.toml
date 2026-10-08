@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/capture", "crates/protocol", "crates/server", "crates/session"]
+members = ["crates/capture", "crates/input", "crates/protocol", "crates/server", "crates/session"]
 
 [workspace.package]
 edition = "2024"
@@ -9,6 +9,8 @@ license = "UNLICENSED"
 publish = false
 
 [workspace.dependencies]
+surf-rac-capture = { path = "crates/capture" }
+surf-rac-input = { path = "crates/input" }
 surf-rac-protocol = { path = "crates/protocol" }
 surf-rac-server = { path = "crates/server" }
 surf-rac-session = { path = "crates/session" }
@@ -37,7 +39,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal
 tokio-tungstenite = "0.26"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant"] }
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_LibraryLoader", "Win32_System_Variant", "Win32_UI_Accessibility", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 # Optimise dependencies in debug builds so argon2 hashing stays fast in tests.

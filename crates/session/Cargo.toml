@@ -10,22 +10,24 @@ publish.workspace = true
 surf-rac-protocol.workspace = true
 base64.workspace = true
 chacha20poly1305.workspace = true
+futures-util.workspace = true
 hex.workspace = true
 hkdf.workspace = true
 livekit.workspace = true
 rand.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 tracing.workspace = true
 x25519-dalek.workspace = true
 
 [dev-dependencies]
-base64.workspace = true
+surf-rac-server.workspace = true
+chrono.workspace = true
 hmac.workspace = true
-rand.workspace = true
-serde_json.workspace = true
-sha2.workspace = true
+reqwest.workspace = true
+sqlx.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
-futures-util.workspace = true

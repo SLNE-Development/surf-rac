@@ -406,6 +406,11 @@ impl Inner {
     }
 
     /// Handles a session request from `viewer`.
+    ///
+    /// Requests from a viewer already in the room, or with a session ID or
+    /// viewer that is already pending, are denied. A viewer that was accepted
+    /// but never joined may request again; accepting that request replaces
+    /// its old slot.
     async fn on_request(&self, viewer: DeviceId, session_id: String, key: String) {
         let Ok(key) = PublicKey::from_base64(&key) else {
             let _ = self.respond(viewer, &session_id, Some(DenyReason::Denied)).await;
@@ -414,7 +419,7 @@ impl Inner {
         let refusal = {
             let mut st = lock(&self.state);
             let duplicate = st.pending.contains_key(&session_id)
-                || st.viewers.contains_key(&viewer)
+                || st.viewers.get(&viewer).is_some_and(|v| v.joined)
                 || st.pending.values().any(|p| p.viewer == viewer);
             if duplicate || st.pending.len() >= MAX_PENDING {
                 Some(Err(DenyReason::Denied))

@@ -101,9 +101,15 @@ pub(crate) async fn connect(
 ///
 /// LiveKit reports refused tokens as HTTP 401 or 403 from its signaling
 /// endpoint; every other failure counts as LiveKit being unavailable.
+/// Returns whether `text` names HTTP status 401 or 403 as a whole number.
+fn is_rejection(text: &str) -> bool {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|number| number == "401" || number == "403")
+}
+
 fn classify(err: RoomError) -> JoinError {
     let text = err.to_string();
-    if text.contains("401") || text.contains("403") {
+    if is_rejection(&text) {
         JoinError::Rejected
     } else {
         JoinError::Unavailable(text)
@@ -207,6 +213,18 @@ pub(crate) fn read_clipboard_stream(
 mod tests {
     use super::*;
     use crate::testutil::{env, mint_token, room_name, unix_now};
+
+    #[test]
+    fn rejection_needs_a_whole_status_code() {
+        assert!(is_rejection(
+            "engine: signal failure: client error: 401 Unauthorized - invalid token"
+        ));
+        assert!(is_rejection("handshake error: 403 Forbidden"));
+        assert!(!is_rejection(
+            "connection error: failed to connect to wss://lk403.example:14013"
+        ));
+        assert!(!is_rejection("timeout after 4010 ms"));
+    }
 
     #[test]
     fn stream_gate_limits_concurrent_streams() {

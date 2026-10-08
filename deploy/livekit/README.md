@@ -10,9 +10,9 @@ encrypted by the clients, so the server only forwards ciphertext.
 |---|---|
 | LiveKit signaling (WebSocket) | `wss://rac-livekit.slne.dev` through a Cloudflare Tunnel to `http://localhost:7880` |
 | Signaling server | `wss://rac.slne.dev` through a Cloudflare Tunnel to `http://localhost:18080` |
-| Media over UDP | `31.70.103.18`, UDP 50000-60000 |
+| Media over UDP | `31.70.103.18`, UDP 50000-58999 |
 | Media over TCP fallback | `31.70.103.18`, TCP 7881 |
-| Embedded TURN | `31.70.103.18`, UDP 3478 |
+| Embedded TURN | `31.70.103.18`, UDP 3478, relayed traffic on UDP 59000-60000 |
 
 Open UDP 50000-60000, TCP 7881 and UDP 3478 in the VPS firewall. Media cannot go
 through the Cloudflare Tunnel; only the two WebSocket hostnames do.

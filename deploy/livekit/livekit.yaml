@@ -6,11 +6,13 @@ log_level: info
 rtc:
   tcp_port: 7881
   port_range_start: 50000
-  port_range_end: 60000
+  port_range_end: 58999
   use_external_ip: true
 turn:
   enabled: true
   udp_port: 3478
+  relay_range_start: 59000
+  relay_range_end: 60000
 room:
   max_participants: 6
   empty_timeout: 300

@@ -13,6 +13,8 @@ pub mod pinning;
 mod reconnect;
 mod room;
 pub mod signaling;
+#[cfg(test)]
+mod testutil;
 pub mod video;
 pub mod viewer;
 

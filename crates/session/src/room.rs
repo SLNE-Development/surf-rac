@@ -149,3 +149,29 @@ pub(crate) fn read_clipboard_stream(
         });
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{env, mint_token, room_name, unix_now};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn expired_token_is_rejected() {
+        let now = unix_now();
+        let token = mint_token(&room_name(), "123456789", now - 600, now - 300);
+        let err = connect(&env("LIVEKIT_URL"), &token, &key_provider(), false)
+            .await
+            .err();
+        assert_eq!(err, Some(JoinError::Rejected));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unreachable_server_is_unavailable() {
+        let now = unix_now();
+        let token = mint_token(&room_name(), "123456789", now, now + 60);
+        let err = connect("ws://127.0.0.1:1", &token, &key_provider(), false)
+            .await
+            .err();
+        assert!(matches!(err, Some(JoinError::Unavailable(_))), "{err:?}");
+    }
+}

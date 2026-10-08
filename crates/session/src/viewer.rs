@@ -355,3 +355,98 @@ fn new_session_id() -> String {
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::crypto::SessionKey;
+    use crate::testutil::{env, mint_token, room_name, unix_now};
+
+    /// Joins a fresh room and starts the viewer loop on simulated room events.
+    async fn loop_on_simulated_events(
+        window: Duration,
+    ) -> (
+        Arc<Inner>,
+        mpsc::UnboundedSender<RoomEvent>,
+        mpsc::Receiver<ViewerEvent>,
+    ) {
+        let now = unix_now();
+        let token = mint_token(&room_name(), "223456789", now, now + 60);
+        let key_provider = room::key_provider();
+        let (lk_room, _real_events) = room::connect(&env("LIVEKIT_URL"), &token, &key_provider, false)
+            .await
+            .unwrap();
+        let inner = Arc::new(Inner {
+            host: DeviceId::new(123_456_789).unwrap(),
+            session_id: "s1".into(),
+            room: lk_room,
+            channel: Mutex::new(PeerChannel::new("s1".into(), SessionKey::from_bytes([1; 32]), Side::Viewer)),
+            send_lock: tokio::sync::Mutex::new(()),
+            key_provider,
+            media_index: Mutex::new(None),
+            task: Mutex::new(None),
+        });
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (public_tx, public_rx) = mpsc::channel(EVENT_CAPACITY);
+        tokio::spawn(run(Arc::clone(&inner), rx, public_tx, ReconnectWatch::new(window)));
+        (inner, tx, public_rx)
+    }
+
+    /// Returns the events delivered within `wait`.
+    async fn drain(events: &mut mpsc::Receiver<ViewerEvent>, wait: Duration) -> Vec<ViewerEvent> {
+        let deadline = tokio::time::Instant::now() + wait;
+        let mut out = Vec::new();
+        while let Ok(Some(ev)) = tokio::time::timeout_at(deadline, events.recv()).await {
+            out.push(ev);
+        }
+        out
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconnect_window_ends_session() {
+        let (_inner, tx, mut events) = loop_on_simulated_events(Duration::from_secs(2)).await;
+        tx.send(RoomEvent::Reconnecting).unwrap();
+        let got = drain(&mut events, Duration::from_secs(4)).await;
+        assert!(matches!(got.first(), Some(ViewerEvent::Reconnecting)), "{got:?}");
+        assert!(matches!(got.last(), Some(ViewerEvent::Ended { reason: EndReason::Timeout })), "{got:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconnect_within_window_keeps_session() {
+        let (_inner, tx, mut events) = loop_on_simulated_events(Duration::from_secs(2)).await;
+        tx.send(RoomEvent::Reconnecting).unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        tx.send(RoomEvent::Reconnected).unwrap();
+        let got = drain(&mut events, Duration::from_secs(4)).await;
+        assert!(matches!(got.as_slice(), [ViewerEvent::Reconnecting, ViewerEvent::Connected]), "{got:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ten_crypto_failures_end_session() {
+        let (inner, _tx, _events) = loop_on_simulated_events(Duration::from_secs(30)).await;
+        let garbage = || Incoming {
+            from: "123456789".into(),
+            topic: surf_rac_protocol::data::TOPIC_INPUT.into(),
+            payload: vec![7; 40],
+        };
+        for _ in 0..crate::CRYPTO_FAILURE_LIMIT - 1 {
+            assert!(matches!(inner.on_data(garbage()), (None, None)));
+        }
+        assert!(matches!(inner.on_data(garbage()), (None, Some(EndReason::CryptoError))));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn data_from_other_participants_is_ignored() {
+        let (inner, _tx, _events) = loop_on_simulated_events(Duration::from_secs(30)).await;
+        for _ in 0..crate::CRYPTO_FAILURE_LIMIT + 5 {
+            let forged = Incoming {
+                from: "323456789".into(),
+                topic: surf_rac_protocol::data::TOPIC_INPUT.into(),
+                payload: vec![7; 40],
+            };
+            assert!(matches!(inner.on_data(forged), (None, None)));
+        }
+    }
+}

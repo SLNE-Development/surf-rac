@@ -338,6 +338,9 @@ impl ClientApp {
                 message,
             })
         };
+        let ctx = ui.ctx().clone();
+        let blocked = |pos: egui::Pos2| pointer_blocked(ctx.layer_id_at(pos).map(|l| l.order));
+        let to_host = |pos: egui::Pos2| if blocked(pos) { None } else { to_host(pos) };
         let hovered = ui
             .input(|i| i.pointer.hover_pos())
             .and_then(to_host)
@@ -396,6 +399,12 @@ impl ClientApp {
             }
         }
     }
+}
+
+/// Returns whether a pointer event over a layer of `order` belongs to egui
+/// itself, such as an open menu, rather than to the picture.
+fn pointer_blocked(order: Option<egui::Order>) -> bool {
+    order.is_some_and(|o| o != egui::Order::Background)
 }
 
 /// Maps an egui pointer button to the protocol's mouse button.
@@ -471,6 +480,14 @@ mod tests {
         assert!(!accept_armed(shown, shown));
         assert!(!accept_armed(shown, shown + ACCEPT_DELAY / 2));
         assert!(accept_armed(shown, shown + ACCEPT_DELAY));
+    }
+
+    #[test]
+    fn clicks_on_popups_are_not_forwarded() {
+        assert!(!pointer_blocked(None));
+        assert!(!pointer_blocked(Some(egui::Order::Background)));
+        assert!(pointer_blocked(Some(egui::Order::Foreground)));
+        assert!(pointer_blocked(Some(egui::Order::Tooltip)));
     }
 
     #[test]

@@ -152,10 +152,10 @@ impl PeerChannel {
     ///
     /// Clipboard items larger than [`MAX_CLIPBOARD_BYTES`] are refused.
     pub fn seal(&mut self, msg: &DataMessage) -> Result<Vec<u8>, SendError> {
-        if let DataMessage::Clipboard { bytes, .. } = msg {
-            if bytes.len() > MAX_CLIPBOARD_BYTES {
-                return Err(SendError::ClipboardTooLarge { size: bytes.len() });
-            }
+        if let DataMessage::Clipboard { bytes, .. } = msg
+            && bytes.len() > MAX_CLIPBOARD_BYTES
+        {
+            return Err(SendError::ClipboardTooLarge { size: bytes.len() });
         }
         let topic = msg.topic();
         let slot = topic_index(topic).expect("every message topic is known");

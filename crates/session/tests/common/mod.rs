@@ -177,10 +177,10 @@ pub async fn collect_stamps(events: &mut Receiver<ViewerEvent>, wait: Duration) 
     let deadline = tokio::time::Instant::now() + wait;
     let mut out = Vec::new();
     while let Ok(Some(ev)) = tokio::time::timeout_at(deadline, events.recv()).await {
-        if let ViewerEvent::VideoFrame(frame) = ev {
-            if let Some(stamp) = stamp::read_stamp(&frame) {
-                out.push((stamp, stamp::now_micros()));
-            }
+        if let ViewerEvent::VideoFrame(frame) = ev
+            && let Some(stamp) = stamp::read_stamp(&frame)
+        {
+            out.push((stamp, stamp::now_micros()));
         }
     }
     out

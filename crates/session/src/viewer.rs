@@ -460,10 +460,10 @@ async fn run(
                     Incoming { from: p.identity().0, topic, payload: payload.to_vec() }
                 }
                 Some(RoomEvent::ByteStreamOpened { reader, topic, participant_identity }) => {
-                    if participant_identity.0 == host_identity {
-                        if let Some(reader) = reader.take() {
-                            room::read_clipboard_stream(reader, topic, participant_identity.0, &gate, incoming_tx.clone());
-                        }
+                    if participant_identity.0 == host_identity
+                        && let Some(reader) = reader.take()
+                    {
+                        room::read_clipboard_stream(reader, topic, participant_identity.0, &gate, incoming_tx.clone());
                     }
                     continue;
                 }

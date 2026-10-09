@@ -75,7 +75,7 @@ impl ClientApp {
             let id = egui::ViewportId::from_hash_of(("prompt", &prompt.session_id));
             let builder = egui::ViewportBuilder::default()
                 .with_title("Connection request - surf-rac")
-                .with_inner_size([420.0, 270.0])
+                .with_inner_size([420.0, 250.0])
                 .with_always_on_top()
                 .with_resizable(false);
             ctx.show_viewport_immediate(id, builder, |ui, _| {
@@ -128,7 +128,8 @@ impl ClientApp {
                         if let Some((tone, icon, text)) = note_callout(prompt.note) {
                             widgets::callout(ui, tone, icon, text);
                         }
-                        ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                        ui.add_space(4.0);
+                        ui.scope(|ui| {
                             ui.columns(2, |cols| {
                                 let deny = widgets::btn_lg(&cols[0], Kind::Secondary, None, "Deny");
                                 if widgets::full_width(&mut cols[0], true, deny).clicked() {

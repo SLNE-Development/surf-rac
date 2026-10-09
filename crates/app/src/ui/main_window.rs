@@ -1,36 +1,23 @@
-//! The main window: the app bar, banners and the open tab, or the account
-//! sign-in screen while it is open.
+//! The main window: the app bar, banners and the open tab, plus the
+//! sign-in, delete-account and server dialogs while they are open.
 
 use eframe::egui::{self, Align, Frame, Layout, Margin, RichText};
 use surf_rac_protocol::DeviceId;
 
 use super::widgets::{self, Kind, Tone};
 use super::{ClientApp, Tab, connect, devices, icons, login, settings, theme};
-use crate::runtime::{AccountTask, Command, Connection};
+use crate::runtime::{Command, Connection};
 
-/// Draws the main window.
+/// Draws the main window and its open dialogs.
 pub(super) fn show(app: &mut ClientApp, ui: &mut egui::Ui) {
-    let p = theme::palette(ui.ctx());
-    if app.snap.account.is_some() {
-        app.forms.sign_in = false;
-    }
-    if app.forms.sign_in {
-        let (message, busy) = match app.snap.account_task.clone() {
-            AccountTask::Idle => (None, false),
-            AccountTask::Working(text) => (Some(text), true),
-            AccountTask::Failed(text) => (Some(text), false),
-        };
-        egui::CentralPanel::no_frame()
-            .frame(Frame::new().fill(p.bg))
-            .show(ui, |ui| login::show(app, ui, message.as_deref(), busy));
-    } else {
-        main_layout(app, ui);
-    }
+    main_layout(app, ui);
+    login::dialog(app, ui.ctx());
+    delete_account_dialog(app, ui.ctx());
     server_dialog(app, ui.ctx());
 }
 
 /// Returns the status chip text and tone for a connection state.
-pub(super) fn status(connection: &Connection) -> (&'static str, Tone) {
+pub(super) fn connection_status(connection: &Connection) -> (&'static str, Tone) {
     match connection {
         Connection::Online => ("Online", Tone::Ok),
         Connection::Connecting => ("Connecting...", Tone::Neutral),
@@ -38,6 +25,28 @@ pub(super) fn status(connection: &Connection) -> (&'static str, Tone) {
         Connection::UpdateRequired => ("Update required", Tone::Danger),
         Connection::Disabled => ("Device disabled", Tone::Danger),
         Connection::Replaced => ("Signed in elsewhere", Tone::Danger),
+    }
+}
+
+/// Returns the banner text and tone for a connection state the client
+/// stopped in, or `None` while it is connected or still trying.
+pub(super) fn connection_banner(connection: &Connection) -> Option<(&'static str, Tone)> {
+    match connection {
+        Connection::UpdateRequired => Some((
+            "Update required: this version of surf-rac is too old for the server. \
+             Install the latest version to connect.",
+            Tone::Danger,
+        )),
+        Connection::Disabled => Some((
+            "This device is disabled. The server's administrator turned it off; \
+             it cannot connect or be reached.",
+            Tone::Danger,
+        )),
+        Connection::Replaced => Some((
+            "This device signed in from another window. This one is disconnected.",
+            Tone::Danger,
+        )),
+        Connection::Online | Connection::Connecting | Connection::Offline => None,
     }
 }
 
@@ -66,7 +75,7 @@ fn main_layout(app: &mut ClientApp, ui: &mut egui::Ui) {
                 .inner_margin(Margin::symmetric(20, 10)),
         )
         .show(ui, |ui| app_bar(app, ui));
-    if app.snap.connection == Connection::Replaced || app.snap.banner.is_some() {
+    if connection_banner(&app.snap.connection).is_some() || app.snap.banner.is_some() {
         egui::Panel::top("banners")
             .frame(Frame::NONE)
             .show_separator_line(false)
@@ -118,15 +127,15 @@ fn app_bar(app: &mut ClientApp, ui: &mut egui::Ui) {
                 .add(widgets::btn(ui, Kind::Secondary, None, "Sign in"))
                 .clicked()
             {
-                app.forms.sign_in = true;
+                app.open_sign_in();
             }
-            let (text, tone) = status(&app.snap.connection);
+            let (text, tone) = connection_status(&app.snap.connection);
             widgets::chip(ui, tone, true, text);
         });
     });
 }
 
-/// Draws the account button with its dropdown holding Sign out.
+/// Draws the account button with its dropdown holding Sign out and Delete account.
 fn account_menu(app: &mut ClientApp, ui: &mut egui::Ui, account: &str) {
     let p = theme::palette(ui.ctx());
     let button = egui::Button::new((
@@ -153,27 +162,30 @@ fn account_menu(app: &mut ClientApp, ui: &mut egui::Ui, account: &str) {
         {
             app.send(Command::SignOut);
         }
+        if ui
+            .add(widgets::btn(ui, Kind::DangerText, None, "Delete account"))
+            .clicked()
+        {
+            app.open_delete_account();
+        }
     });
     widgets::avatar(ui, account, 28.0);
 }
 
-/// Draws the "signed in elsewhere" strip and the runtime's banner message.
+/// Draws the strip for a stopped connection (update required, device
+/// disabled, signed in elsewhere) and the runtime's banner message.
 fn banners(app: &mut ClientApp, ui: &mut egui::Ui) {
-    if app.snap.connection == Connection::Replaced {
-        widgets::banner(
-            ui,
-            Tone::Danger,
-            icons::TRIANGLE_ALERT,
-            "This device signed in from another window. This one is disconnected.",
-            |ui| {
-                if ui
+    let connection = app.snap.connection.clone();
+    if let Some((text, tone)) = connection_banner(&connection) {
+        widgets::banner(ui, tone, icons::TRIANGLE_ALERT, text, |ui| {
+            if connection == Connection::Replaced
+                && ui
                     .add(widgets::btn(ui, Kind::Secondary, None, "Reconnect"))
                     .clicked()
-                {
-                    app.send(Command::Reconnect);
-                }
-            },
-        );
+            {
+                app.send(Command::Reconnect);
+            }
+        });
     }
     if let Some(banner) = app.snap.banner.clone() {
         widgets::banner(ui, Tone::Warn, icons::TRIANGLE_ALERT, &banner, |ui| {
@@ -194,6 +206,68 @@ pub(super) fn format_id(id: DeviceId) -> String {
 pub(super) fn parse_id(text: &str) -> Option<DeviceId> {
     let digits: String = text.chars().filter(|c| !c.is_whitespace()).collect();
     digits.parse().ok()
+}
+
+/// Shows the delete-account dialog while it is open: a warning, the
+/// password field, the progress or error of the deletion and the buttons to
+/// delete or cancel. It closes once the account is gone.
+fn delete_account_dialog(app: &mut ClientApp, ctx: &egui::Context) {
+    let Some(account) = app.snap.account.clone() else {
+        app.forms.delete_account = None;
+        return;
+    };
+    let Some(mut password) = app.forms.delete_account.take() else {
+        return;
+    };
+    let (message, busy) = if app.forms.account_sent {
+        login::account_message(&app.snap.account_task)
+    } else {
+        (None, false)
+    };
+    let message = message.map(str::to_string);
+    let mut close = false;
+    let response = widgets::dialog(ctx, "delete_account_dialog", "Delete account", |ui| {
+        ui.spacing_mut().item_spacing.y = 12.0;
+        widgets::callout(
+            ui,
+            Tone::Danger,
+            icons::TRIANGLE_ALERT,
+            &format!(
+                "This deletes the account {account} and its contacts and unlinks every device. \
+                 It cannot be undone. Your devices keep their IDs."
+            ),
+        );
+        let field = widgets::labeled(ui, "Confirm with your password", |ui| {
+            widgets::text_field(ui, &mut password, "", true)
+        });
+        let submit = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if let Some(message) = &message {
+            if busy {
+                widgets::callout(ui, Tone::Neutral, icons::REFRESH, message);
+            } else {
+                widgets::callout(ui, Tone::Danger, icons::CIRCLE_ALERT, message);
+            }
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let ready = !busy && !password.is_empty();
+            let button = widgets::btn(ui, Kind::Danger, None, "Delete account");
+            if ui.add_enabled(ready, button).clicked() || (submit && ready) {
+                app.forms.account_sent = true;
+                app.commands.send(Command::DeleteAccount {
+                    password: std::mem::take(&mut password),
+                });
+            }
+            if ui
+                .add(widgets::btn(ui, Kind::Secondary, None, "Cancel"))
+                .clicked()
+            {
+                close = true;
+            }
+        });
+    });
+    if !(close || response.should_close()) {
+        app.forms.delete_account = Some(password);
+    }
 }
 
 /// Shows the server dialog while it is open: the URL field, a warning and
@@ -246,28 +320,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn status_covers_every_connection_state() {
-        assert_eq!(status(&Connection::Online), ("Online", Tone::Ok));
+    fn connection_status_covers_every_connection_state() {
+        assert_eq!(connection_status(&Connection::Online), ("Online", Tone::Ok));
         assert_eq!(
-            status(&Connection::Connecting),
+            connection_status(&Connection::Connecting),
             ("Connecting...", Tone::Neutral)
         );
         assert_eq!(
-            status(&Connection::Offline),
+            connection_status(&Connection::Offline),
             ("Offline - reconnecting", Tone::Warn)
         );
         assert_eq!(
-            status(&Connection::UpdateRequired),
+            connection_status(&Connection::UpdateRequired),
             ("Update required", Tone::Danger)
         );
         assert_eq!(
-            status(&Connection::Disabled),
+            connection_status(&Connection::Disabled),
             ("Device disabled", Tone::Danger)
         );
         assert_eq!(
-            status(&Connection::Replaced),
+            connection_status(&Connection::Replaced),
             ("Signed in elsewhere", Tone::Danger)
         );
+    }
+
+    #[test]
+    fn only_stopped_connections_get_a_banner() {
+        for quiet in [
+            Connection::Online,
+            Connection::Connecting,
+            Connection::Offline,
+        ] {
+            assert_eq!(connection_banner(&quiet), None);
+        }
+        let (text, tone) = connection_banner(&Connection::UpdateRequired).unwrap();
+        assert!(text.starts_with("Update required"));
+        assert_eq!(tone, Tone::Danger);
+        let (text, tone) = connection_banner(&Connection::Disabled).unwrap();
+        assert!(text.starts_with("This device is disabled"));
+        assert_eq!(tone, Tone::Danger);
+        let (text, tone) = connection_banner(&Connection::Replaced).unwrap();
+        assert!(text.contains("another window"));
+        assert_eq!(tone, Tone::Danger);
     }
 
     #[test]

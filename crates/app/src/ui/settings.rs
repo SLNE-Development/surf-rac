@@ -1,5 +1,5 @@
-//! The Settings tab: incoming connections, the unattended password, saved
-//! passwords, the Defender exclusion and the server.
+//! The Settings tab: the account, incoming connections, the unattended
+//! password, saved passwords, the Defender exclusion and the server.
 
 use eframe::egui::{self, Align, Frame, Layout, Margin, RichText, Ui};
 
@@ -29,6 +29,7 @@ pub(super) fn show(app: &mut ClientApp, ui: &mut Ui) {
         ui.vertical(|ui| {
             ui.set_width(width);
             ui.spacing_mut().item_spacing.y = 16.0;
+            account_card(app, ui);
             incoming_card(app, ui);
             password_card(app, ui);
             saved_passwords_card(app, ui);
@@ -87,6 +88,78 @@ fn rich_setting_row(
                 });
             });
         });
+}
+
+/// Draws the Account card: Sign in while signed out; otherwise the
+/// username with Sign out, and Delete account, which asks for the password.
+fn account_card(app: &mut ClientApp, ui: &mut Ui) {
+    let account = app.snap.account.clone();
+    section(
+        ui,
+        "Account",
+        |ui| {
+            if account.is_none() {
+                widgets::chip(ui, Tone::Neutral, false, "Not signed in");
+            }
+        },
+        |ui| match &account {
+            None => setting_row(
+                ui,
+                true,
+                "No account",
+                "Optional. Sign in to sync contacts and see your devices.",
+                |ui| {
+                    if ui
+                        .add(widgets::btn(ui, Kind::Secondary, None, "Sign in"))
+                        .clicked()
+                    {
+                        app.open_sign_in();
+                    }
+                },
+            ),
+            Some(username) => {
+                setting_row(
+                    ui,
+                    true,
+                    username,
+                    "Signed in. Your contacts and devices sync with this account.",
+                    |ui| {
+                        if ui
+                            .add(widgets::btn(
+                                ui,
+                                Kind::Secondary,
+                                Some(icons::LOG_OUT),
+                                "Sign out",
+                            ))
+                            .clicked()
+                        {
+                            app.send(Command::SignOut);
+                        }
+                    },
+                );
+                setting_row(
+                    ui,
+                    false,
+                    "Delete account",
+                    "Deletes the account and its contacts and unlinks every device. \
+                     Asks for your password.",
+                    |ui| {
+                        if ui
+                            .add(widgets::btn(
+                                ui,
+                                Kind::DangerText,
+                                None,
+                                "Delete account\u{2026}",
+                            ))
+                            .clicked()
+                        {
+                            app.open_delete_account();
+                        }
+                    },
+                );
+            }
+        },
+    );
 }
 
 /// Draws the Incoming connections card, editing a draft that is saved or discarded.

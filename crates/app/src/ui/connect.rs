@@ -171,8 +171,13 @@ fn id_card(app: &mut ClientApp, ui: &mut egui::Ui) {
     });
 }
 
-/// Draws the contacts card: header with count, search and Add contact, then the rows.
+/// Draws the contacts card: a sign-in hint while signed out, otherwise the
+/// header with count, search and Add contact, then the rows.
 fn contacts_card(app: &mut ClientApp, ui: &mut egui::Ui, online: bool) {
+    if app.snap.account.is_none() {
+        signed_out_contacts(app, ui);
+        return;
+    }
     let contacts = app.snap.contacts.clone();
     widgets::card_frame(ui).show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -221,6 +226,35 @@ fn contacts_card(app: &mut ClientApp, ui: &mut egui::Ui, online: bool) {
         for (i, c) in shown.into_iter().enumerate() {
             widgets::row(ui, i == 0, |ui| contact_row(app, ui, c, online));
         }
+    });
+}
+
+/// Draws the contacts card shown while signed out: the title, why contacts
+/// need an account and a Sign in button.
+fn signed_out_contacts(app: &mut ClientApp, ui: &mut egui::Ui) {
+    widgets::card(ui, 20, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.label(widgets::title("Contacts"));
+                ui.label(
+                    widgets::muted(
+                        ui,
+                        "Sign in to sync contacts. Contacts are kept in your account, not on this computer.",
+                    )
+                    .size(13.0),
+                );
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add(widgets::btn(ui, Kind::Secondary, None, "Sign in"))
+                    .clicked()
+                {
+                    app.open_sign_in();
+                }
+            });
+        });
     });
 }
 

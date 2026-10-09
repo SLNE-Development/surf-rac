@@ -25,28 +25,30 @@ pub(super) fn seen_text(online: bool, last_seen_at: Option<DateTime<Utc>>) -> Op
 
 /// Draws the My devices tab.
 pub(super) fn show(app: &mut ClientApp, ui: &mut egui::Ui) {
+    let signed_in = app.snap.account.is_some();
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
             ui.label(RichText::new("My devices").font(theme::bold(20.0)));
-            ui.label(widgets::muted(ui, "Every computer signed in to your account.").size(13.0));
+            ui.label(widgets::muted(ui, "Every computer linked to your account.").size(13.0));
         });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui
-                .add(widgets::btn(
-                    ui,
-                    Kind::Secondary,
-                    Some(icons::REFRESH),
-                    "Refresh",
-                ))
-                .clicked()
+            if signed_in
+                && ui
+                    .add(widgets::btn(
+                        ui,
+                        Kind::Secondary,
+                        Some(icons::REFRESH),
+                        "Refresh",
+                    ))
+                    .clicked()
             {
                 app.send(Command::RefreshLists);
             }
         });
     });
     ui.add_space(8.0);
-    if app.snap.account.is_none() {
+    if !signed_in {
         widgets::card_frame(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
             egui::Frame::new()
@@ -60,7 +62,7 @@ pub(super) fn show(app: &mut ClientApp, ui: &mut egui::Ui) {
                         .add(widgets::btn(ui, Kind::Secondary, None, "Sign in"))
                         .clicked()
                     {
-                        app.forms.sign_in = true;
+                        app.open_sign_in();
                     }
                 });
         });
@@ -81,7 +83,8 @@ pub(super) fn show(app: &mut ClientApp, ui: &mut egui::Ui) {
     });
 }
 
-/// Draws one device row: icon, name and ID, presence, Connect and the actions menu.
+/// Draws one device row: icon, name and ID, presence, Connect and the
+/// actions menu whose Remove unlinks the device from the account.
 fn device_row(app: &mut ClientApp, ui: &mut egui::Ui, d: &MyDeviceInfo) {
     let this = Some(d.device_id) == app.snap.device_id;
     widgets::icon_tile(ui, icons::MONITOR);
@@ -90,6 +93,7 @@ fn device_row(app: &mut ClientApp, ui: &mut egui::Ui, d: &MyDeviceInfo) {
             widgets::icon_menu(ui, icons::ELLIPSIS, "More actions", |ui| {
                 if ui
                     .add(widgets::btn(ui, Kind::DangerText, None, "Remove"))
+                    .on_hover_text("Unlink this computer from your account. It keeps its ID.")
                     .clicked()
                 {
                     app.send(Command::UnlinkDevice(d.device_id));

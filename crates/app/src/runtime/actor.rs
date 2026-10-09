@@ -34,13 +34,6 @@ use crate::yuv;
 /// How often the clipboard is checked while a session syncs it.
 const CLIPBOARD_POLL: Duration = Duration::from_millis(500);
 
-/// Banner shown when the server needs a newer client.
-const UPDATE_REQUIRED_TEXT: &str =
-    "This version of surf-rac is too old for the server. Please update to connect.";
-
-/// Banner shown when an administrator disabled this device.
-const DISABLED_TEXT: &str = "This device was disabled by the server's administrator.";
-
 /// Banner shown when an account action needs a signed-in account.
 const SIGN_IN_FIRST_TEXT: &str = "Sign in to an account to keep contacts and devices.";
 
@@ -242,15 +235,6 @@ fn api_for(store: &Store) -> Api {
             .account
             .map(|a| a.session_token.expose().to_string()),
     )
-}
-
-/// Returns the banner text for a connection state the client stopped in.
-fn stop_text(connection: &Connection) -> Option<&'static str> {
-    match connection {
-        Connection::UpdateRequired => Some(UPDATE_REQUIRED_TEXT),
-        Connection::Disabled => Some(DISABLED_TEXT),
-        _ => None,
-    }
 }
 
 impl Actor {
@@ -548,10 +532,11 @@ impl Actor {
         }
     }
 
-    /// Stops connecting in `state` and tells the user why.
+    /// Stops connecting in `state` and clears the banner; the connection
+    /// state itself tells the user why.
     fn stop_connecting(&mut self, state: Connection) {
         tracing::warn!(?state, "no further connection attempts");
-        self.banner = stop_text(&state).map(str::to_string);
+        self.banner = None;
         self.connection = state;
     }
 

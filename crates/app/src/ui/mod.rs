@@ -33,14 +33,22 @@ enum Tab {
 /// Text fields and drafts of the main window.
 #[derive(Default)]
 struct Forms {
-    /// Whether the sign-in screen is open.
+    /// Whether the sign-in dialog is open.
     sign_in: bool,
     /// Sign-in or registration username.
     username: String,
     /// Sign-in or registration password.
     password: String,
-    /// Whether the sign-in screen shows registration.
+    /// Whether the sign-in dialog shows account creation.
     register: bool,
+    /// Why the typed username or password was refused before sending, if it was.
+    account_error: Option<&'static str>,
+    /// Whether an account dialog sent its command, so the runtime's account
+    /// progress and errors belong to it.
+    account_sent: bool,
+    /// The password typed to confirm account deletion; `Some` while the
+    /// dialog is open.
+    delete_account: Option<String>,
     /// Whether the sign-in password is shown in clear text.
     show_password: bool,
     /// Whether the server dialog is open.
@@ -143,6 +151,19 @@ impl ClientApp {
     /// Sends a command to the runtime.
     fn send(&self, command: Command) {
         self.commands.send(command);
+    }
+
+    /// Opens the sign-in dialog with no message from an earlier attempt.
+    fn open_sign_in(&mut self) {
+        self.forms.sign_in = true;
+        self.forms.account_error = None;
+        self.forms.account_sent = false;
+    }
+
+    /// Opens the delete-account dialog with an empty password.
+    fn open_delete_account(&mut self) {
+        self.forms.delete_account = Some(String::new());
+        self.forms.account_sent = false;
     }
 
     /// Routes captured keys to the focused viewer window whose host grants the keyboard.

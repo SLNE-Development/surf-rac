@@ -83,12 +83,12 @@ fn connect_card(app: &mut ClientApp, ui: &mut egui::Ui, online: bool) {
         let mut submit = false;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
-            let field_width = ui.available_width() - 130.0;
+            let field_width = ui.available_width() - 120.0;
             let field =
                 widgets::id_field(ui, &mut app.forms.connect_id, "123 456 789", field_width);
             submit |= field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let button =
-                widgets::btn_lg(ui, Kind::Primary, None, "Connect").min_size(vec2(120.0, 46.0));
+                widgets::btn(ui, Kind::Primary, None, "Connect").min_size(vec2(110.0, 40.0));
             submit |= ui.add_enabled(online, button).clicked();
         });
         ui.horizontal(|ui| {

@@ -14,8 +14,12 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// Request header carrying the device ID on the WebSocket upgrade.
 pub const HEADER_DEVICE_ID: &str = "x-device-id";
 
-/// Request header carrying the device secret on the WebSocket upgrade.
-pub const HEADER_DEVICE_SECRET: &str = "x-device-secret";
+/// Request header carrying the client's protocol version on the WebSocket upgrade.
+pub const HEADER_PROTOCOL_VERSION: &str = "x-protocol-version";
+
+/// Wire protocol version this build speaks; peers on any other version are refused
+/// with `update_required`.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Largest WebSocket message, in bytes, the server accepts.
 pub const MAX_WS_MESSAGE_BYTES: usize = 65_536;
@@ -102,8 +106,6 @@ impl<'de> Deserialize<'de> for DeviceId {
 /// Body of `POST /v1/register`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterRequest {
-    /// Single-use invite code issued by an admin.
-    pub invite_code: String,
     /// Desired username: 3 to 32 characters of `[a-z0-9._-]`.
     pub username: String,
     /// Password: 10 to 256 characters.
@@ -138,13 +140,14 @@ pub struct LoginResponse {
 /// Body of `POST /v1/devices`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterDeviceRequest {
+    /// The installation's Ed25519 identity public key, standard base64 of 32 bytes.
+    pub public_key: String,
     /// Lowercase hex SHA-256 of the device's hardware fingerprint (64 characters).
     pub fingerprint_hash: String,
     /// Human-readable device name, 1 to 64 characters.
     pub name: String,
-    /// Existing ID of this account to re-bind to new hardware, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub device_id: Option<DeviceId>,
+    /// Protocol version the client speaks.
+    pub protocol_version: u32,
 }
 
 /// Response of `POST /v1/devices`.
@@ -152,10 +155,26 @@ pub struct RegisterDeviceRequest {
 pub struct RegisterDeviceResponse {
     /// The device's ID.
     pub device_id: DeviceId,
-    /// Device secret, returned only here; required to open the WebSocket.
-    pub device_secret: String,
-    /// True when an existing ID was re-bound instead of a new one created.
-    pub rebound: bool,
+}
+
+/// Body of `DELETE /v1/account`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteAccountRequest {
+    /// The account password, confirming the deletion.
+    pub password: String,
+}
+
+/// One entry of the signed-in account's device list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MyDeviceInfo {
+    /// The device's ID.
+    pub device_id: DeviceId,
+    /// Human-readable device name.
+    pub name: String,
+    /// Whether the device currently holds a WebSocket connection.
+    pub online: bool,
+    /// When the device last connected or disconnected.
+    pub last_seen_at: Option<DateTime<Utc>>,
 }
 
 /// One entry of `GET /v1/devices`.
@@ -201,13 +220,6 @@ pub struct PresenceInfo {
     pub public_key: Option<String>,
 }
 
-/// Body of `PUT /v1/devices/{id}/public-key`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PutPublicKeyRequest {
-    /// The device's X25519 public key, standard base64 of 32 bytes.
-    pub public_key: String,
-}
-
 /// Error body of every failed HTTP request.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ErrorBody {
@@ -233,6 +245,10 @@ pub enum ErrorCode {
     Conflict,
     /// Too many requests from this client.
     RateLimited,
+    /// The client's protocol version is not supported and it must be updated.
+    UpdateRequired,
+    /// Two installations are using the same device identity.
+    CloneDetected,
     /// The account is temporarily locked after failed logins.
     Locked,
     /// The database is unreachable.
@@ -276,8 +292,11 @@ pub enum ClientMessage {
         to: DeviceId,
         /// Viewer-chosen session identifier, 1 to 64 characters.
         session_id: String,
-        /// The viewer device's X25519 public key, standard base64 of 32 bytes.
-        viewer_public_key: String,
+        /// The viewer's per-session X25519 public key, standard base64 of 32 bytes.
+        session_key: String,
+        /// The viewer's Ed25519 signature over the session role, session ID and
+        /// `session_key`, standard base64 of 64 bytes.
+        signature: String,
         /// The unattended password sealed for the host, standard base64 of nonce and
         /// ciphertext, at most [`MAX_SEALED_PASSWORD_LEN`] characters; absent when none is offered.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -294,12 +313,33 @@ pub enum ClientMessage {
         /// Why the session was refused, when it was.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<DenyReason>,
-        /// The host device's X25519 public key, standard base64 of 32 bytes, when accepted.
+        /// The host's per-session X25519 public key, standard base64 of 32 bytes, when accepted.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        host_public_key: Option<String>,
+        session_key: Option<String>,
+        /// The host's Ed25519 signature over the session role, session ID and
+        /// `session_key`, standard base64 of 64 bytes, when accepted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
         /// Random bytes the host chose for this session's key, standard base64 of 32 bytes, when accepted.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         host_nonce: Option<String>,
+    },
+    /// Prove ownership of the device identity by answering the server's challenge.
+    Authenticate {
+        /// Ed25519 signature over the challenge domain tag and nonce, standard base64 of 64 bytes.
+        signature: String,
+        /// Lowercase hex SHA-256 of the device's hardware fingerprint (64 characters).
+        fingerprint_hash: String,
+    },
+    /// Link this device to the account that issued `token`; answered with `linked`.
+    LinkAccount {
+        /// Account session token from `POST /v1/login`.
+        token: String,
+    },
+    /// Remove this device from the account that issued `token`; answered with `unlinked`.
+    UnlinkAccount {
+        /// Account session token from `POST /v1/login`.
+        token: String,
     },
     /// Ask for a LiveKit token for this device's own room; answered with `host_token`.
     HostTokenRequest,
@@ -320,6 +360,11 @@ pub enum ClientMessage {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    /// First message after the upgrade; the client answers with `authenticate`.
+    Challenge {
+        /// Random nonce to sign, standard base64 of 32 bytes.
+        nonce: String,
+    },
     /// First message after a successful connect.
     Hello {
         /// The authenticated device ID of this connection.
@@ -342,8 +387,16 @@ pub enum ServerMessage {
         from: DeviceId,
         /// Session identifier chosen by the viewer.
         session_id: String,
-        /// The viewer device's X25519 public key, standard base64 of 32 bytes.
-        viewer_public_key: String,
+        /// The viewer's per-session X25519 public key, standard base64 of 32 bytes.
+        session_key: String,
+        /// The viewer's Ed25519 signature over the session role, session ID and
+        /// `session_key`, standard base64 of 64 bytes.
+        signature: String,
+        /// The viewer's Ed25519 identity public key as attested by the server,
+        /// standard base64 of 32 bytes.
+        identity_key: String,
+        /// The viewer device's name.
+        name: String,
         /// The unattended password sealed for this device, as the viewer sent it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         password: Option<String>,
@@ -359,12 +412,20 @@ pub enum ServerMessage {
         /// Why the session was refused, when it was.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<DenyReason>,
-        /// The host device's X25519 public key, standard base64 of 32 bytes, when accepted.
+        /// The host's per-session X25519 public key, standard base64 of 32 bytes, when accepted.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        host_public_key: Option<String>,
+        session_key: Option<String>,
+        /// The host's Ed25519 signature over the session role, session ID and
+        /// `session_key`, standard base64 of 64 bytes, when accepted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
         /// Random bytes the host chose for this session's key, standard base64 of 32 bytes, when accepted.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         host_nonce: Option<String>,
+        /// The host's Ed25519 identity public key as attested by the server,
+        /// standard base64 of 32 bytes, when accepted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity_key: Option<String>,
     },
     /// LiveKit join token for this device's own room.
     HostToken {
@@ -417,6 +478,13 @@ pub enum ServerMessage {
     },
     /// This connection was superseded and is about to be closed.
     Replaced,
+    /// This device was linked to the account named `username`.
+    Linked {
+        /// Username of the account the device is now linked to.
+        username: String,
+    },
+    /// This device was removed from its account.
+    Unlinked,
 }
 
 /// Why a host refused a session request.
@@ -443,6 +511,12 @@ pub enum WsErrorCode {
     RateLimited,
     /// The device may not make this request.
     Forbidden,
+    /// The client's protocol version is not supported and it must be updated.
+    UpdateRequired,
+    /// Two installations are using the same device identity.
+    CloneDetected,
+    /// A signature did not verify against the claimed identity key.
+    BadSignature,
 }
 
 #[cfg(test)]
@@ -538,54 +612,6 @@ mod tests {
     }
 
     #[test]
-    fn session_request_round_trip() {
-        let raw = json!({"type":"session_request","to":"123456789","session_id":"s1","viewer_public_key":"AAAA"});
-        let msg: ClientMessage = serde_json::from_value(raw.clone()).unwrap();
-        assert!(matches!(msg, ClientMessage::SessionRequest { .. }));
-        assert_eq!(serde_json::to_value(&msg).unwrap(), raw);
-    }
-
-    #[test]
-    fn session_request_omits_absent_password() {
-        let msg = ServerMessage::SessionRequest {
-            from: DeviceId::new(123_456_789).unwrap(),
-            session_id: "s1".into(),
-            viewer_public_key: "AAAA".into(),
-            password: None,
-        };
-        let value = serde_json::to_value(&msg).unwrap();
-        assert!(value.get("password").is_none());
-    }
-
-    #[test]
-    fn session_request_round_trips_password() {
-        let raw = json!({"type":"session_request","to":"123456789","session_id":"s1",
-                         "viewer_public_key":"AAAA","password":"c2VhbGVk"});
-        let msg: ClientMessage = serde_json::from_value(raw.clone()).unwrap();
-        let ClientMessage::SessionRequest { password, .. } = &msg else {
-            panic!("not a session request");
-        };
-        assert_eq!(password.as_deref(), Some("c2VhbGVk"));
-        assert_eq!(serde_json::to_value(&msg).unwrap(), raw);
-    }
-
-    #[test]
-    fn session_response_omits_absent_fields() {
-        let msg = ServerMessage::SessionResponse {
-            from: DeviceId::new(123_456_789).unwrap(),
-            session_id: "s1".into(),
-            accepted: false,
-            reason: Some(DenyReason::RoomFull),
-            host_public_key: None,
-            host_nonce: None,
-        };
-        assert_eq!(
-            serde_json::to_value(&msg).unwrap(),
-            json!({"type":"session_response","from":"123456789","session_id":"s1","accepted":false,"reason":"room_full"})
-        );
-    }
-
-    #[test]
     fn token_messages_round_trip() {
         let req: ClientMessage =
             serde_json::from_value(json!({"type":"host_token_request"})).unwrap();
@@ -613,9 +639,132 @@ mod tests {
     }
 
     #[test]
-    fn register_device_request_optional_device_id() {
-        let req: RegisterDeviceRequest =
-            serde_json::from_value(json!({"fingerprint_hash":"ab","name":"pc"})).unwrap();
-        assert!(req.device_id.is_none());
+    fn protocol_version_is_two() {
+        assert_eq!(PROTOCOL_VERSION, 2);
+        assert_eq!(HEADER_PROTOCOL_VERSION, "x-protocol-version");
+    }
+
+    #[test]
+    fn challenge_round_trip() {
+        let raw = json!({"type":"challenge","nonce":"AAAA"});
+        let msg: ServerMessage = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(msg, ServerMessage::Challenge { nonce: "AAAA".into() });
+        assert_eq!(serde_json::to_value(&msg).unwrap(), raw);
+    }
+
+    #[test]
+    fn authenticate_round_trip() {
+        let raw = json!({"type":"authenticate","signature":"c2ln","fingerprint_hash":"ab"});
+        let msg: ClientMessage = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(
+            msg,
+            ClientMessage::Authenticate {
+                signature: "c2ln".into(),
+                fingerprint_hash: "ab".into()
+            }
+        );
+        assert_eq!(serde_json::to_value(&msg).unwrap(), raw);
+    }
+
+    #[test]
+    fn signed_session_request_round_trip() {
+        let raw = json!({"type":"session_request","to":"123456789","session_id":"s1",
+                         "session_key":"a2V5","signature":"c2ln"});
+        let msg: ClientMessage = serde_json::from_value(raw.clone()).unwrap();
+        assert!(matches!(msg, ClientMessage::SessionRequest { password: None, .. }));
+        assert_eq!(serde_json::to_value(&msg).unwrap(), raw);
+
+        let relayed = json!({"type":"session_request","from":"123456789","session_id":"s1",
+                             "session_key":"a2V5","signature":"c2ln","identity_key":"aWQ=",
+                             "name":"pc","password":"c2VhbGVk"});
+        let msg: ServerMessage = serde_json::from_value(relayed.clone()).unwrap();
+        let ServerMessage::SessionRequest { identity_key, name, .. } = &msg else {
+            panic!("not a session request");
+        };
+        assert_eq!(identity_key, "aWQ=");
+        assert_eq!(name, "pc");
+        assert_eq!(serde_json::to_value(&msg).unwrap(), relayed);
+    }
+
+    #[test]
+    fn signed_session_response_round_trip() {
+        let accepted = json!({"type":"session_response","to":"123456789","session_id":"s1",
+                              "accepted":true,"session_key":"a2V5","signature":"c2ln",
+                              "host_nonce":"bm9uY2U="});
+        let msg: ClientMessage = serde_json::from_value(accepted.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&msg).unwrap(), accepted);
+
+        let denied = json!({"type":"session_response","to":"123456789","session_id":"s1",
+                            "accepted":false,"reason":"denied"});
+        let msg: ClientMessage = serde_json::from_value(denied.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&msg).unwrap(), denied);
+
+        let relayed = json!({"type":"session_response","from":"123456789","session_id":"s1",
+                             "accepted":true,"session_key":"a2V5","signature":"c2ln",
+                             "host_nonce":"bm9uY2U=","identity_key":"aWQ="});
+        let msg: ServerMessage = serde_json::from_value(relayed.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&msg).unwrap(), relayed);
+    }
+
+    #[test]
+    fn link_account_messages_round_trip() {
+        let raw = json!({"type":"link_account","token":"t"});
+        let msg: ClientMessage = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(msg, ClientMessage::LinkAccount { token: "t".into() });
+        assert_eq!(serde_json::to_value(&msg).unwrap(), raw);
+        let raw = json!({"type":"unlink_account","token":"t"});
+        let msg: ClientMessage = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(msg, ClientMessage::UnlinkAccount { token: "t".into() });
+        let linked = json!({"type":"linked","username":"bob"});
+        let msg: ServerMessage = serde_json::from_value(linked.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&msg).unwrap(), linked);
+        assert_eq!(
+            serde_json::to_value(ServerMessage::Unlinked).unwrap(),
+            json!({"type":"unlinked"})
+        );
+    }
+
+    #[test]
+    fn register_request_has_no_invite() {
+        let value = serde_json::to_value(RegisterRequest {
+            username: "bob".into(),
+            password: "pw".into(),
+        })
+        .unwrap();
+        let mut keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["password", "username"]);
+    }
+
+    #[test]
+    fn register_device_bodies_round_trip() {
+        let req: RegisterDeviceRequest = serde_json::from_value(json!({
+            "public_key":"a2V5","fingerprint_hash":"ab","name":"pc","protocol_version":2
+        }))
+        .unwrap();
+        assert_eq!(req.protocol_version, PROTOCOL_VERSION);
+        let resp = RegisterDeviceResponse { device_id: DeviceId::new(123_456_789).unwrap() };
+        assert_eq!(
+            serde_json::to_value(&resp).unwrap(),
+            json!({"device_id":"123456789"})
+        );
+    }
+
+    #[test]
+    fn account_bodies_and_new_error_codes() {
+        let del: DeleteAccountRequest = serde_json::from_value(json!({"password":"pw"})).unwrap();
+        assert_eq!(del.password, "pw");
+        let info = MyDeviceInfo {
+            device_id: DeviceId::new(123_456_789).unwrap(),
+            name: "pc".into(),
+            online: true,
+            last_seen_at: None,
+        };
+        assert_eq!(serde_json::to_value(&info).unwrap()["name"], "pc");
+        assert_eq!(serde_json::to_value(ErrorCode::UpdateRequired).unwrap(), json!("update_required"));
+        assert_eq!(serde_json::to_value(ErrorCode::CloneDetected).unwrap(), json!("clone_detected"));
+        assert_eq!(serde_json::to_value(WsErrorCode::UpdateRequired).unwrap(), json!("update_required"));
+        assert_eq!(serde_json::to_value(WsErrorCode::CloneDetected).unwrap(), json!("clone_detected"));
+        assert_eq!(serde_json::to_value(WsErrorCode::BadSignature).unwrap(), json!("bad_signature"));
     }
 }

@@ -18,7 +18,9 @@ use tokio::task::JoinHandle;
 
 use crate::channel::{Inbound, PeerChannel, SendError, Side, topic_index};
 use crate::config::{EndReason, SessionConfig};
-use crate::crypto::{self, DeviceKeys, PublicKey};
+use crate::crypto::{
+    self, Ephemeral, EphemeralPublic, IdentityKey, IdentityPublic, Role, SessionKey,
+};
 use crate::pinning::{KeyChanged, KnownKeys};
 use crate::reconnect::ReconnectWatch;
 use crate::room::{self, Incoming, JoinError};
@@ -34,10 +36,9 @@ const EVENT_CAPACITY: usize = 64;
 /// Optional inputs of a session request.
 #[derive(Clone, Default)]
 pub struct RequestOptions {
-    /// Unattended password offered to the host; sent only when a host key is known.
+    /// Unattended password the viewer intends to authenticate with; when set,
+    /// the request is marked unattended.
     pub password: Option<String>,
-    /// Host public key the password is sealed for when no key is pinned for the host yet.
-    pub host_key: Option<PublicKey>,
 }
 
 impl std::fmt::Debug for RequestOptions {
@@ -45,7 +46,6 @@ impl std::fmt::Debug for RequestOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RequestOptions")
             .field("password", &self.password.as_ref().map(|_| ".."))
-            .field("host_key", &self.host_key)
             .finish()
     }
 }
@@ -132,22 +132,32 @@ impl ViewerSession {
     /// the host has handed over its media key.
     pub async fn request(
         signaling: SignalingClient,
-        keys: Arc<DeviceKeys>,
+        identity: Arc<IdentityKey>,
         known: Arc<Mutex<KnownKeys>>,
         host: DeviceId,
         config: SessionConfig,
     ) -> Result<(ViewerSession, mpsc::Receiver<ViewerEvent>), RequestError> {
-        Self::request_with(signaling, keys, known, host, RequestOptions::default(), config).await
+        Self::request_with(
+            signaling,
+            identity,
+            known,
+            host,
+            RequestOptions::default(),
+            config,
+        )
+        .await
     }
 
-    /// Requests a session with `host` like [`ViewerSession::request`], offering
-    /// the unattended password in `options`.
+    /// Requests a session with `host` like [`ViewerSession::request`], with the
+    /// inputs in `options`.
     ///
-    /// The password is sealed for the key pinned for `host`, or for
-    /// `options.host_key` when none is pinned; without either it is not sent.
+    /// The request carries a fresh per-session key signed with `identity`. The
+    /// host's per-session key must carry a valid signature by the host's
+    /// identity key, which is pinned on first contact and must match the pin
+    /// afterwards.
     pub async fn request_with(
         signaling: SignalingClient,
-        keys: Arc<DeviceKeys>,
+        identity: Arc<IdentityKey>,
         known: Arc<Mutex<KnownKeys>>,
         host: DeviceId,
         options: RequestOptions,
@@ -155,26 +165,16 @@ impl ViewerSession {
     ) -> Result<(ViewerSession, mpsc::Receiver<ViewerEvent>), RequestError> {
         let viewer = signaling.device_id();
         let session_id = new_session_id();
-        let password = match options.password.as_deref() {
-            None => None,
-            Some(password) => {
-                let host_key = lock(&known).get(host).copied().or(options.host_key);
-                match host_key {
-                    None => None,
-                    Some(key) => Some(
-                        crypto::seal_password(&keys, &key, &session_id, viewer, host, password)
-                            .map_err(|_| RequestError::Denied)?,
-                    ),
-                }
-            }
-        };
+        let ephemeral = Ephemeral::generate();
+        let signature = identity.sign_session(Role::Viewer, &session_id, &ephemeral.public());
         let mut sig_events = signaling.subscribe();
         signaling
             .send(ClientMessage::SessionRequest {
                 to: host,
                 session_id: session_id.clone(),
-                viewer_public_key: keys.public_key().to_base64(),
-                password,
+                session_key: ephemeral.public().to_base64(),
+                signature: crypto::signature_to_base64(&signature),
+                unattended: options.password.is_some(),
             })
             .await?;
         tracing::info!(%host, %session_id, "session requested");
@@ -196,8 +196,10 @@ impl ViewerSession {
                         session_id: sid,
                         accepted,
                         reason,
-                        host_public_key,
+                        session_key,
+                        signature,
                         host_nonce,
+                        identity_key,
                     }) if from == host && sid == session_id => {
                         if !accepted {
                             return Err(match reason {
@@ -205,26 +207,14 @@ impl ViewerSession {
                                 _ => RequestError::Denied,
                             });
                         }
-                        let host_key = host_public_key
-                            .as_deref()
-                            .and_then(|k| PublicKey::from_base64(k).ok())
-                            .ok_or(RequestError::Denied)?;
-                        lock(&known).check(host, &host_key)?;
-                        let nonce: [u8; 32] = host_nonce
-                            .as_deref()
-                            .and_then(|n| STANDARD.decode(n).ok())
-                            .and_then(|n| n.try_into().ok())
-                            .ok_or(RequestError::Denied)?;
-                        let derived = crypto::derive_session_key(
-                            &keys,
-                            &host_key,
-                            &session_id,
-                            host,
-                            viewer,
-                            &nonce,
-                        )
-                        .map_err(|_| RequestError::Denied)?;
-                        key = Some(derived);
+                        let accepted = AcceptedKeys {
+                            identity_key: identity_key.as_deref(),
+                            session_key: session_key.as_deref(),
+                            signature: signature.as_deref(),
+                            host_nonce: host_nonce.as_deref(),
+                        };
+                        key =
+                            Some(accepted.derive(&ephemeral, &known, &session_id, host, viewer)?);
                     }
                     Some(ServerMessage::ViewerToken {
                         from,
@@ -476,6 +466,72 @@ fn spawn_frames(track: RemoteVideoTrack, public: mpsc::Sender<ViewerEvent>) -> J
     })
 }
 
+/// The key material of an accepted session response, as received.
+struct AcceptedKeys<'a> {
+    /// The host's identity key as attested by the server, standard base64.
+    identity_key: Option<&'a str>,
+    /// The host's per-session key, standard base64.
+    session_key: Option<&'a str>,
+    /// The host's signature over its per-session key, standard base64.
+    signature: Option<&'a str>,
+    /// The host nonce of the session, standard base64 of 32 bytes.
+    host_nonce: Option<&'a str>,
+}
+
+impl AcceptedKeys<'_> {
+    /// Verifies the host's signed per-session key and derives the session key.
+    ///
+    /// The host's per-session key must be signed by its identity key for
+    /// `session_id`; the identity key is then checked against the pin in
+    /// `known`, which pins it on first contact. `ephemeral` is this viewer's
+    /// per-session key pair. Fails with [`RequestError::Denied`] when a field is
+    /// missing or malformed, the signature does not verify or the key agreement
+    /// fails, and with [`RequestError::KeyChanged`] when the identity key differs
+    /// from the pinned one.
+    fn derive(
+        &self,
+        ephemeral: &Ephemeral,
+        known: &Mutex<KnownKeys>,
+        session_id: &str,
+        host: DeviceId,
+        viewer: DeviceId,
+    ) -> Result<SessionKey, RequestError> {
+        let identity_key = self
+            .identity_key
+            .and_then(|k| IdentityPublic::from_base64(k).ok())
+            .ok_or(RequestError::Denied)?;
+        let host_key = self
+            .session_key
+            .and_then(|k| EphemeralPublic::from_base64(k).ok())
+            .ok_or(RequestError::Denied)?;
+        let signature = self
+            .signature
+            .and_then(|s| crypto::signature_from_base64(s).ok())
+            .ok_or(RequestError::Denied)?;
+        identity_key
+            .verify_session(Role::Host, session_id, &host_key, &signature)
+            .map_err(|_| RequestError::Denied)?;
+        lock(known).check(host, &identity_key)?;
+        let nonce: [u8; 32] = self
+            .host_nonce
+            .and_then(|n| STANDARD.decode(n).ok())
+            .and_then(|n| n.try_into().ok())
+            .ok_or(RequestError::Denied)?;
+        let shared = ephemeral
+            .agree(&host_key)
+            .map_err(|_| RequestError::Denied)?;
+        Ok(crypto::derive_session_key(
+            &shared,
+            &ephemeral.public(),
+            &host_key,
+            session_id,
+            &nonce,
+            host,
+            viewer,
+        ))
+    }
+}
+
 /// Returns a new random 128-bit session ID as 32 hex characters.
 fn new_session_id() -> String {
     let mut bytes = [0u8; 16];
@@ -493,8 +549,57 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::crypto::SessionKey;
     use crate::testutil::{env, mint_token, room_name, unix_now};
+
+    #[test]
+    fn accepted_keys_verify_host_signature_pin_and_derive_shared_key() {
+        let (host, viewer) = (
+            DeviceId::new(123_456_789).unwrap(),
+            DeviceId::new(223_456_789).unwrap(),
+        );
+        let host_identity = IdentityKey::generate();
+        let (host_eph, viewer_eph) = (Ephemeral::generate(), Ephemeral::generate());
+        let identity_b64 = host_identity.public().to_base64();
+        let key_b64 = host_eph.public().to_base64();
+        let nonce_b64 = STANDARD.encode([9; 32]);
+        let sig = |role| {
+            crypto::signature_to_base64(&host_identity.sign_session(role, "s1", &host_eph.public()))
+        };
+        let (host_sig, viewer_sig) = (sig(Role::Host), sig(Role::Viewer));
+        let known = Mutex::new(KnownKeys::default());
+        let keys = |signature: &str| {
+            AcceptedKeys {
+                identity_key: Some(identity_b64.as_str()),
+                session_key: Some(key_b64.as_str()),
+                signature: Some(signature),
+                host_nonce: Some(nonce_b64.as_str()),
+            }
+            .derive(&viewer_eph, &known, "s1", host, viewer)
+        };
+
+        assert_eq!(keys(&viewer_sig).unwrap_err(), RequestError::Denied);
+        assert!(
+            lock(&known).get(host).is_none(),
+            "a bad signature pins nothing"
+        );
+
+        let derived = keys(&host_sig).unwrap();
+        let shared = host_eph.agree(&viewer_eph.public()).unwrap();
+        let host_side = crypto::derive_session_key(
+            &shared,
+            &viewer_eph.public(),
+            &host_eph.public(),
+            "s1",
+            &[9; 32],
+            host,
+            viewer,
+        );
+        assert_eq!(derived.as_bytes(), host_side.as_bytes());
+        assert_eq!(lock(&known).get(host), Some(&host_identity.public()));
+
+        lock(&known).trust_key(host, IdentityKey::generate().public());
+        assert!(matches!(keys(&host_sig), Err(RequestError::KeyChanged(_))));
+    }
 
     /// Joins a fresh room and starts the viewer loop on simulated room events.
     async fn loop_on_simulated_events(

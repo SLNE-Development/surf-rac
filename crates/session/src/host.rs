@@ -19,7 +19,9 @@ use tokio::time::Instant;
 
 use crate::channel::{Inbound, PeerChannel, SendError, Side, topic_index};
 use crate::config::{EndReason, MAX_VIEWERS, SessionConfig};
-use crate::crypto::{self, DeviceKeys, PublicKey, SessionKey};
+use crate::crypto::{
+    self, Ephemeral, EphemeralPublic, IdentityKey, IdentityPublic, Role, SessionKey,
+};
 use crate::pinning::{KeyChanged, KnownKeys};
 use crate::reconnect::ReconnectWatch;
 use crate::room::{self, Incoming, JoinError};
@@ -65,14 +67,14 @@ pub enum HostEvent {
         session_id: String,
         /// The requesting device.
         viewer: DeviceId,
-        /// Fingerprint of the viewer's public key.
+        /// Fingerprint of the viewer's identity key.
         fingerprint: String,
-        /// The viewer's public key.
-        viewer_key: PublicKey,
-        /// The unattended password the viewer sealed for this host, if it offered one.
-        password: Option<String>,
+        /// The viewer's identity key.
+        viewer_key: IdentityPublic,
+        /// Whether the viewer intends to authenticate with the unattended password.
+        unattended: bool,
     },
-    /// A viewer presented a key that differs from its pinned key; its request was refused.
+    /// A viewer presented an identity key that differs from its pinned key; its request was refused.
     KeyChanged(KeyChanged),
     /// An accepted viewer joined the room and received the media key.
     ViewerJoined {
@@ -149,9 +151,9 @@ struct Inner {
     signaling: SignalingClient,
     /// The host's LiveKit room.
     room: Room,
-    /// This device's key pair.
-    keys: Arc<DeviceKeys>,
-    /// Pinned viewer keys.
+    /// This device's identity key.
+    identity: Arc<IdentityKey>,
+    /// Pinned viewer identity keys.
     known: Arc<Mutex<KnownKeys>>,
     /// The published video track and its source.
     video: Mutex<Video>,
@@ -203,8 +205,8 @@ struct State {
 struct Pending {
     /// The requesting device.
     viewer: DeviceId,
-    /// Its public key.
-    key: PublicKey,
+    /// Its signed per-session key.
+    session_key: EphemeralPublic,
     /// When the request arrived.
     requested_at: Instant,
 }
@@ -341,7 +343,7 @@ impl HostSession {
     /// Returns the session and the receiver of its events.
     pub async fn start(
         signaling: SignalingClient,
-        keys: Arc<DeviceKeys>,
+        identity: Arc<IdentityKey>,
         known: Arc<Mutex<KnownKeys>>,
         width: u32,
         height: u32,
@@ -381,7 +383,7 @@ impl HostSession {
             device,
             signaling,
             room: lk_room,
-            keys,
+            identity,
             known,
             video: Mutex::new(video),
             video_switch: tokio::sync::Mutex::new(()),
@@ -412,39 +414,48 @@ impl HostSession {
 
     /// Accepts the pending request `session_id`.
     ///
-    /// The viewer gets the host's public key and a join token for the room. When
+    /// The viewer gets a fresh per-session key of the host, signed with the
+    /// host's identity key, the host nonce and a join token for the room. When
     /// the room already has [`MAX_VIEWERS`] viewers the request is refused as
     /// room full instead.
     pub async fn accept(&self, session_id: &str) -> Result<(), HostError> {
         let inner = &self.inner;
         inner.expire_requests().await;
         let nonce = crypto::random_nonce();
+        let ephemeral = Ephemeral::generate();
         let (viewer, outcome) = {
             let mut st = lock(&inner.state);
             let pending = st
                 .pending
                 .remove(session_id)
                 .ok_or(HostError::UnknownRequest)?;
-            let outcome = crypto::derive_session_key(
-                &inner.keys,
-                &pending.key,
-                session_id,
-                inner.device,
-                pending.viewer,
-                &nonce,
-            )
-            .map_err(|_| DenyReason::Denied)
-            .and_then(|key| {
-                let channel = PeerChannel::new(session_id.to_owned(), key, Side::Host);
-                st.admit(pending.viewer, session_id, channel, Instant::now())
-            });
+            let outcome = ephemeral
+                .agree(&pending.session_key)
+                .map(|shared| {
+                    crypto::derive_session_key(
+                        &shared,
+                        &pending.session_key,
+                        &ephemeral.public(),
+                        session_id,
+                        &nonce,
+                        inner.device,
+                        pending.viewer,
+                    )
+                })
+                .map_err(|_| DenyReason::Denied)
+                .and_then(|key| {
+                    let channel = PeerChannel::new(session_id.to_owned(), key, Side::Host);
+                    st.admit(pending.viewer, session_id, channel, Instant::now())
+                });
             (pending.viewer, outcome)
         };
         match outcome {
             Err(reason) => inner.respond(viewer, session_id, Err(reason)).await,
             Ok(()) => {
                 tracing::info!(viewer = %viewer, %session_id, "session accepted");
-                inner.respond(viewer, session_id, Ok(&nonce)).await?;
+                inner
+                    .respond(viewer, session_id, Ok((&ephemeral.public(), &nonce)))
+                    .await?;
                 inner
                     .signaling
                     .send(ClientMessage::ViewerTokenRequest {
@@ -644,21 +655,27 @@ impl Inner {
         sync_own_key_index(&self.room, &room::identity(self.device), st.active_index);
     }
 
-    /// Answers `viewer`'s request `session_id`: accepted with the session's
-    /// host nonce, or refused with a reason.
+    /// Answers `viewer`'s request `session_id`: accepted with the host's
+    /// per-session key, signed with its identity key, and the session's host
+    /// nonce, or refused with a reason.
     async fn respond(
         &self,
         viewer: DeviceId,
         session_id: &str,
-        answer: Result<&[u8; 32], DenyReason>,
+        answer: Result<(&EphemeralPublic, &[u8; 32]), DenyReason>,
     ) -> Result<(), HostError> {
-        let (reason, host_public_key, host_nonce) = match answer {
-            Ok(nonce) => (
+        let (reason, session_key, signature, host_nonce) = match answer {
+            Ok((key, nonce)) => (
                 None,
-                Some(self.keys.public_key().to_base64()),
+                Some(key.to_base64()),
+                Some(crypto::signature_to_base64(&self.identity.sign_session(
+                    Role::Host,
+                    session_id,
+                    key,
+                ))),
                 Some(STANDARD.encode(nonce)),
             ),
-            Err(reason) => (Some(reason), None, None),
+            Err(reason) => (Some(reason), None, None, None),
         };
         self.signaling
             .send(ClientMessage::SessionResponse {
@@ -666,7 +683,8 @@ impl Inner {
                 session_id: session_id.to_owned(),
                 accepted: answer.is_ok(),
                 reason,
-                host_public_key,
+                session_key,
+                signature,
                 host_nonce,
             })
             .await?;
@@ -750,24 +768,29 @@ impl Inner {
 
     /// Handles a session request from `viewer`.
     ///
-    /// Requests with a malformed key, from a viewer already in the room, with a
+    /// `session_key` is the viewer's per-session key, `signature` its signature
+    /// by the viewer's identity key and `identity_key` that identity key as
+    /// attested by the server. Requests with a malformed key or signature, a
+    /// signature that does not verify, from a viewer already in the room, with a
     /// session ID or viewer that is already pending, or beyond [`MAX_PENDING`]
-    /// are refused, as are viewers whose key differs from the pinned one. Each
-    /// viewer is told about a refusal at most once per [`REFUSAL_INTERVAL`];
-    /// further requests in that interval are dropped without an answer. A
-    /// viewer that was accepted but never joined may request again; accepting
-    /// that request replaces its old slot.
+    /// are refused, as are viewers whose identity key differs from the pinned
+    /// one. Each viewer is told about a refusal at most once per
+    /// [`REFUSAL_INTERVAL`]; further requests in that interval are dropped
+    /// without an answer. A viewer that was accepted but never joined may
+    /// request again; accepting that request replaces its old slot.
     async fn on_request(
         &self,
         viewer: DeviceId,
         session_id: String,
-        key: String,
-        password: Option<String>,
+        session_key: &str,
+        signature: &str,
+        identity_key: &str,
+        unattended: bool,
     ) {
         self.expire_requests().await;
-        let decision = match PublicKey::from_base64(&key) {
+        let decision = match verify_request(&session_id, session_key, signature, identity_key) {
             Err(_) => Err(DenyReason::Denied),
-            Ok(key) => {
+            Ok((key, session_key)) => {
                 let mut st = lock(&self.state);
                 let duplicate = st.pending.contains_key(&session_id)
                     || st.viewers.get(&viewer).is_some_and(|v| v.joined)
@@ -782,7 +805,7 @@ impl Inner {
                                 session_id.clone(),
                                 Pending {
                                     viewer,
-                                    key,
+                                    session_key,
                                     requested_at: Instant::now(),
                                 },
                             );
@@ -801,7 +824,7 @@ impl Inner {
                     viewer,
                     fingerprint: viewer_key.fingerprint(),
                     viewer_key,
-                    password,
+                    unattended,
                 })
                 .await;
             return;
@@ -901,8 +924,18 @@ async fn run(
     let reason = loop {
         tokio::select! {
             msg = signaling.recv(), if signaling_open => match msg {
-                Some(ServerMessage::SessionRequest { from, session_id, viewer_public_key, password }) => {
-                    inner.on_request(from, session_id, viewer_public_key, password).await;
+                Some(ServerMessage::SessionRequest {
+                    from,
+                    session_id,
+                    session_key,
+                    signature,
+                    identity_key,
+                    unattended,
+                    ..
+                }) => {
+                    inner
+                        .on_request(from, session_id, &session_key, &signature, &identity_key, unattended)
+                        .await;
                 }
                 Some(_) => {}
                 None => {
@@ -1031,6 +1064,27 @@ fn sync_own_key_index(lk_room: &Room, own: &ParticipantIdentity, index: u8) {
     }
 }
 
+/// Parses a viewer's signed per-session key and checks its signature.
+///
+/// `identity_key` and `session_key` are standard base64 of 32 bytes and
+/// `signature` standard base64 of 64 bytes. Returns the viewer's identity key
+/// and per-session key when `signature` is the identity key's signature over
+/// the per-session key as viewer of `session_id`; fails with the
+/// [`CryptoError`](crypto::CryptoError) of the first malformed or
+/// non-verifying input otherwise.
+fn verify_request(
+    session_id: &str,
+    session_key: &str,
+    signature: &str,
+    identity_key: &str,
+) -> Result<(IdentityPublic, EphemeralPublic), crypto::CryptoError> {
+    let identity = IdentityPublic::from_base64(identity_key)?;
+    let key = EphemeralPublic::from_base64(session_key)?;
+    let signature = crypto::signature_from_base64(signature)?;
+    identity.verify_session(Role::Viewer, session_id, &key, &signature)?;
+    Ok((identity, key))
+}
+
 /// Locks `m`, recovering from a poisoned lock.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -1085,10 +1139,26 @@ mod tests {
             sid.into(),
             Pending {
                 viewer,
-                key: PublicKey::from_bytes([5; 32]),
+                session_key: EphemeralPublic::from_bytes([5; 32]),
                 requested_at: at,
             },
         );
+    }
+
+    #[test]
+    fn verify_request_accepts_only_a_viewer_signature_for_the_session() {
+        let identity = IdentityKey::generate();
+        let key = Ephemeral::generate().public();
+        let b64 = |role| crypto::signature_to_base64(&identity.sign_session(role, "s1", &key));
+        let id_b64 = identity.public().to_base64();
+        let (got_identity, got_key) =
+            verify_request("s1", &key.to_base64(), &b64(Role::Viewer), &id_b64).unwrap();
+        assert_eq!((got_identity, got_key), (identity.public(), key));
+        assert!(verify_request("s1", &key.to_base64(), &b64(Role::Host), &id_b64).is_err());
+        assert!(verify_request("s2", &key.to_base64(), &b64(Role::Viewer), &id_b64).is_err());
+        let other = IdentityKey::generate().public().to_base64();
+        assert!(verify_request("s1", &key.to_base64(), &b64(Role::Viewer), &other).is_err());
+        assert!(verify_request("s1", "AAAA", &b64(Role::Viewer), &id_b64).is_err());
     }
 
     #[test]

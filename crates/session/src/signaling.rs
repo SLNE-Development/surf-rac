@@ -7,13 +7,18 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use futures_util::{SinkExt, StreamExt};
 use surf_rac_protocol::{
-    ClientMessage, DeviceId, HEADER_DEVICE_ID, HEADER_DEVICE_SECRET, ServerMessage,
+    ClientMessage, DeviceId, HEADER_DEVICE_ID, HEADER_PROTOCOL_VERSION, PROTOCOL_VERSION,
+    ServerMessage,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+use crate::crypto::{self, IdentityKey};
 
 /// Incoming messages a subscriber may fall behind by before it skips ahead.
 const EVENT_CAPACITY: usize = 256;
@@ -66,14 +71,18 @@ impl Inner {
 }
 
 impl SignalingClient {
-    /// Connects device `device_id` to `<url>/v1/ws` and waits for the server's `hello`.
+    /// Connects device `device_id` to `<url>/v1/ws`, answers the server's
+    /// challenge with `identity` and waits for the server's `hello`.
     ///
     /// `url` is the server base as `ws://` or `wss://`, e.g. `wss://rac.slne.dev`.
+    /// `fingerprint_hash` is the lowercase hex SHA-256 of the device's hardware
+    /// fingerprint. Fails with [`SignalingError::Connect`] when the server sends
+    /// an error or no `hello` arrives within the handshake timeout.
     pub async fn connect(
         url: &str,
-        session_token: &str,
         device_id: DeviceId,
-        device_secret: &str,
+        identity: &IdentityKey,
+        fingerprint_hash: &str,
     ) -> Result<Self, SignalingError> {
         let mut request = format!("{}/v1/ws", url.trim_end_matches('/'))
             .into_client_request()
@@ -83,9 +92,11 @@ impl SignalingClient {
             v.parse()
                 .map_err(|_| SignalingError::Connect("invalid header value".into()))
         };
-        headers.insert("authorization", header(format!("Bearer {session_token}"))?);
         headers.insert(HEADER_DEVICE_ID, header(device_id.to_string())?);
-        headers.insert(HEADER_DEVICE_SECRET, header(device_secret.to_owned())?);
+        headers.insert(
+            HEADER_PROTOCOL_VERSION,
+            header(PROTOCOL_VERSION.to_string())?,
+        );
         let (mut ws, _) = match tokio_tungstenite::connect_async(request).await {
             Ok(ok) => ok,
             Err(tokio_tungstenite::tungstenite::Error::Http(res)) => {
@@ -93,19 +104,12 @@ impl SignalingClient {
             }
             Err(e) => return Err(SignalingError::Connect(e.to_string())),
         };
-        let hello = tokio::time::timeout(HELLO_TIMEOUT, async {
-            while let Some(frame) = ws.next().await {
-                if let Ok(Message::Text(text)) = frame {
-                    return serde_json::from_str::<ServerMessage>(text.as_str()).ok();
-                }
-            }
-            None
-        })
-        .await;
-        match hello {
-            Ok(Some(ServerMessage::Hello { device_id: id })) if id == device_id => {}
-            _ => return Err(SignalingError::Connect("no hello from server".into())),
-        }
+        tokio::time::timeout(
+            HELLO_TIMEOUT,
+            handshake(&mut ws, device_id, identity, fingerprint_hash),
+        )
+        .await
+        .map_err(|_| SignalingError::Connect("no hello from server".into()))??;
 
         let (out, out_rx) = mpsc::channel(OUTBOUND_CAPACITY);
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
@@ -165,6 +169,50 @@ impl SignalingEvents {
 /// The WebSocket stream type of a client connection.
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Answers the server's challenge on `ws` and waits for its `hello` for `device_id`.
+///
+/// Signs the challenge nonce with `identity` and sends it with
+/// `fingerprint_hash`. Fails with [`SignalingError::Connect`] when the server
+/// sends an error, an invalid nonce or a `hello` for another device, or closes
+/// the connection.
+async fn handshake(
+    ws: &mut Ws,
+    device_id: DeviceId,
+    identity: &IdentityKey,
+    fingerprint_hash: &str,
+) -> Result<(), SignalingError> {
+    while let Some(frame) = ws.next().await {
+        let Ok(Message::Text(text)) = frame else {
+            continue;
+        };
+        match serde_json::from_str::<ServerMessage>(text.as_str()) {
+            Ok(ServerMessage::Challenge { nonce }) => {
+                let nonce: [u8; 32] = STANDARD
+                    .decode(&nonce)
+                    .ok()
+                    .and_then(|n| n.try_into().ok())
+                    .ok_or_else(|| SignalingError::Connect("invalid challenge nonce".into()))?;
+                let reply = ClientMessage::Authenticate {
+                    signature: crypto::signature_to_base64(&identity.sign_challenge(&nonce)),
+                    fingerprint_hash: fingerprint_hash.to_owned(),
+                };
+                let text = serde_json::to_string(&reply).expect("client messages always serialize");
+                ws.send(Message::Text(text.into()))
+                    .await
+                    .map_err(|e| SignalingError::Connect(e.to_string()))?;
+            }
+            Ok(ServerMessage::Hello { device_id: id }) if id == device_id => return Ok(()),
+            Ok(ServerMessage::Error { code, message }) => {
+                return Err(SignalingError::Connect(format!(
+                    "server refused the connection ({code:?}): {message}"
+                )));
+            }
+            _ => return Err(SignalingError::Connect("no hello from server".into())),
+        }
+    }
+    Err(SignalingError::Connect("no hello from server".into()))
+}
 
 /// Runs the connection until either side closes it, then marks it closed.
 async fn run(ws: Ws, mut out_rx: mpsc::Receiver<ClientMessage>, inner: Arc<Inner>) {

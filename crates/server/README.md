@@ -79,7 +79,10 @@ against a migrated database; rolling back past it needs the database backup.
    WebSocket upgrades need no extra configuration.
 5. Health check: `GET /healthz` returns 200 when the database is reachable.
 
-Rollback: redeploy the previous image tag.
+Rollback: redeploy the previous image tag. When the deployment applied
+migration `0003_device_identity`, also restore the database backup taken
+before that migration ran; the previous image does not start against the
+migrated schema.
 
 ## coturn
 
@@ -106,6 +109,30 @@ surf-rac-server revoke-sessions <username>
 Disabling a user or revoking sessions affects only the account: its sessions
 stop working for account endpoints at once. Devices do not depend on accounts
 and stay connected; a device linked to the account stays linked.
+
+### Disabling a device
+
+There is no CLI command for devices. An operator disables or re-enables one
+installation with SQL in the Postgres resource (Coolify terminal of the
+database, or `psql "$DATABASE_URL"`), using the 9-digit device ID the client
+shows:
+
+```sql
+UPDATE devices SET disabled = true WHERE id = <id>;   -- disable
+UPDATE devices SET disabled = false WHERE id = <id>;  -- enable again
+```
+
+A disabled device that is connected receives an `error` with code
+`device_disabled` at the next re-check (within a minute) and is closed. New
+WebSocket connections of the device are refused with a 403
+`device_disabled`. The client stops connecting, shows the status "Device
+disabled" and the banner "This device is disabled. The server's administrator
+turned it off; it cannot connect or be reached." Other devices see it as
+offline, so session requests to it fail as offline.
+
+Re-enabling takes effect for the next connection. The client does not retry
+on its own once it saw `device_disabled`; the user restarts surf-rac on that
+device, which then connects with the same device ID.
 
 ## API
 
@@ -137,23 +164,23 @@ All endpoints are under `/v1`. The wire types are defined in the
   (bearer). A contact may name an ID that is not registered.
 - `GET /presence/{id}` (bearer): online state of a registered device
 - `GET /ws`: WebSocket. Send `X-Device-Id` and `X-Protocol-Version` on the
-  upgrade request; another or a missing version is a 426 `update_required`,
-  a missing or malformed device ID a 401, an unknown one a 404 `unknown_device`
+  upgrade request; another or a missing version is a 426 `update_required`, a
+  missing or malformed device ID a 401, an unknown one a 404 `unknown_device`
   and a disabled one a 403 `device_disabled`. A device disabled while
-  connected receives an `error` with code `device_disabled` and is closed. The server then sends `challenge` with
-  a random 32-byte nonce, and the device must answer within 10 seconds with
-  `authenticate`: an Ed25519 signature over `surf-rac/challenge/v1` followed
-  by the nonce, and its fingerprint hash. A wrong signature closes the socket
-  with `bad_signature`, a different fingerprint with `clone_detected`; a valid
-  answer is followed by `hello`. `link_account` with an account session
-  `token` links the connection's device to that account and is answered with
-  `linked` and the username; `unlink_account` removes that link and is
-  answered with `unlinked`. An invalid token is an `error` with code
-  `forbidden` and changes nothing. A device receives `presence` for every
-  device that an account linked to it has as a contact or linked. Besides
-  `signal` relaying it
-  carries session negotiation (`session_request`, `password_challenge`,
-  `session_password`, `session_response`) and
-  LiveKit tokens: `host_token_request` returns a token for the device's own
-  room `host-<device_id>`; `viewer_token_request` sends a 60-second
-  subscribe-only token for that room to the named viewer.
+  connected receives an `error` with code `device_disabled` and is closed; a
+  device deleted while connected is closed without an error. The server then
+  sends `challenge` with a random 32-byte nonce, and the device must answer
+  within 10 seconds with `authenticate`: an Ed25519 signature over
+  `surf-rac/challenge/v1` followed by the nonce, and its fingerprint hash. A
+  wrong signature closes the socket with `bad_signature`, a different
+  fingerprint with `clone_detected`; a valid answer is followed by `hello`.
+  `link_account` with an account session `token` links the connection's device
+  to that account and is answered with `linked` and the username;
+  `unlink_account` removes that link and is answered with `unlinked`. An
+  invalid token is an `error` with code `forbidden` and changes nothing. A
+  device receives `presence` for every device that an account linked to it has
+  as a contact or linked. Besides `signal` relaying it carries session
+  negotiation (`session_request`, `password_challenge`, `session_password`,
+  `session_response`) and LiveKit tokens: `host_token_request` returns a token
+  for the device's own room `host-<device_id>`; `viewer_token_request` sends a
+  60-second subscribe-only token for that room to the named viewer.

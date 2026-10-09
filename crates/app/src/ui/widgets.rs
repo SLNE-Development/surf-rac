@@ -100,24 +100,47 @@ fn styled(
 /// Shows a square, frameless button holding only `icon`, with a tooltip.
 pub(super) fn icon_button(ui: &mut Ui, icon: char, tooltip: &str) -> Response {
     let p = theme::palette(ui.ctx());
-    ui.add(
-        Button::new(icons::text(icon, 16.0).color(p.muted))
-            .frame_when_inactive(false)
-            .corner_radius(RADIUS_CONTROL)
-            .min_size(Vec2::splat(32.0)),
-    )
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding = Vec2::splat(8.0);
+        ui.add(
+            Button::new(icons::text(icon, 16.0).color(p.muted))
+                .frame_when_inactive(false)
+                .corner_radius(RADIUS_CONTROL)
+                .min_size(Vec2::splat(32.0)),
+        )
+    })
+    .inner
     .on_hover_text(tooltip)
 }
 
 /// Shows a full-width single-line text field with a hint; `password` hides the text.
 pub(super) fn text_field(ui: &mut Ui, value: &mut String, hint: &str, password: bool) -> Response {
+    let width = ui.available_width();
+    sized_field(ui, value, hint, password, width)
+}
+
+/// Shows a single-line text field of `width` points with a hint; `password` hides the text.
+pub(super) fn sized_field(
+    ui: &mut Ui,
+    value: &mut String,
+    hint: &str,
+    password: bool,
+    width: f32,
+) -> Response {
     ui.add(
         TextEdit::singleline(value)
             .hint_text(hint.to_string())
             .password(password)
             .margin(Margin::symmetric(10, 9))
-            .desired_width(f32::INFINITY),
+            .desired_width(width)
+            .min_size(vec2(width, 38.0)),
     )
+}
+
+/// Shows `button` stretched to the full available width with its label centred.
+pub(super) fn full_width(ui: &mut Ui, enabled: bool, button: Button<'static>) -> Response {
+    let size = vec2(ui.available_width(), BUTTON_HEIGHT_LG);
+    ui.add_enabled_ui(enabled, |ui| ui.add_sized(size, button)).inner
 }
 
 /// Shows a large text field for a device ID.
@@ -149,6 +172,20 @@ pub(super) fn muted(ui: &Ui, text: impl Into<String>) -> RichText {
 /// Returns `text` as a 15-point semibold section title.
 pub(super) fn title(text: impl Into<String>) -> RichText {
     RichText::new(text).font(theme::semibold(15.0))
+}
+
+/// Returns the width of `text` laid out in `font` on one line.
+pub(super) fn text_width(ui: &Ui, text: &str, font: egui::FontId) -> f32 {
+    ui.fonts_mut(|f| f.layout_no_wrap(text.to_string(), font, Color32::WHITE).size().x)
+}
+
+/// Shows a horizontal row of `width` points centred in the available width.
+pub(super) fn centered_row<R>(ui: &mut Ui, width: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
+    ui.horizontal(|ui| {
+        ui.add_space(((ui.available_width() - width) / 2.0).max(0.0));
+        add(ui)
+    })
+    .inner
 }
 
 /// Shows an on/off switch bound to `on`; the response is marked changed when toggled.
@@ -383,13 +420,17 @@ pub(super) fn toggle_icon(ui: &mut Ui, on: &mut bool, icon: char, tooltip: &str)
         (p.muted, Color32::TRANSPARENT)
     };
     let mut response = ui
-        .add(
-            Button::new(icons::text(icon, 16.0).color(fg))
-                .fill(fill)
-                .stroke(Stroke::NONE)
-                .corner_radius(RADIUS_CONTROL)
-                .min_size(Vec2::splat(32.0)),
-        )
+        .scope(|ui| {
+            ui.spacing_mut().button_padding = Vec2::splat(8.0);
+            ui.add(
+                Button::new(icons::text(icon, 16.0).color(fg))
+                    .fill(fill)
+                    .stroke(Stroke::NONE)
+                    .corner_radius(RADIUS_CONTROL)
+                    .min_size(Vec2::splat(32.0)),
+            )
+        })
+        .inner
         .on_hover_text(tooltip);
     if response.clicked() {
         *on = !*on;
@@ -523,3 +564,4 @@ mod tests {
         assert_eq!(initials("élan vital"), "ÉV");
     }
 }
+

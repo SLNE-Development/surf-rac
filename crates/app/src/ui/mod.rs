@@ -2,6 +2,7 @@
 //! prompt, the host's connections and each viewer session.
 
 mod icons;
+mod login;
 mod main_window;
 mod sessions;
 mod theme;
@@ -37,6 +38,10 @@ struct Forms {
     invite: String,
     /// Whether the login screen shows registration.
     register: bool,
+    /// Whether the sign-in password is shown in clear text.
+    show_password: bool,
+    /// Whether the server dialog is open.
+    server_dialog: bool,
     /// Host ID to connect to.
     connect_id: String,
     /// Password typed for the connection.

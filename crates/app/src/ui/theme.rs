@@ -154,7 +154,7 @@ pub(super) fn bold(size: f32) -> FontId {
 }
 
 /// Builds the font set: Inter first in the proportional family, the bold
-/// weights and Lucide as named families, and egui's default fonts behind
+/// weights and Lucide (backed by Inter) as named families, and egui's default fonts behind
 /// each Inter family for glyphs Inter lacks.
 fn font_definitions() -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
@@ -203,7 +203,7 @@ fn font_definitions() -> FontDefinitions {
     );
     fonts
         .families
-        .insert(FontFamily::Name(LUCIDE.into()), vec![LUCIDE.into()]);
+        .insert(FontFamily::Name(LUCIDE.into()), vec![LUCIDE.into(), "inter-regular".into()]);
     fonts
 }
 

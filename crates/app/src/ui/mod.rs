@@ -3,6 +3,7 @@
 
 mod main_window;
 mod sessions;
+mod theme;
 
 use std::collections::HashMap;
 
@@ -92,8 +93,10 @@ pub struct ClientApp {
 }
 
 impl ClientApp {
-    /// Creates the app around a started runtime; installs the keyboard hook on this thread.
-    pub fn new(runtime: Runtime) -> ClientApp {
+    /// Creates the app around a started runtime: installs the theme on `ctx`
+    /// and the keyboard hook on this thread.
+    pub fn new(ctx: &egui::Context, runtime: Runtime) -> ClientApp {
+        theme::install(ctx);
         let hook = match crate::keyhook::KeyHook::install() {
             Ok(hook) => Some(hook),
             Err(e) => {

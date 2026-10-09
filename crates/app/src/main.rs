@@ -37,8 +37,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("surf-rac")
-            .with_inner_size([720.0, 560.0])
-            .with_min_inner_size([520.0, 400.0]),
+            .with_inner_size([960.0, 640.0])
+            .with_min_inner_size([760.0, 560.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -47,7 +47,7 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             let ctx = cc.egui_ctx.clone();
             let runtime = Runtime::start(store, Arc::new(move || ctx.request_repaint()))?;
-            Ok(Box::new(ClientApp::new(runtime)))
+            Ok(Box::new(ClientApp::new(&cc.egui_ctx, runtime)))
         }),
     )
 }

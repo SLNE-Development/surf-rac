@@ -28,6 +28,8 @@ fn parse_id(raw: &str) -> Result<DeviceId, ApiError> {
 /// A different protocol version is a 426 `update_required`. A key registered
 /// with a different fingerprint is a 409 `clone_detected`. A key registered
 /// with the same fingerprint returns its existing ID and takes the new name.
+/// A missing or invalid registration signature is a 401 `bad_signature` and
+/// nothing is written.
 pub async fn register(
     State(state): State<AppState>,
     JsonBody(req): JsonBody<RegisterDeviceRequest>,
@@ -51,6 +53,13 @@ pub async fn register(
     if !devices::valid_name(&req.name) {
         return Err(ApiError::bad_request("name must be 1 to 64 characters"));
     }
+    let signature: [u8; 64] = STANDARD
+        .decode(&req.signature)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(ApiError::bad_signature)?;
+    devices::verify_registration(&public_key, &req.fingerprint_hash, &req.name, &signature)
+        .map_err(|_| ApiError::bad_signature())?;
     let id = devices::register(&state.db, &public_key, &req.fingerprint_hash, &req.name)
         .await
         .map_err(|err| match err {

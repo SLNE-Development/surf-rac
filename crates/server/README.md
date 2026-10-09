@@ -88,10 +88,15 @@ All endpoints are under `/v1`. The wire types are defined in the
 - `POST /devices`: registers an installation without an account. Body:
   `public_key` (standard base64 of the 32-byte Ed25519 identity public key),
   `fingerprint_hash` (64 lowercase hex characters), `name` (1 to 64
-  characters) and `protocol_version`. Returns the 9-digit `device_id`. The
-  same key and fingerprint return the existing ID and update the name; the
-  same key with another fingerprint is a 409 `clone_detected`; another
-  protocol version is a 426 `update_required`.
+  characters), `signature` and `protocol_version`. `signature` is standard
+  base64 of an Ed25519 signature by the identity key over
+  `surf-rac/register/v1`, the 32 public key bytes, the fingerprint hash
+  (UTF-8), a `0x00` byte and the name (UTF-8); a missing or invalid signature
+  is a 401 `bad_signature` and nothing is written. Returns the 9-digit
+  `device_id`. The same key and fingerprint return the existing ID and update
+  the name (which also needs a valid signature); the same key with another
+  fingerprint is a 409 `clone_detected`; another protocol version is a 426
+  `update_required`.
 - `GET /devices`, `DELETE /devices/{id}`: the devices linked to the account
 - `GET /contacts`, `PUT /contacts/{id}`, `DELETE /contacts/{id}`
 - `GET /presence/{id}`: online state of a device

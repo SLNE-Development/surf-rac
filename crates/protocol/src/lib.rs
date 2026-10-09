@@ -39,6 +39,30 @@ pub const CHALLENGE_DOMAIN: &[u8] = b"surf-rac/challenge/v1";
 /// the 32 bytes of its per-session X25519 public key with its identity key.
 pub const SESSION_DOMAIN: &[u8] = b"surf-rac/session/v1";
 
+/// Domain tag prefixed to the key, fingerprint and name of a signed device registration.
+///
+/// A registering installation signs the message built by [`register_message`]
+/// with its Ed25519 identity key to prove it holds the private key.
+pub const REGISTER_DOMAIN: &[u8] = b"surf-rac/register/v1";
+
+/// Builds the message a device registration signature covers.
+///
+/// The message is [`REGISTER_DOMAIN`], the 32 bytes of `public_key`, the UTF-8
+/// bytes of `fingerprint_hash`, a single `0x00` separator and the UTF-8 bytes
+/// of `name`. The fingerprint hash has a fixed length, so the separator keeps
+/// the boundary between the fingerprint hash and the name unambiguous.
+pub fn register_message(public_key: &[u8; 32], fingerprint_hash: &str, name: &str) -> Vec<u8> {
+    let mut message = Vec::with_capacity(
+        REGISTER_DOMAIN.len() + public_key.len() + fingerprint_hash.len() + 1 + name.len(),
+    );
+    message.extend_from_slice(REGISTER_DOMAIN);
+    message.extend_from_slice(public_key);
+    message.extend_from_slice(fingerprint_hash.as_bytes());
+    message.push(0);
+    message.extend_from_slice(name.as_bytes());
+    message
+}
+
 /// Smallest valid device ID.
 const DEVICE_ID_MIN: u32 = 100_000_000;
 
@@ -158,6 +182,11 @@ pub struct RegisterDeviceRequest {
     pub fingerprint_hash: String,
     /// Human-readable device name, 1 to 64 characters.
     pub name: String,
+    /// Ed25519 signature by the identity key over [`register_message`], standard base64 of 64 bytes.
+    ///
+    /// An absent field reads as an empty string, which never verifies.
+    #[serde(default)]
+    pub signature: String,
     /// Protocol version the client speaks.
     pub protocol_version: u32,
 }
@@ -249,6 +278,8 @@ pub enum ErrorCode {
     BadRequest,
     /// Credentials or session token are missing or invalid.
     Unauthorized,
+    /// A signature is missing or does not verify against the claimed identity key.
+    BadSignature,
     /// The caller may not act on this resource.
     Forbidden,
     /// The resource does not exist.
@@ -709,6 +740,29 @@ mod tests {
     fn domain_tags_are_fixed() {
         assert_eq!(CHALLENGE_DOMAIN, b"surf-rac/challenge/v1");
         assert_eq!(SESSION_DOMAIN, b"surf-rac/session/v1");
+        assert_eq!(REGISTER_DOMAIN, b"surf-rac/register/v1");
+    }
+
+    #[test]
+    fn register_message_layout_is_fixed() {
+        let key = [7u8; 32];
+        let msg = register_message(&key, "ab", "pc é");
+        let mut expected = b"surf-rac/register/v1".to_vec();
+        expected.extend_from_slice(&key);
+        expected.extend_from_slice(b"ab");
+        expected.push(0);
+        expected.extend_from_slice("pc é".as_bytes());
+        assert_eq!(msg, expected);
+    }
+
+    #[test]
+    fn register_request_without_signature_reads_as_empty() {
+        let missing: RegisterDeviceRequest = serde_json::from_value(json!({
+            "public_key":"a2V5","fingerprint_hash":"ab","name":"pc","protocol_version":2
+        }))
+        .unwrap();
+        assert!(missing.signature.is_empty());
+        assert_eq!(serde_json::to_value(ErrorCode::BadSignature).unwrap(), json!("bad_signature"));
     }
 
     #[test]
@@ -835,9 +889,10 @@ mod tests {
     #[test]
     fn register_device_bodies_round_trip() {
         let req: RegisterDeviceRequest = serde_json::from_value(json!({
-            "public_key":"a2V5","fingerprint_hash":"ab","name":"pc","protocol_version":2
+            "public_key":"a2V5","fingerprint_hash":"ab","name":"pc","signature":"c2ln","protocol_version":2
         }))
         .unwrap();
+        assert_eq!(req.signature, "c2ln");
         assert_eq!(req.protocol_version, PROTOCOL_VERSION);
         let resp = RegisterDeviceResponse { device_id: DeviceId::new(123_456_789).unwrap() };
         assert_eq!(

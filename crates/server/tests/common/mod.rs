@@ -112,6 +112,21 @@ pub fn sign_challenge(key: &SigningKey, nonce: &[u8]) -> String {
     STANDARD.encode(key.sign(&msg).to_bytes())
 }
 
+/// Signs a device registration with `signer` over the registration message of `key`.
+///
+/// Returns the signature as standard base64. `signer` differs from `key` to
+/// produce a registration signed by a key that does not match the request.
+pub fn sign_registration(
+    signer: &SigningKey,
+    key: &SigningKey,
+    fingerprint_hash: &str,
+    name: &str,
+) -> String {
+    let message =
+        surf_rac_protocol::register_message(key.verifying_key().as_bytes(), fingerprint_hash, name);
+    STANDARD.encode(signer.sign(&message).to_bytes())
+}
+
 /// A registered device identity: its ID, key and fingerprint.
 pub struct Identity {
     /// The device ID the server assigned.
@@ -182,16 +197,32 @@ impl TestApp {
     }
 
     /// Calls `POST /v1/devices` for `key`, `fingerprint_hash` and `name` at the current protocol version.
+    ///
+    /// The request is signed by `key` over exactly those values.
     pub async fn register_device(
         &self,
         key: &SigningKey,
         fingerprint_hash: &str,
         name: &str,
     ) -> reqwest::Response {
+        let signature = sign_registration(key, key, fingerprint_hash, name);
+        self.register_device_signed(key, fingerprint_hash, name, &signature)
+            .await
+    }
+
+    /// Calls `POST /v1/devices` for `key`, `fingerprint_hash` and `name` carrying the given base64 `signature`.
+    pub async fn register_device_signed(
+        &self,
+        key: &SigningKey,
+        fingerprint_hash: &str,
+        name: &str,
+        signature: &str,
+    ) -> reqwest::Response {
         self.register_device_raw(json!({
             "public_key": public_key_b64(key),
             "fingerprint_hash": fingerprint_hash,
             "name": name,
+            "signature": signature,
             "protocol_version": surf_rac_protocol::PROTOCOL_VERSION,
         }))
         .await

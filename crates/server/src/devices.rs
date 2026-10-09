@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, VerifyingKey};
 use rand::Rng;
 use sqlx::PgPool;
-use surf_rac_protocol::{CHALLENGE_DOMAIN, DeviceId};
+use surf_rac_protocol::{CHALLENGE_DOMAIN, DeviceId, register_message};
 
 /// Attempts at finding an unused random device ID before giving up.
 const ID_ATTEMPTS: usize = 10;
@@ -91,6 +91,25 @@ pub fn device_id(id: i64) -> DeviceId {
         .ok()
         .and_then(DeviceId::new)
         .expect("device ids in the database are 9-digit")
+}
+
+/// Checks the registration signature of an installation.
+///
+/// `signature` must be an Ed25519 signature by `public_key` over
+/// [`register_message`] of `public_key`, `fingerprint` and `name`, verified
+/// strictly. Fails with [`DeviceError::BadSignature`] otherwise.
+pub fn verify_registration(
+    public_key: &[u8; 32],
+    fingerprint: &str,
+    name: &str,
+    signature: &[u8; 64],
+) -> Result<(), DeviceError> {
+    let key = VerifyingKey::from_bytes(public_key).map_err(|_| DeviceError::BadSignature)?;
+    key.verify_strict(
+        &register_message(public_key, fingerprint, name),
+        &Signature::from_bytes(signature),
+    )
+    .map_err(|_| DeviceError::BadSignature)
 }
 
 /// Registers the installation with identity `public_key`, `fingerprint` and `name`.

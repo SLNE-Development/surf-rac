@@ -43,6 +43,15 @@ impl ApiError {
         )
     }
 
+    /// 401: a signature is missing or does not verify against the claimed identity key.
+    pub fn bad_signature() -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            ErrorCode::BadSignature,
+            "signature does not verify",
+        )
+    }
+
     /// 401 for a failed login, without revealing which part was wrong.
     pub fn invalid_credentials() -> Self {
         Self::new(

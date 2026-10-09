@@ -4,7 +4,7 @@ mod common;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use common::{fingerprint, identity_key, public_key_b64};
+use common::{fingerprint, identity_key, public_key_b64, sign_registration};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
@@ -90,6 +90,7 @@ async fn wrong_protocol_version_is_update_required(pool: PgPool) {
                 "public_key": public_key_b64(&key),
                 "fingerprint_hash": fingerprint(1),
                 "name": "pc",
+                "signature": sign_registration(&key, &key, &fingerprint(1), "pc"),
                 "protocol_version": version,
             }))
             .await;
@@ -110,15 +111,16 @@ async fn invalid_registration_input_400(pool: PgPool) {
     let good_key = public_key_b64(&identity_key());
     let weak_key = STANDARD.encode([0u8; 32]);
     let short_key = STANDARD.encode([7u8; 31]);
+    let sig = STANDARD.encode([1u8; 64]);
     let cases = [
-        json!({"public_key": good_key, "fingerprint_hash": "xyz", "name": "pc", "protocol_version": 2}),
-        json!({"public_key": good_key, "fingerprint_hash": "AB".repeat(32), "name": "pc", "protocol_version": 2}),
-        json!({"public_key": good_key, "fingerprint_hash": fingerprint(1), "name": "", "protocol_version": 2}),
-        json!({"public_key": good_key, "fingerprint_hash": fingerprint(1), "name": "x".repeat(65), "protocol_version": 2}),
-        json!({"public_key": "not base64!", "fingerprint_hash": fingerprint(1), "name": "pc", "protocol_version": 2}),
-        json!({"public_key": short_key, "fingerprint_hash": fingerprint(1), "name": "pc", "protocol_version": 2}),
-        json!({"public_key": weak_key, "fingerprint_hash": fingerprint(1), "name": "pc", "protocol_version": 2}),
-        json!({"fingerprint_hash": fingerprint(1), "name": "pc", "protocol_version": 2}),
+        json!({"public_key": good_key, "fingerprint_hash": "xyz", "name": "pc", "signature": sig, "protocol_version": 2}),
+        json!({"public_key": good_key, "fingerprint_hash": "AB".repeat(32), "name": "pc", "signature": sig, "protocol_version": 2}),
+        json!({"public_key": good_key, "fingerprint_hash": fingerprint(1), "name": "", "signature": sig, "protocol_version": 2}),
+        json!({"public_key": good_key, "fingerprint_hash": fingerprint(1), "name": "x".repeat(65), "signature": sig, "protocol_version": 2}),
+        json!({"public_key": "not base64!", "fingerprint_hash": fingerprint(1), "name": "pc", "signature": sig, "protocol_version": 2}),
+        json!({"public_key": short_key, "fingerprint_hash": fingerprint(1), "name": "pc", "signature": sig, "protocol_version": 2}),
+        json!({"public_key": weak_key, "fingerprint_hash": fingerprint(1), "name": "pc", "signature": sig, "protocol_version": 2}),
+        json!({"fingerprint_hash": fingerprint(1), "name": "pc", "signature": sig, "protocol_version": 2}),
     ];
     for body in cases {
         let res = app.register_device_raw(body.clone()).await;
@@ -170,4 +172,74 @@ async fn identity_key_lookup_returns_registered_key(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(unknown, None);
+}
+
+/// Counts the rows of the devices table.
+async fn device_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("select count(*) from devices")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn registration_without_signature_is_unauthorized_and_writes_nothing(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let key = identity_key();
+    let res = app
+        .register_device_raw(json!({
+            "public_key": public_key_b64(&key),
+            "fingerprint_hash": fingerprint(1),
+            "name": "pc",
+            "protocol_version": surf_rac_protocol::PROTOCOL_VERSION,
+        }))
+        .await;
+    assert_eq!(res.status(), 401);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["error"], "bad_signature");
+    assert_eq!(device_count(&app.pool).await, 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn registration_with_wrong_signature_is_unauthorized_and_writes_nothing(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let key = identity_key();
+    let other = identity_key();
+    let fp = fingerprint(1);
+    let by_other_key = sign_registration(&other, &key, &fp, "pc");
+    let over_other_name = sign_registration(&key, &key, &fp, "other");
+    let over_other_fingerprint = sign_registration(&key, &key, &fingerprint(2), "pc");
+    let malformed = STANDARD.encode([1u8; 10]);
+    for signature in [by_other_key, over_other_name, over_other_fingerprint, malformed] {
+        let res = app.register_device_signed(&key, &fp, "pc", &signature).await;
+        assert_eq!(res.status(), 401, "{signature}");
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["error"], "bad_signature");
+    }
+    assert_eq!(device_count(&app.pool).await, 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn renaming_needs_a_valid_signature(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let key = identity_key();
+    let fp = fingerprint(1);
+    assert_eq!(app.register_device(&key, &fp, "old").await.status(), 200);
+    let forged = sign_registration(&identity_key(), &key, &fp, "new");
+    let res = app.register_device_signed(&key, &fp, "new", &forged).await;
+    assert_eq!(res.status(), 401);
+    let reused = sign_registration(&key, &key, &fp, "old");
+    let res = app.register_device_signed(&key, &fp, "new", &reused).await;
+    assert_eq!(res.status(), 401);
+    let name: String = sqlx::query_scalar("select name from devices")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(name, "old");
+    assert_eq!(app.register_device(&key, &fp, "new").await.status(), 200);
+    let name: String = sqlx::query_scalar("select name from devices")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(name, "new");
 }

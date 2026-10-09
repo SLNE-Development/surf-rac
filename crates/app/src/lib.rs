@@ -12,6 +12,7 @@ pub mod keyhook;
 pub mod keys;
 pub mod logging;
 pub mod runtime;
+pub mod single_instance;
 pub mod store;
 pub mod ui;
 pub mod viewmap;

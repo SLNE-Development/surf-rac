@@ -7,6 +7,7 @@ use std::sync::Arc;
 use eframe::egui;
 use surf_rac_app::installation::{InstallationStore, PortableStore};
 use surf_rac_app::runtime::Runtime;
+use surf_rac_app::single_instance;
 use surf_rac_app::store::{Store, default_dir};
 use surf_rac_app::ui::ClientApp;
 
@@ -34,7 +35,15 @@ fn main() -> eframe::Result {
     let _log = surf_rac_app::logging::init();
     set_dpi_awareness();
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "surf-rac starting");
-    let store = Store::open(default_dir());
+    let state_dir = default_dir();
+    let _instance = match single_instance::acquire(&state_dir) {
+        single_instance::Acquired::First(guard) => guard,
+        single_instance::Acquired::AlreadyRunning => {
+            tracing::info!("another instance is running; its window was focused");
+            return Ok(());
+        }
+    };
+    let store = Store::open(state_dir);
     let installation: Arc<dyn InstallationStore> = Arc::new(PortableStore::new(store.clone()));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

@@ -11,8 +11,8 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use futures_util::{SinkExt, StreamExt};
 use surf_rac_protocol::{
-    ClientMessage, DeviceId, HEADER_DEVICE_ID, HEADER_PROTOCOL_VERSION, PROTOCOL_VERSION,
-    ServerMessage, WsErrorCode,
+    ClientMessage, DeviceId, ErrorBody, ErrorCode, HEADER_DEVICE_ID, HEADER_PROTOCOL_VERSION,
+    PROTOCOL_VERSION, ServerMessage, WsErrorCode,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message;
@@ -65,20 +65,25 @@ pub enum SignalingError {
 }
 
 impl SignalingError {
-    /// Returns the error for an upgrade the server refused with HTTP `status`.
+    /// Returns the error for an upgrade the server refused with HTTP
+    /// `status` and response `body`.
     ///
-    /// 426 is [`UpdateRequired`](Self::UpdateRequired), 404
-    /// [`UnknownDevice`](Self::UnknownDevice), 403
-    /// [`DeviceDisabled`](Self::DeviceDisabled) and 429
-    /// [`RateLimited`](Self::RateLimited); any other status is
-    /// [`Rejected`](Self::Rejected).
-    fn from_status(status: u16) -> Self {
-        match status {
-            426 => Self::UpdateRequired,
-            404 => Self::UnknownDevice,
-            403 => Self::DeviceDisabled,
-            429 => Self::RateLimited,
-            other => Self::Rejected(other),
+    /// 426 is [`UpdateRequired`](Self::UpdateRequired) and 429
+    /// [`RateLimited`](Self::RateLimited). A 404 is
+    /// [`UnknownDevice`](Self::UnknownDevice) and a 403
+    /// [`DeviceDisabled`](Self::DeviceDisabled) only when the body is the
+    /// server's error body with the matching code; without it, as from a
+    /// proxy, they and every other status are [`Rejected`](Self::Rejected).
+    fn from_response(status: u16, body: Option<&[u8]>) -> Self {
+        let code = body
+            .and_then(|b| serde_json::from_slice::<ErrorBody>(b).ok())
+            .map(|b| b.error);
+        match (status, code) {
+            (426, _) => Self::UpdateRequired,
+            (429, _) => Self::RateLimited,
+            (404, Some(ErrorCode::UnknownDevice)) => Self::UnknownDevice,
+            (403, Some(ErrorCode::DeviceDisabled)) => Self::DeviceDisabled,
+            (other, _) => Self::Rejected(other),
         }
     }
 
@@ -135,8 +140,8 @@ impl SignalingClient {
     /// `fingerprint_hash` is the lowercase hex SHA-256 of the device's hardware
     /// fingerprint.
     ///
-    /// A refused upgrade fails with the variant of its HTTP status (see
-    /// [`SignalingError`]), and a refused challenge answer with
+    /// A refused upgrade fails with the variant of its HTTP status and error
+    /// body (see [`SignalingError`]), and a refused challenge answer with
     /// [`BadSignature`](SignalingError::BadSignature),
     /// [`CloneDetected`](SignalingError::CloneDetected) or
     /// [`DeviceDisabled`](SignalingError::DeviceDisabled). Fails with
@@ -164,7 +169,10 @@ impl SignalingClient {
         let (mut ws, _) = match tokio_tungstenite::connect_async(request).await {
             Ok(ok) => ok,
             Err(tokio_tungstenite::tungstenite::Error::Http(res)) => {
-                return Err(SignalingError::from_status(res.status().as_u16()));
+                return Err(SignalingError::from_response(
+                    res.status().as_u16(),
+                    res.body().as_deref(),
+                ));
             }
             Err(e) => return Err(SignalingError::Connect(e.to_string())),
         };
@@ -346,27 +354,56 @@ async fn run(ws: Ws, mut out_rx: mpsc::Receiver<ClientMessage>, inner: Arc<Inner
 mod tests {
     use super::*;
 
+    /// Returns an error body with `code` as the server sends it.
+    fn body(code: &str) -> Vec<u8> {
+        format!(r#"{{"error":"{code}","message":"m"}}"#).into_bytes()
+    }
+
     #[test]
     fn refused_upgrades_map_to_typed_errors() {
+        let cases = [
+            (426, None, SignalingError::UpdateRequired),
+            (429, None, SignalingError::RateLimited),
+            (401, None, SignalingError::Rejected(401)),
+            (
+                404,
+                Some(body("unknown_device")),
+                SignalingError::UnknownDevice,
+            ),
+            (
+                403,
+                Some(body("device_disabled")),
+                SignalingError::DeviceDisabled,
+            ),
+        ];
+        for (status, body, expected) in cases {
+            assert_eq!(
+                SignalingError::from_response(status, body.as_deref()),
+                expected,
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn untyped_403_and_404_are_plain_rejections() {
+        for status in [403, 404] {
+            assert_eq!(
+                SignalingError::from_response(status, None),
+                SignalingError::Rejected(status)
+            );
+            assert_eq!(
+                SignalingError::from_response(status, Some(b"<html>Not Found</html>")),
+                SignalingError::Rejected(status)
+            );
+            assert_eq!(
+                SignalingError::from_response(status, Some(&body("not_found"))),
+                SignalingError::Rejected(status)
+            );
+        }
         assert_eq!(
-            SignalingError::from_status(426),
-            SignalingError::UpdateRequired
-        );
-        assert_eq!(
-            SignalingError::from_status(404),
-            SignalingError::UnknownDevice
-        );
-        assert_eq!(
-            SignalingError::from_status(403),
-            SignalingError::DeviceDisabled
-        );
-        assert_eq!(
-            SignalingError::from_status(429),
-            SignalingError::RateLimited
-        );
-        assert_eq!(
-            SignalingError::from_status(401),
-            SignalingError::Rejected(401)
+            SignalingError::from_response(404, Some(&body("device_disabled"))),
+            SignalingError::Rejected(404)
         );
     }
 

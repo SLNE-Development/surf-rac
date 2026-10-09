@@ -191,3 +191,35 @@ async fn replaced_connection_ends_subscribers(pool: PgPool) {
     .unwrap();
     assert_eq!(err, SignalingError::Closed);
 }
+
+/// Serves one connection with a bare HTTP `status` response that has no error body.
+async fn bare_status_server(status: &'static str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf).await;
+        let response =
+            format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+        let _ = stream.write_all(response.as_bytes()).await;
+    });
+    format!("ws://{addr}")
+}
+
+#[tokio::test]
+async fn bare_404_and_403_without_error_body_are_plain_rejections() {
+    let identity = IdentityKey::generate();
+    let id = "123456789".parse().unwrap();
+    let fingerprint = "ab".repeat(32);
+    for (status, code) in [("404 Not Found", 404), ("403 Forbidden", 403)] {
+        let url = bare_status_server(status).await;
+        let result = SignalingClient::connect(&url, id, &identity, &fingerprint).await;
+        assert_eq!(
+            result.err(),
+            Some(SignalingError::Rejected(code)),
+            "{status}"
+        );
+    }
+}

@@ -585,3 +585,26 @@ async fn request_awaiting_password_cannot_be_accepted(pool: PgPool) {
     );
     host.deny("waiting").await.unwrap();
 }
+
+#[sqlx::test(migrations = "../server/migrations")]
+async fn eleventh_request_to_one_host_fails_fast_as_rate_limited(pool: PgPool) {
+    let env = TestEnv::start_with(pool, &common::env("LIVEKIT_URL"), |state| {
+        let mut config = common::test_config(&common::env("LIVEKIT_URL"));
+        config.session_requests_per_minute = 10;
+        state.limits = std::sync::Arc::new(surf_rac_server::limits::Limits::from_config(&config));
+    })
+    .await;
+    let (h, v) = (env.device("host", 1).await, env.device("viewer", 2).await);
+    let ephemeral = Ephemeral::generate();
+    for i in 0..10 {
+        send_request(&v, h.id, &format!("fill-{i}"), &ephemeral, &ephemeral).await;
+    }
+    let started = Instant::now();
+    let result = request(&v, h.id, SessionConfig::default()).await.unwrap();
+    assert_eq!(result.err(), Some(RequestError::RateLimited));
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "took {:?}",
+        started.elapsed()
+    );
+}

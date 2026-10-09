@@ -101,6 +101,11 @@ pub enum RequestError {
     /// The signaling connection failed.
     #[error(transparent)]
     Signaling(#[from] SignalingError),
+    /// The server refused to relay the request because the host received
+    /// too many session requests, or this connection sent too many messages,
+    /// within its rate window.
+    #[error("too many session requests")]
+    RateLimited,
 }
 
 /// A connected viewer session; cheap to clone.
@@ -169,7 +174,9 @@ impl ViewerSession {
     /// differs from the pin with [`RequestError::KeyChanged`]. After a
     /// challenge, an accepted response must carry the challenge's per-session
     /// key, signature and host nonce, or the request fails with
-    /// [`RequestError::ChallengeMismatch`].
+    /// [`RequestError::ChallengeMismatch`]. When the server refuses to relay
+    /// the request because of its rate limits before the host answered, the
+    /// request fails at once with [`RequestError::RateLimited`].
     pub async fn request_with(
         signaling: SignalingClient,
         identity: Arc<IdentityKey>,
@@ -207,6 +214,12 @@ impl ViewerSession {
                         ..
                     }) if key.is_none() => {
                         return Err(RequestError::Offline);
+                    }
+                    Some(ServerMessage::Error {
+                        code: WsErrorCode::RateLimited,
+                        ..
+                    }) if key.is_none() && challenge.is_none() => {
+                        return Err(RequestError::RateLimited);
                     }
                     Some(ServerMessage::PasswordChallenge {
                         from,

@@ -482,7 +482,8 @@ pub fn password_to_send(offer: Option<(String, bool)>, pinned: bool) -> Option<S
 
 /// Returns whether a failed request should offer to forget the saved
 /// password: only when the saved password was actually sent and the host
-/// refused or never answered, as a host with a changed password does.
+/// refused or never answered, as a host with a changed password does. A
+/// request the server refused as rate limited never offers it.
 pub fn offer_forget(sent_saved: bool, error: &RequestError) -> bool {
     sent_saved && matches!(error, RequestError::Denied | RequestError::Timeout)
 }
@@ -503,6 +504,9 @@ pub fn request_error_text(error: &RequestError) -> String {
             "The host's answer did not match its security check. The connection was refused for safety.".into()
         }
         RequestError::Signaling(_) => "The connection to the server was lost.".into(),
+        RequestError::RateLimited => {
+            "The host is receiving too many requests. Try again in a minute.".into()
+        }
     }
 }
 
@@ -613,6 +617,7 @@ mod tests {
         assert!(offer_forget(true, &RequestError::Timeout));
         assert!(!offer_forget(false, &RequestError::Denied));
         assert!(!offer_forget(true, &RequestError::Offline));
+        assert!(!offer_forget(true, &RequestError::RateLimited));
     }
 
     #[test]
@@ -642,6 +647,7 @@ mod tests {
             RequestError::TokenRejected,
             RequestError::MediaUnavailable("x".into()),
             RequestError::ChallengeMismatch,
+            RequestError::RateLimited,
         ] {
             assert!(request_error_text(&error).ends_with('.'));
         }

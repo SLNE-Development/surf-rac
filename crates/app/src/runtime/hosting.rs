@@ -211,9 +211,13 @@ impl Actor {
             HostEvent::ViewerRequested {
                 session_id,
                 viewer,
+                name,
                 fingerprint,
                 ..
-            } => self.on_request(session_id, *viewer, fingerprint),
+            } => {
+                self.on_request(session_id, *viewer, name, fingerprint)
+                    .await
+            }
             HostEvent::PasswordReceived {
                 session_id,
                 viewer,
@@ -299,31 +303,58 @@ impl Actor {
     }
 
     /// Tells the host session whether viewers may send the unattended
-    /// password: whenever one is set.
+    /// password: unattended access is on, a password is set and password
+    /// access is not locked out.
     pub(super) fn update_password_access(&self) {
-        let set = self.store.state().settings.password_hash.is_some();
+        let settings = self.store.state().settings;
+        let available = access::password_access_available(
+            settings.unattended,
+            settings.password_hash.is_some(),
+            false,
+            self.lockout.is_locked(Instant::now()),
+        );
         if let Some(host) = &self.host {
-            host.session.set_password_access(set);
+            host.session.set_password_access(available);
         }
     }
 
     /// Shows a prompt for a session request, with what the password check
-    /// found when the request fell back from a password.
-    fn on_request(&mut self, session_id: &str, viewer: DeviceId, fingerprint: &str) {
+    /// found when the request fell back from a password. An open prompt of
+    /// the same viewer is replaced and its request denied.
+    async fn on_request(
+        &mut self,
+        session_id: &str,
+        viewer: DeviceId,
+        name: &str,
+        fingerprint: &str,
+    ) {
         self.persist_known();
-        let name = self.name_of(viewer);
+        let alias = self
+            .contacts
+            .iter()
+            .find(|c| c.id == viewer)
+            .map(|c| c.alias.clone());
         let Some(host) = self.host.as_mut() else {
             return;
         };
         let note = host.notes.remove(session_id).unwrap_or(PromptNote::None);
-        host.prompts.retain(|p| p.session_id != session_id);
-        host.prompts.push(PromptView {
-            session_id: session_id.to_string(),
-            viewer,
-            name,
-            fingerprint: fingerprint.to_string(),
-            note,
-        });
+        let replaced = access::open_prompt(
+            &mut host.prompts,
+            PromptView {
+                session_id: session_id.to_string(),
+                viewer,
+                name: name.to_string(),
+                alias,
+                fingerprint: fingerprint.to_string(),
+                note,
+            },
+        );
+        for old in replaced {
+            host.notes.remove(&old);
+            if let Err(e) = host.session.deny(&old).await {
+                tracing::debug!(error = %e, "replaced request not denied");
+            }
+        }
     }
 
     /// Decides a request whose viewer sent the unattended password: admits
@@ -343,7 +374,8 @@ impl Actor {
             .map(|h| h.expose().to_string());
         let unattended = settings.unattended && hash.is_some();
         let check = access::check_password(password.map(Password::as_str), hash.as_deref());
-        let decision = access::decide(check, unattended, &mut self.lockout, viewer, Instant::now());
+        let decision = access::decide(check, unattended, &mut self.lockout, Instant::now());
+        self.update_password_access();
         tracing::info!(viewer = %viewer, ?check, ?decision, "unattended password received");
         match decision {
             Decision::Accept => self.accept_request(session_id, viewer).await,

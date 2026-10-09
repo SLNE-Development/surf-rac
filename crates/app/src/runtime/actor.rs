@@ -209,7 +209,7 @@ pub(super) struct Actor {
     /// The clipboard.
     pub(super) clipboard: Clipboard,
     /// Password lockout bookkeeping.
-    pub(super) lockout: access::Lockout,
+    pub(super) lockout: access::HostLockout,
     /// Grants per viewer, remembered for the process lifetime.
     pub(super) grants: std::collections::HashMap<DeviceId, surf_rac_input::Grants>,
 }
@@ -288,7 +288,7 @@ impl Actor {
             contacts: Vec::new(),
             banner: None,
             clipboard: open_clipboard(),
-            lockout: access::Lockout::default(),
+            lockout: access::HostLockout::default(),
             grants: Default::default(),
         }
     }
@@ -319,6 +319,7 @@ impl Actor {
                 _ = tick.tick() => {
                     self.poll_clipboard().await;
                     self.prune_unjoined().await;
+                    self.update_password_access();
                 }
             }
             self.publish();

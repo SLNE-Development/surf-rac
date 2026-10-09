@@ -102,6 +102,11 @@ impl ClientApp {
                                     )
                                     .truncate(),
                                 );
+                                if let Some(alias) = &prompt.alias {
+                                    ui.label(
+                                        widgets::muted(ui, format!("Contact {alias}")).size(13.0),
+                                    );
+                                }
                                 ui.horizontal(|ui| {
                                     ui.spacing_mut().item_spacing.x = 6.0;
                                     ui.label(widgets::muted(ui, "Device").size(13.0));

@@ -1,22 +1,15 @@
 //! Whether a host admits a session request: unattended password checks with
-//! brute-force lockout, falling back to asking the person at the host.
+//! host-wide brute-force lockout, falling back to asking the person at the host.
 
-use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
+use crate::runtime::PromptView;
 use argon2::Argon2;
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use surf_rac_protocol::DeviceId;
 
-/// Wrong passwords from one viewer device that lock it out.
-pub const VIEWER_LIMIT: u32 = 5;
-
-/// Wrong passwords from all viewers within [`WINDOW`] that lock everyone out.
-pub const GLOBAL_LIMIT: usize = 20;
-
-/// Window over which wrong passwords count towards [`GLOBAL_LIMIT`].
-pub const WINDOW: Duration = Duration::from_secs(15 * 60);
+/// Wrong unattended passwords, from any viewers, that lock password access.
+pub const FAILURE_LIMIT: u32 = 5;
 
 /// How long a lockout lasts.
 pub const LOCKOUT: Duration = Duration::from_secs(15 * 60);
@@ -41,66 +34,46 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
     })
 }
 
-/// Failed attempts of one viewer device.
+/// Host-wide brute-force bookkeeping for unattended passwords, held in memory.
 #[derive(Debug, Default)]
-struct ViewerFailures {
-    /// Wrong passwords since the last success or lockout.
-    count: u32,
+pub struct HostLockout {
+    /// Wrong passwords from any viewer since the last lockout.
+    failures: u32,
     /// End of the current lockout, if any.
     locked_until: Option<Instant>,
 }
 
-/// Brute-force bookkeeping for unattended passwords, held in memory.
-#[derive(Debug, Default)]
-pub struct Lockout {
-    /// Failures per viewer device.
-    viewers: HashMap<DeviceId, ViewerFailures>,
-    /// Times of recent failures from any viewer, oldest first.
-    recent: VecDeque<Instant>,
-    /// End of the current lockout of all viewers, if any.
-    global_until: Option<Instant>,
+impl HostLockout {
+    /// Returns whether password access is locked at `now`.
+    pub fn is_locked(&self, now: Instant) -> bool {
+        self.locked_until.is_some_and(|until| now < until)
+    }
+
+    /// Counts a wrong password at `now`; the [`FAILURE_LIMIT`]th failure locks
+    /// password access for [`LOCKOUT`].
+    pub fn record_failure(&mut self, now: Instant) {
+        if self.locked_until.is_some_and(|until| now >= until) {
+            self.locked_until = None;
+            self.failures = 0;
+        }
+        self.failures += 1;
+        if self.failures >= FAILURE_LIMIT {
+            self.failures = 0;
+            self.locked_until = Some(now + LOCKOUT);
+        }
+    }
 }
 
-impl Lockout {
-    /// Returns whether password admission is locked for `viewer` at `now`.
-    pub fn locked(&self, viewer: DeviceId, now: Instant) -> bool {
-        self.global_until.is_some_and(|until| now < until)
-            || self
-                .viewers
-                .get(&viewer)
-                .and_then(|v| v.locked_until)
-                .is_some_and(|until| now < until)
-    }
-
-    /// Counts a wrong password from `viewer` at `now`, starting lockouts at the limits.
-    pub fn fail(&mut self, viewer: DeviceId, now: Instant) {
-        let entry = self.viewers.entry(viewer).or_default();
-        if entry.locked_until.is_some_and(|until| now >= until) {
-            entry.locked_until = None;
-        }
-        entry.count += 1;
-        if entry.count >= VIEWER_LIMIT {
-            entry.count = 0;
-            entry.locked_until = Some(now + LOCKOUT);
-        }
-        while self
-            .recent
-            .front()
-            .is_some_and(|t| now.saturating_duration_since(*t) >= WINDOW)
-        {
-            self.recent.pop_front();
-        }
-        self.recent.push_back(now);
-        if self.recent.len() >= GLOBAL_LIMIT {
-            self.recent.clear();
-            self.global_until = Some(now + LOCKOUT);
-        }
-    }
-
-    /// Forgets the failures of `viewer` after a correct password.
-    pub fn succeed(&mut self, viewer: DeviceId) {
-        self.viewers.remove(&viewer);
-    }
+/// Returns whether viewers may offer the unattended password: unattended
+/// access is enabled, a password is set, the host is not attended-only and
+/// password access is not locked out.
+pub fn password_access_available(
+    enabled: bool,
+    password_set: bool,
+    attended_only: bool,
+    locked: bool,
+) -> bool {
+    enabled && password_set && !attended_only && !locked
 }
 
 /// What checking a request's password found.
@@ -137,7 +110,7 @@ pub enum PromptNote {
     CorrectPassword,
     /// The viewer supplied a wrong password.
     WrongPassword,
-    /// Password admission is locked for this viewer.
+    /// Password admission is locked for the whole host.
     LockedOut,
 }
 
@@ -150,51 +123,56 @@ pub enum Decision {
     Prompt(PromptNote),
 }
 
-/// Decides a request from `viewer` given its password check and whether
-/// unattended access is on, updating `lockout`.
+/// Decides a request given its password check and whether unattended access
+/// is on, updating `lockout`.
 ///
 /// Only a correct password with unattended access on and no lockout admits a
 /// viewer; every other case asks the person at the host. Wrong and unreadable
-/// passwords count as failures unless the viewer is already locked out.
+/// passwords count as failures unless password access is already locked.
 pub fn decide(
     check: PasswordCheck,
     unattended: bool,
-    lockout: &mut Lockout,
-    viewer: DeviceId,
+    lockout: &mut HostLockout,
     now: Instant,
 ) -> Decision {
     if check == PasswordCheck::Absent {
         return Decision::Prompt(PromptNote::None);
     }
-    if lockout.locked(viewer, now) {
+    if lockout.is_locked(now) {
         return Decision::Prompt(PromptNote::LockedOut);
     }
     match check {
         PasswordCheck::Absent => Decision::Prompt(PromptNote::None),
         PasswordCheck::Wrong | PasswordCheck::Unreadable => {
-            lockout.fail(viewer, now);
+            lockout.record_failure(now);
             Decision::Prompt(PromptNote::WrongPassword)
         }
-        PasswordCheck::Correct => {
-            lockout.succeed(viewer);
-            if unattended {
-                Decision::Accept
-            } else {
-                Decision::Prompt(PromptNote::CorrectPassword)
-            }
-        }
+        PasswordCheck::Correct if unattended => Decision::Accept,
+        PasswordCheck::Correct => Decision::Prompt(PromptNote::CorrectPassword),
     }
+}
+
+/// Opens `prompt`, replacing any open prompt of the same viewer.
+///
+/// Returns the session IDs of the replaced prompts, whose requests the caller
+/// must deny.
+pub fn open_prompt(prompts: &mut Vec<PromptView>, prompt: PromptView) -> Vec<String> {
+    let mut replaced = Vec::new();
+    prompts.retain(|p| {
+        let same = p.viewer == prompt.viewer || p.session_id == prompt.session_id;
+        if same && p.session_id != prompt.session_id {
+            replaced.push(p.session_id.clone());
+        }
+        !same
+    });
+    prompts.push(prompt);
+    replaced
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
-    use surf_rac_protocol::DeviceId;
-
-    fn id(n: u32) -> DeviceId {
-        DeviceId::new(100_000_000 + n).unwrap()
-    }
+    use std::time::Instant;
 
     #[test]
     fn received_passwords_are_checked_against_the_hash() {
@@ -220,96 +198,37 @@ mod tests {
     }
 
     #[test]
-    fn five_failures_lock_only_that_viewer() {
-        let mut lockout = Lockout::default();
-        let now = Instant::now();
-        for _ in 0..4 {
-            lockout.fail(id(1), now);
-        }
-        assert!(!lockout.locked(id(1), now));
-        lockout.fail(id(1), now);
-        assert!(lockout.locked(id(1), now));
-        assert!(!lockout.locked(id(2), now));
-        assert!(!lockout.locked(id(1), now + LOCKOUT));
-    }
-
-    #[test]
-    fn success_resets_a_viewers_count() {
-        let mut lockout = Lockout::default();
-        let now = Instant::now();
-        for _ in 0..4 {
-            lockout.fail(id(1), now);
-        }
-        lockout.succeed(id(1));
-        lockout.fail(id(1), now);
-        assert!(!lockout.locked(id(1), now));
-    }
-
-    #[test]
-    fn twenty_failures_across_viewers_lock_everyone() {
-        let mut lockout = Lockout::default();
-        let now = Instant::now();
-        for n in 0..19 {
-            lockout.fail(id(n), now);
-        }
-        assert!(!lockout.locked(id(99), now));
-        lockout.fail(id(19), now);
-        assert!(lockout.locked(id(99), now));
-        assert!(!lockout.locked(id(99), now + LOCKOUT));
-    }
-
-    #[test]
-    fn global_window_slides() {
-        let mut lockout = Lockout::default();
-        let start = Instant::now();
-        for n in 0..19 {
-            lockout.fail(id(n), start);
-        }
-        let later = start + WINDOW + Duration::from_secs(1);
-        lockout.fail(id(50), later);
-        assert!(!lockout.locked(id(99), later));
+    fn password_access_follows_toggle_hash_attended_only_and_lockout() {
+        assert!(password_access_available(true, true, false, false));
+        assert!(!password_access_available(false, true, false, false));
+        assert!(!password_access_available(true, false, false, false));
+        assert!(!password_access_available(true, true, true, false));
+        assert!(!password_access_available(true, true, false, true));
     }
 
     #[test]
     fn decisions() {
         let now = Instant::now();
-        let mut lockout = Lockout::default();
+        let mut lockout = HostLockout::default();
         assert_eq!(
-            decide(PasswordCheck::Absent, true, &mut lockout, id(1), now),
+            decide(PasswordCheck::Absent, true, &mut lockout, now),
             Decision::Prompt(PromptNote::None)
         );
         assert_eq!(
-            decide(PasswordCheck::Correct, true, &mut lockout, id(1), now),
+            decide(PasswordCheck::Correct, true, &mut lockout, now),
             Decision::Accept
         );
         assert_eq!(
-            decide(PasswordCheck::Correct, false, &mut lockout, id(1), now),
+            decide(PasswordCheck::Correct, false, &mut lockout, now),
             Decision::Prompt(PromptNote::CorrectPassword)
         );
         assert_eq!(
-            decide(PasswordCheck::Wrong, true, &mut lockout, id(1), now),
+            decide(PasswordCheck::Wrong, true, &mut lockout, now),
             Decision::Prompt(PromptNote::WrongPassword)
         );
         assert_eq!(
-            decide(PasswordCheck::Unreadable, true, &mut lockout, id(1), now),
+            decide(PasswordCheck::Unreadable, true, &mut lockout, now),
             Decision::Prompt(PromptNote::WrongPassword)
-        );
-    }
-
-    #[test]
-    fn locked_viewer_is_prompted_even_with_the_right_password() {
-        let now = Instant::now();
-        let mut lockout = Lockout::default();
-        for _ in 0..5 {
-            decide(PasswordCheck::Wrong, true, &mut lockout, id(1), now);
-        }
-        assert_eq!(
-            decide(PasswordCheck::Correct, true, &mut lockout, id(1), now),
-            Decision::Prompt(PromptNote::LockedOut)
-        );
-        assert_eq!(
-            decide(PasswordCheck::Wrong, true, &mut lockout, id(1), now),
-            Decision::Prompt(PromptNote::LockedOut)
         );
     }
 }

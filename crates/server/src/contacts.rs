@@ -1,4 +1,7 @@
 //! Per-account contact book in the database.
+//!
+//! A contact names a device ID that need not be registered, so a contact can
+//! be added before the device exists or kept after it re-registers elsewhere.
 
 use sqlx::PgPool;
 use surf_rac_protocol::DeviceId;
@@ -22,27 +25,24 @@ pub async fn list(db: &PgPool, user_id: i64) -> Result<Vec<ContactRow>, sqlx::Er
     .await
 }
 
-/// Adds `device` to `user_id`'s contacts or renames it; false when the device does not exist.
+/// Adds `device` to `user_id`'s contacts with `alias`, or renames it when it is already there.
+///
+/// The device does not have to be registered.
 pub async fn put(
     db: &PgPool,
     user_id: i64,
     device: DeviceId,
     alias: &str,
-) -> Result<bool, sqlx::Error> {
-    let res = sqlx::query(
-        "insert into contacts (user_id, device_id, alias) values ($1, $2, $3) \
-         on conflict (user_id, device_id) do update set alias = excluded.alias",
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "insert into contacts (user_id, device_id, alias) values ($1, $2, $3)          on conflict (user_id, device_id) do update set alias = excluded.alias",
     )
     .bind(user_id)
     .bind(i64::from(device.get()))
     .bind(alias)
     .execute(db)
-    .await;
-    match res {
-        Ok(_) => Ok(true),
-        Err(sqlx::Error::Database(e)) if e.is_foreign_key_violation() => Ok(false),
-        Err(e) => Err(e),
-    }
+    .await?;
+    Ok(())
 }
 
 /// Removes `device` from `user_id`'s contacts.
@@ -55,12 +55,14 @@ pub async fn delete(db: &PgPool, user_id: i64, device: DeviceId) -> Result<(), s
     Ok(())
 }
 
-/// Returns the users who watch `device`: every account linked to it and every
-/// account with it as a contact.
-pub async fn watchers(db: &PgPool, device: DeviceId) -> Result<Vec<i64>, sqlx::Error> {
+/// Returns the devices that receive presence of `device`, without duplicates.
+///
+/// The watchers of a device are the users linked to it and the users with it
+/// as a contact; the result is every device linked to any watcher, except
+/// `device` itself.
+pub async fn watcher_devices(db: &PgPool, device: DeviceId) -> Result<Vec<i64>, sqlx::Error> {
     sqlx::query_scalar(
-        "select user_id from device_links where device_id = $1 \
-         union select user_id from contacts where device_id = $1",
+        "select distinct l.device_id from device_links l          where l.device_id <> $1 and l.user_id in (              select user_id from device_links where device_id = $1              union select user_id from contacts where device_id = $1)",
     )
     .bind(i64::from(device.get()))
     .fetch_all(db)

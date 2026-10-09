@@ -6,7 +6,7 @@ mod health;
 mod ws;
 
 use axum::Router;
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 
 use crate::state::AppState;
 
@@ -17,8 +17,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/register", post(accounts::register))
         .route("/v1/login", post(accounts::login))
         .route("/v1/logout", post(accounts::logout))
-        .route("/v1/devices", post(devices::register).get(devices::list))
-        .route("/v1/devices/{id}", axum::routing::delete(devices::delete))
+        .route("/v1/account", delete(accounts::delete_account))
+        .route("/v1/devices", post(devices::register))
+        .route("/v1/my-devices", get(devices::my_devices))
+        .route("/v1/my-devices/{id}", delete(devices::unlink_my_device))
         .route("/v1/contacts", get(devices::list_contacts))
         .route(
             "/v1/contacts/{id}",

@@ -185,6 +185,64 @@ impl TestApp {
         body["token"].as_str().unwrap().to_owned()
     }
 
+    /// Calls `DELETE /v1/account` with `token` and `password`.
+    pub async fn delete_account(&self, token: &str, password: &str) -> reqwest::Response {
+        self.client
+            .delete(self.url("/v1/account"))
+            .bearer_auth(token)
+            .header("x-forwarded-for", fresh_ip())
+            .json(&json!({"password": password}))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// Calls `GET /v1/my-devices` with `token` and returns the parsed list; asserts 200.
+    pub async fn my_devices(&self, token: &str) -> Vec<Value> {
+        let res = self
+            .client
+            .get(self.url("/v1/my-devices"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        res.json().await.unwrap()
+    }
+
+    /// Returns the device IDs listed by `GET /v1/my-devices` for `token`.
+    pub async fn my_device_ids(&self, token: &str) -> Vec<String> {
+        self.my_devices(token)
+            .await
+            .iter()
+            .map(|d| d["device_id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// Calls `PUT /v1/contacts/{device_id}` with `token` and `alias`.
+    pub async fn put_contact(
+        &self,
+        token: &str,
+        device_id: &str,
+        alias: &str,
+    ) -> reqwest::Response {
+        self.client
+            .put(self.url(&format!("/v1/contacts/{device_id}")))
+            .bearer_auth(token)
+            .json(&json!({"alias": alias}))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// Counts the rows of `table` matching the SQL condition `filter`.
+    pub async fn count(&self, table: &str, filter: &str) -> i64 {
+        sqlx::query_scalar(&format!("select count(*) from {table} where {filter}"))
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+    }
+
     /// Calls `POST /v1/devices` with `body`, from a fresh client IP and without credentials.
     pub async fn register_device_raw(&self, body: Value) -> reqwest::Response {
         self.client

@@ -6,11 +6,6 @@ use common::{PASSWORD, TestApp};
 use sqlx::PgPool;
 use surf_rac_server::admin;
 
-/// Returns the invite code printed by `create_invite` (its last word).
-fn code_from(output: &str) -> String {
-    output.split_whitespace().last().unwrap().to_owned()
-}
-
 /// Returns the status of a logout probe with `token`.
 async fn probe(app: &TestApp, token: &str) -> u16 {
     app.client
@@ -46,53 +41,57 @@ async fn create_admin_validates_input(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn create_invite_is_redeemable(pool: PgPool) {
-    let app = common::spawn(pool).await;
-    let out = admin::create_invite(&app.pool, 1).await.unwrap();
-    assert_eq!(
-        app.register(&code_from(&out), "alice", PASSWORD)
-            .await
-            .status(),
-        201
-    );
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn create_invite_rejects_nonpositive_hours(pool: PgPool) {
-    assert!(admin::create_invite(&pool, 0).await.is_err());
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn revoke_invite_blocks_redemption(pool: PgPool) {
-    let app = common::spawn(pool).await;
-    let code = code_from(&admin::create_invite(&app.pool, 72).await.unwrap());
-    let id: i64 = sqlx::query_scalar("select id from invites")
-        .fetch_one(&app.pool)
-        .await
-        .unwrap();
-    admin::revoke_invite(&app.pool, id).await.unwrap();
-    assert_eq!(app.register(&code, "alice", PASSWORD).await.status(), 400);
-    assert!(admin::revoke_invite(&app.pool, id + 100).await.is_err());
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn list_invites_never_prints_code(pool: PgPool) {
-    let code = code_from(&admin::create_invite(&pool, 72).await.unwrap());
-    let listing = admin::list_invites(&pool).await.unwrap();
-    assert!(!listing.contains(&code));
-    assert!(listing.contains("unused"));
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn list_users_shows_flags(pool: PgPool) {
+async fn list_users_shows_flags_and_linked_devices(pool: PgPool) {
     let app = common::spawn(pool).await;
     admin::create_admin(&app.pool, "root", PASSWORD)
         .await
         .unwrap();
-    app.register_and_login("alice").await;
+    let alice = app.register_and_login("alice").await;
+    let _one = app.linked_device(1, &alice).await;
+    let _two = app.linked_device(2, &alice).await;
     let listing = admin::list_users(&app.pool).await.unwrap();
-    assert!(listing.contains("root") && listing.contains("admin"));
-    assert!(listing.contains("alice"));
+    let root = listing.lines().find(|l| l.starts_with("root\t")).unwrap();
+    assert_eq!(root.split('\t').nth(1), Some("admin"));
+    assert_eq!(root.split('\t').nth(2), Some("0"));
+    let alice = listing.lines().find(|l| l.starts_with("alice\t")).unwrap();
+    assert_eq!(alice.split('\t').nth(1), Some("-"));
+    assert_eq!(alice.split('\t').nth(2), Some("2"));
+}
+
+/// Runs the server binary with `args` and returns its exit status, stdout and stderr.
+fn cli(args: &[&str]) -> (bool, String, String) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_surf-rac-server"))
+        .args(args)
+        .env_remove("DATABASE_URL")
+        .output()
+        .unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn cli_has_no_invite_commands() {
+    let (ok, help, _) = cli(&["--help"]);
+    assert!(ok);
+    assert!(!help.to_lowercase().contains("invite"), "{help}");
+    for command in [
+        "create-admin",
+        "list-users",
+        "disable-user",
+        "enable-user",
+        "reset-password",
+        "revoke-sessions",
+    ] {
+        assert!(help.contains(command), "{command} missing: {help}");
+    }
+    for command in ["create-invite", "list-invites", "revoke-invite"] {
+        let (ok, _, err) = cli(&[command]);
+        assert!(!ok, "{command}");
+        assert!(err.contains("unrecognized subcommand"), "{command}: {err}");
+    }
 }
 
 #[sqlx::test(migrations = "./migrations")]

@@ -1,8 +1,8 @@
 # surf-rac-server
 
-Signaling and account server for surf-rac: team accounts, device registry,
-contact book, presence, WebRTC signaling relay and TURN credentials. One
-binary, one Postgres database, one instance.
+Signaling server for surf-rac: device registry, optional accounts with a
+contact book and "My devices", presence, WebRTC signaling relay and TURN
+credentials. One binary, one Postgres database, one instance.
 
 ## Build
 
@@ -33,6 +33,18 @@ docker compose -f compose.test.yaml run --rm test
 | `RUST_LOG` | no | `info` | Log filter |
 
 The server refuses to start when a required value is missing or invalid.
+
+Accounts are open: anyone can register with a username of 3 to 32 characters
+of `a-z`, `0-9`, `.`, `_` or `-` and a password of 10 to 256 characters. There
+are no invites and no setting for this. These limits are built in and not
+configurable:
+
+- registration: 5 attempts per client address per minute
+- login: 10 attempts per client address per minute
+- login lockout: 15 minutes after 5 consecutive failures for one username
+  (also for usernames that do not exist); a failed password check on
+  account deletion counts as a failure
+- account sessions expire 30 days after their last use
 Migrations run automatically on start and are forward-only. Migration
 `0003_device_identity` drops every user, session, device and contact and
 creates the device-identity schema, so the image before it does not work
@@ -66,25 +78,28 @@ Run inside the container (Coolify terminal, or `docker exec -it <container>`):
 
 ```sh
 surf-rac-server create-admin <username>       # password from SURF_RAC_PASSWORD or stdin
-surf-rac-server create-invite [--expires-hours 72]
-surf-rac-server list-invites
-surf-rac-server revoke-invite <id>
-surf-rac-server list-users
+surf-rac-server list-users                    # flags and number of linked devices
 surf-rac-server disable-user <username>       # also revokes sessions
 surf-rac-server enable-user <username>
 surf-rac-server reset-password <username>     # also revokes sessions
 surf-rac-server revoke-sessions <username>
 ```
 
-Invite codes are printed once and stored only as hashes. Disabled users and
-revoked sessions lose their WebSocket within a minute.
+Disabling a user or revoking sessions affects only the account: its sessions
+stop working for account endpoints at once. Devices do not depend on accounts
+and stay connected; a device linked to the account stays linked.
 
 ## API
 
 All endpoints are under `/v1`. The wire types are defined in the
 `surf-rac-protocol` crate.
 
-- `POST /register`, `POST /login`, `POST /logout`
+- `POST /register` (`username`, `password`; 201, 400 on invalid input, 409
+  when the name is taken), `POST /login` (returns a bearer `token`),
+  `POST /logout`
+- `DELETE /account` (bearer, body `password`): deletes the account, its
+  sessions, contacts and device links. Devices are never deleted; a device
+  linked to another account stays listed there.
 - `POST /devices`: registers an installation without an account. Body:
   `public_key` (standard base64 of the 32-byte Ed25519 identity public key),
   `fingerprint_hash` (64 lowercase hex characters), `name` (1 to 64
@@ -97,9 +112,12 @@ All endpoints are under `/v1`. The wire types are defined in the
   the name (which also needs a valid signature); the same key with another
   fingerprint is a 409 `clone_detected`; another protocol version is a 426
   `update_required`.
-- `GET /devices`, `DELETE /devices/{id}`: the devices linked to the account
-- `GET /contacts`, `PUT /contacts/{id}`, `DELETE /contacts/{id}`
-- `GET /presence/{id}`: online state of a device
+- `GET /my-devices` (bearer): the devices linked to the account with name,
+  online state and last-seen time. `DELETE /my-devices/{id}` (bearer) only
+  removes the link; the device stays registered and connected.
+- `GET /contacts`, `PUT /contacts/{id}` (body `alias`), `DELETE /contacts/{id}`
+  (bearer). A contact may name an ID that is not registered.
+- `GET /presence/{id}` (bearer): online state of a registered device
 - `GET /ws`: WebSocket. Send `X-Device-Id` and `X-Protocol-Version` on the
   upgrade request; another or a missing version is a 426 `update_required`,
   a missing or malformed device ID a 401, an unknown one a 404 `unknown_device`
@@ -109,7 +127,13 @@ All endpoints are under `/v1`. The wire types are defined in the
   `authenticate`: an Ed25519 signature over `surf-rac/challenge/v1` followed
   by the nonce, and its fingerprint hash. A wrong signature closes the socket
   with `bad_signature`, a different fingerprint with `clone_detected`; a valid
-  answer is followed by `hello`. Besides `signal` relaying it
+  answer is followed by `hello`. `link_account` with an account session
+  `token` links the connection's device to that account and is answered with
+  `linked` and the username; `unlink_account` removes that link and is
+  answered with `unlinked`. An invalid token is an `error` with code
+  `forbidden` and changes nothing. A device receives `presence` for every
+  device that an account linked to it has as a contact or linked. Besides
+  `signal` relaying it
   carries session negotiation (`session_request`, `password_challenge`,
   `session_password`, `session_response`) and
   LiveKit tokens: `host_token_request` returns a token for the device's own

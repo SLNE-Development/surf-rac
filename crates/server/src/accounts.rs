@@ -1,9 +1,9 @@
-//! Users and invite codes in the database.
+//! User accounts in the database.
+//!
+//! Accounts are optional: anyone can create one, and it only owns a contact
+//! list, device links and its sessions. Devices never belong to an account.
 
-use chrono::{Duration, Utc};
 use sqlx::PgPool;
-
-use crate::crypto::{random_token, sha256};
 
 /// A user row as needed for login.
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -23,9 +23,6 @@ pub struct UserRow {
 /// Why a registration was refused.
 #[derive(Debug, thiserror::Error)]
 pub enum RegisterError {
-    /// The invite code is unknown, used, revoked or expired.
-    #[error("invalid or expired invite")]
-    InvalidInvite,
     /// The username is already taken.
     #[error("username already taken")]
     UsernameTaken,
@@ -47,58 +44,7 @@ pub fn valid_password(password: &str) -> bool {
     (10..=256).contains(&password.chars().count())
 }
 
-/// Creates a single-use invite valid for `expires_in` and returns its plaintext code.
-///
-/// Only the SHA-256 of the code is stored.
-pub async fn create_invite(
-    db: &PgPool,
-    created_by: &str,
-    expires_in: Duration,
-) -> Result<String, sqlx::Error> {
-    let code = random_token(16);
-    sqlx::query("insert into invites (code_hash, created_by, expires_at) values ($1, $2, $3)")
-        .bind(sha256(&code))
-        .bind(created_by)
-        .bind(Utc::now() + expires_in)
-        .execute(db)
-        .await?;
-    Ok(code)
-}
-
-/// Consumes the invite `code` and creates a user in one transaction.
-///
-/// The invite is claimed with a conditional update, so of two concurrent
-/// redemptions exactly one succeeds. If the username is taken the whole
-/// transaction rolls back and the invite stays unused.
-pub async fn redeem_invite_and_create_user(
-    db: &PgPool,
-    code: &str,
-    username: &str,
-    password_hash: &str,
-) -> Result<i64, RegisterError> {
-    let mut tx = db.begin().await?;
-    let invite_id: Option<i64> = sqlx::query_scalar(
-        "update invites set used_at = now() \
-         where code_hash = $1 and used_at is null and expires_at > now() \
-         returning id",
-    )
-    .bind(sha256(code))
-    .fetch_optional(&mut *tx)
-    .await?;
-    let Some(invite_id) = invite_id else {
-        return Err(RegisterError::InvalidInvite);
-    };
-    let user_id = insert_user(&mut tx, username, password_hash, false).await?;
-    sqlx::query("update invites set used_by = $1 where id = $2")
-        .bind(user_id)
-        .bind(invite_id)
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
-    Ok(user_id)
-}
-
-/// Creates a user without an invite and returns its ID.
+/// Creates a user and returns its ID.
 pub async fn create_user(
     db: &PgPool,
     username: &str,
@@ -143,4 +89,24 @@ pub async fn find_user_by_name(
     .bind(username)
     .fetch_optional(db)
     .await
+}
+
+/// Deletes the user `user_id` and returns whether it existed.
+///
+/// Its sessions, contacts and device links go with it; devices themselves
+/// are never deleted, so a device linked to another account stays linked there.
+pub async fn delete_user(db: &PgPool, user_id: i64) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query("delete from users where id = $1")
+        .bind(user_id)
+        .execute(db)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Returns the password hash of the user `user_id`, if the user exists.
+pub async fn password_hash(db: &PgPool, user_id: i64) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar("select password_hash from users where id = $1")
+        .bind(user_id)
+        .fetch_optional(db)
+        .await
 }

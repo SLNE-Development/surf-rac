@@ -1,20 +1,16 @@
 //! Admin operations behind the CLI subcommands.
 //!
-//! Each function returns the text to print. Invite codes are printed only
-//! when created and never stored in plaintext.
+//! Each function returns the text to print.
 
 use std::fmt::Write as _;
 
 use anyhow::{Context, anyhow, bail};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 use crate::accounts::{self, RegisterError};
 use crate::crypto;
 use crate::sessions;
-
-/// Label stored as `created_by` for invites minted through the CLI.
-const CLI_CREATOR: &str = "admin-cli";
 
 /// Creates an admin account named `username` with `password`.
 pub async fn create_admin(db: &PgPool, username: &str, password: &str) -> anyhow::Result<String> {
@@ -25,80 +21,6 @@ pub async fn create_admin(db: &PgPool, username: &str, password: &str) -> anyhow
         Err(RegisterError::UsernameTaken) => bail!("username {username} is already taken"),
         Err(err) => Err(err.into()),
     }
-}
-
-/// Creates an invite valid for `expires_hours` hours and returns a line ending with its code.
-pub async fn create_invite(db: &PgPool, expires_hours: i64) -> anyhow::Result<String> {
-    if expires_hours <= 0 {
-        bail!("expiry must be a positive number of hours");
-    }
-    let expires_at = Utc::now() + Duration::hours(expires_hours);
-    let code = accounts::create_invite(db, CLI_CREATOR, Duration::hours(expires_hours)).await?;
-    Ok(format!(
-        "invite valid until {}: {code}",
-        expires_at.format("%Y-%m-%d %H:%M UTC")
-    ))
-}
-
-/// Row of the invite listing.
-#[derive(sqlx::FromRow)]
-struct InviteRow {
-    /// Invite ID, used by `revoke-invite`.
-    id: i64,
-    /// Creation time.
-    created_at: DateTime<Utc>,
-    /// Expiry time.
-    expires_at: DateTime<Utc>,
-    /// Redemption time, if redeemed.
-    used_at: Option<DateTime<Utc>>,
-    /// Username that redeemed it, if any.
-    used_by: Option<String>,
-}
-
-/// Lists all invites with their status, without codes.
-pub async fn list_invites(db: &PgPool) -> anyhow::Result<String> {
-    let rows: Vec<InviteRow> = sqlx::query_as(
-        "select i.id, i.created_at, i.expires_at, i.used_at, u.username as used_by \
-         from invites i left join users u on u.id = i.used_by order by i.id",
-    )
-    .fetch_all(db)
-    .await?;
-    let now = Utc::now();
-    let mut out = String::from("id\tcreated\texpires\tstatus\n");
-    for r in rows {
-        let status = match (r.used_at, r.used_by) {
-            (Some(at), by) => format!(
-                "used {} by {}",
-                at.format("%Y-%m-%d %H:%M"),
-                by.unwrap_or_else(|| "deleted user".into())
-            ),
-            (None, _) if r.expires_at <= now => "expired".into(),
-            (None, _) => "unused".into(),
-        };
-        let _ = writeln!(
-            out,
-            "{}\t{}\t{}\t{}",
-            r.id,
-            r.created_at.format("%Y-%m-%d %H:%M"),
-            r.expires_at.format("%Y-%m-%d %H:%M"),
-            status
-        );
-    }
-    Ok(out)
-}
-
-/// Revokes the unused invite `id` by expiring it now.
-pub async fn revoke_invite(db: &PgPool, id: i64) -> anyhow::Result<String> {
-    let res = sqlx::query(
-        "update invites set expires_at = now() where id = $1 and used_at is null and expires_at > now()",
-    )
-    .bind(id)
-    .execute(db)
-    .await?;
-    if res.rows_affected() == 0 {
-        bail!("no active invite with id {id}");
-    }
-    Ok(format!("revoked invite {id}"))
 }
 
 /// Row of the user listing.

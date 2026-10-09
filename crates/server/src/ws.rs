@@ -6,7 +6,8 @@
 //! signaling until the client leaves, the hub closes it (replacement) or a
 //! periodic re-validation finds the device disabled (it is sent a
 //! `device_disabled` error first) or cannot reach the database several times
-//! in a row.
+//! in a row. An authenticated connection can also link its device to an
+//! account, or unlink it, by presenting that account's session token.
 
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,7 @@ use surf_rac_protocol::{
 use crate::devices::{self, DeviceError, DeviceIdentity};
 use crate::livekit::{self, Role};
 use crate::presence;
+use crate::sessions;
 use crate::state::AppState;
 use crate::turn;
 
@@ -157,7 +159,7 @@ pub async fn run(state: AppState, socket: WebSocket, device: DeviceId, identity:
                 },
                 incoming = stream.next() => match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        if let Some(reply) = handle_text(&state, &sender, &mut bucket, text.as_str())
+                        if let Some(reply) = handle_text(&state, &sender, &mut bucket, text.as_str()).await
                             && sink.send(frame(&reply)).await.is_err()
                         {
                             break;
@@ -286,7 +288,7 @@ async fn next_text(stream: &mut SplitStream<WebSocket>) -> Option<String> {
 }
 
 /// Handles one text frame from `sender` and returns the reply to send, if any.
-fn handle_text(
+async fn handle_text(
     state: &AppState,
     sender: &Sender,
     bucket: &mut TokenBucket,
@@ -445,10 +447,8 @@ fn handle_text(
             WsErrorCode::BadMessage,
             "connection is already authenticated",
         )),
-        ClientMessage::LinkAccount { .. } | ClientMessage::UnlinkAccount { .. } => Some(error(
-            WsErrorCode::BadMessage,
-            "account linking is not supported",
-        )),
+        ClientMessage::LinkAccount { token } => Some(link_account(state, device, &token).await),
+        ClientMessage::UnlinkAccount { token } => Some(unlink_account(state, device, &token).await),
         ClientMessage::HostTokenRequest => {
             let room = livekit::room_for(device);
             tracing::info!(device_id = %device, "host token issued");
@@ -499,6 +499,52 @@ fn handle_text(
             })
         }
     }
+}
+
+/// Links `device` to the account of the session `token` and returns the reply.
+///
+/// Answers `linked` with the account's username. An unknown, expired or
+/// revoked token, or a disabled account, is a `forbidden` error and links
+/// nothing; a database failure is a `forbidden` error as well.
+async fn link_account(state: &AppState, device: DeviceId, token: &str) -> ServerMessage {
+    let user = match sessions::authenticate(&state.db, token).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return error(WsErrorCode::Forbidden, "invalid account session"),
+        Err(err) => {
+            tracing::warn!(error = %err, device_id = %device, "account link failed");
+            return error(WsErrorCode::Forbidden, "account linking failed");
+        }
+    };
+    if let Err(err) = devices::link(&state.db, user.user_id, device).await {
+        tracing::warn!(error = %err, device_id = %device, "account link failed");
+        return error(WsErrorCode::Forbidden, "account linking failed");
+    }
+    tracing::info!(device_id = %device, username = %user.username, "device linked");
+    ServerMessage::Linked {
+        username: user.username,
+    }
+}
+
+/// Removes the link between `device` and the account of the session `token` and returns the reply.
+///
+/// Answers `unlinked`, also when the device was not linked to that account.
+/// An unknown, expired or revoked token is a `forbidden` error and removes
+/// nothing; a database failure is a `forbidden` error as well.
+async fn unlink_account(state: &AppState, device: DeviceId, token: &str) -> ServerMessage {
+    let user = match sessions::authenticate(&state.db, token).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return error(WsErrorCode::Forbidden, "invalid account session"),
+        Err(err) => {
+            tracing::warn!(error = %err, device_id = %device, "account unlink failed");
+            return error(WsErrorCode::Forbidden, "account unlinking failed");
+        }
+    };
+    if let Err(err) = devices::unlink(&state.db, user.user_id, device).await {
+        tracing::warn!(error = %err, device_id = %device, "account unlink failed");
+        return error(WsErrorCode::Forbidden, "account unlinking failed");
+    }
+    tracing::info!(device_id = %device, username = %user.username, "device unlinked");
+    ServerMessage::Unlinked
 }
 
 /// Queues `msg` for `to`; returns a `target_offline` error when it cannot be delivered.

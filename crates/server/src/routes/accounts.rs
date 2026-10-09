@@ -1,4 +1,4 @@
-//! Registration, login and logout routes.
+//! Registration, login, logout and account deletion routes.
 
 use std::net::SocketAddr;
 use std::time::Instant;
@@ -6,7 +6,9 @@ use std::time::Instant;
 use axum::Json;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
-use surf_rac_protocol::{LoginRequest, LoginResponse, RegisterRequest, RegisterResponse};
+use surf_rac_protocol::{
+    DeleteAccountRequest, LoginRequest, LoginResponse, RegisterRequest, RegisterResponse,
+};
 
 use crate::accounts::{self, RegisterError};
 use crate::client_ip::client_ip;
@@ -17,7 +19,10 @@ use crate::limits::rate_key;
 use crate::sessions::{self, AuthUser};
 use crate::state::AppState;
 
-/// `POST /v1/register`: creates an account.
+/// `POST /v1/register`: creates an account; anyone may register.
+///
+/// Limited per client address. The username must be 3 to 32 characters of
+/// `[a-z0-9._-]` and the password 10 to 256 characters; a taken username is a 409.
 pub async fn register(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -55,7 +60,6 @@ pub async fn register(
         }
         Err(RegisterError::UsernameTaken) => Err(ApiError::conflict("username already taken")),
         Err(RegisterError::Db(err)) => Err(err.into()),
-        Err(err @ RegisterError::InvalidInvite) => Err(ApiError::internal(err)),
     }
 }
 
@@ -118,6 +122,41 @@ pub async fn login(
 /// `POST /v1/logout`: revokes the session used for this request.
 pub async fn logout(State(state): State<AppState>, user: AuthUser) -> Result<StatusCode, ApiError> {
     sessions::revoke(&state.db, &user.token_hash).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /v1/account`: deletes the caller's account after checking its password.
+///
+/// The password check counts against the per-account login lockout. The
+/// account's sessions, contacts and device links are removed with it; its
+/// devices stay registered and stay linked to other accounts.
+pub async fn delete_account(
+    State(state): State<AppState>,
+    user: AuthUser,
+    JsonBody(req): JsonBody<DeleteAccountRequest>,
+) -> Result<StatusCode, ApiError> {
+    let now = Instant::now();
+    if let Err(remaining) = state
+        .limits
+        .account_lockout
+        .try_attempt(&user.username, now)
+    {
+        return Err(ApiError::locked(remaining.as_secs()));
+    }
+    let hash = accounts::password_hash(&state.db, user.user_id)
+        .await?
+        .ok_or_else(ApiError::unauthorized)?;
+    let password = req.password;
+    let matches = tokio::task::spawn_blocking(move || crypto::verify_password(&password, &hash))
+        .await
+        .map_err(ApiError::internal)?;
+    if !matches {
+        tracing::info!(username = %user.username, "account deletion refused");
+        return Err(ApiError::invalid_credentials());
+    }
+    state.limits.account_lockout.record_success(&user.username);
+    accounts::delete_user(&state.db, user.user_id).await?;
+    tracing::info!(username = %user.username, "account deleted");
     Ok(StatusCode::NO_CONTENT)
 }
 

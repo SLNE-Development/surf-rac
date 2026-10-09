@@ -1,4 +1,4 @@
-//! Device, contact and presence routes.
+//! Device registration, My devices, contact and presence routes.
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use surf_rac_protocol::{
-    ContactInfo, DeviceId, DeviceInfo, PROTOCOL_VERSION, PresenceInfo, PutContactRequest,
+    ContactInfo, DeviceId, MyDeviceInfo, PROTOCOL_VERSION, PresenceInfo, PutContactRequest,
     RegisterDeviceRequest, RegisterDeviceResponse,
 };
 
@@ -71,17 +71,17 @@ pub async fn register(
     Ok(Json(RegisterDeviceResponse { device_id: id }))
 }
 
-/// `GET /v1/devices`: lists the caller's devices with their online state.
-pub async fn list(
+/// `GET /v1/my-devices`: lists the devices linked to the caller's account with their online state.
+pub async fn my_devices(
     State(state): State<AppState>,
     user: AuthUser,
-) -> Result<Json<Vec<DeviceInfo>>, ApiError> {
+) -> Result<Json<Vec<MyDeviceInfo>>, ApiError> {
     let rows = devices::list(&state.db, user.user_id).await?;
     Ok(Json(
         rows.into_iter()
             .map(|r| {
                 let id = device_id(r.id);
-                DeviceInfo {
+                MyDeviceInfo {
                     device_id: id,
                     name: r.name,
                     online: state.hub.is_online(id),
@@ -92,8 +92,11 @@ pub async fn list(
     ))
 }
 
-/// `DELETE /v1/devices/{id}`: removes the link between the caller's account and a device.
-pub async fn delete(
+/// `DELETE /v1/my-devices/{id}`: removes the link between the caller's account and a device.
+///
+/// The device stays registered and connected; a device that is not linked
+/// to the caller is a 404.
+pub async fn unlink_my_device(
     State(state): State<AppState>,
     user: AuthUser,
     Path(raw): Path<String>,
@@ -126,7 +129,9 @@ pub async fn list_contacts(
     ))
 }
 
-/// `PUT /v1/contacts/{id}`: adds a device to the caller's contacts or renames it.
+/// `PUT /v1/contacts/{id}`: adds a device ID to the caller's contacts or renames it.
+///
+/// The ID does not have to be registered.
 pub async fn put_contact(
     State(state): State<AppState>,
     user: AuthUser,
@@ -137,9 +142,7 @@ pub async fn put_contact(
     if !devices::valid_name(&req.alias) {
         return Err(ApiError::bad_request("alias must be 1 to 64 characters"));
     }
-    if !contacts::put(&state.db, user.user_id, id, &req.alias).await? {
-        return Err(ApiError::not_found());
-    }
+    contacts::put(&state.db, user.user_id, id, &req.alias).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -154,7 +157,7 @@ pub async fn delete_contact(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `GET /v1/presence/{id}`: reports whether a device is online.
+/// `GET /v1/presence/{id}`: reports whether a registered device is online; needs an account session.
 pub async fn presence(
     State(state): State<AppState>,
     _user: AuthUser,
@@ -167,6 +170,5 @@ pub async fn presence(
     Ok(Json(PresenceInfo {
         device_id: id,
         online: state.hub.is_online(id),
-        public_key: None,
     }))
 }

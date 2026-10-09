@@ -249,6 +249,19 @@ pub async fn list(db: &PgPool, user_id: i64) -> Result<Vec<DeviceRow>, sqlx::Err
     .await
 }
 
+/// Links `device` to `user_id`; linking an already linked device changes nothing.
+pub async fn link(db: &PgPool, user_id: i64, device: DeviceId) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "insert into device_links (user_id, device_id) values ($1, $2) \
+         on conflict (user_id, device_id) do nothing",
+    )
+    .bind(user_id)
+    .bind(i64::from(device.get()))
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
 /// Removes the link between `user_id` and `device`; returns whether a link existed.
 pub async fn unlink(db: &PgPool, user_id: i64, device: DeviceId) -> Result<bool, sqlx::Error> {
     let res = sqlx::query("delete from device_links where user_id = $1 and device_id = $2")

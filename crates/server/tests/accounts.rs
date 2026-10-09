@@ -1,4 +1,4 @@
-//! Registration, login, logout and session tests.
+//! Registration, login, logout, session, contact and presence lookup tests.
 
 mod common;
 
@@ -25,10 +25,9 @@ async fn error_code(res: reqwest::Response) -> String {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn register_with_invite_then_login(pool: PgPool) {
+async fn open_registration_then_login(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let code = app.invite().await;
-    let res = app.register(&code, "alice", PASSWORD).await;
+    let res = app.register("alice", PASSWORD).await;
     assert_eq!(res.status(), 201);
     let body: Value = res.json().await.unwrap();
     assert_eq!(body, json!({"username": "alice"}));
@@ -38,79 +37,73 @@ async fn register_with_invite_then_login(pool: PgPool) {
     let body: Value = res.json().await.unwrap();
     assert!(body["token"].as_str().unwrap().len() >= 43);
     assert!(body["expires_at"].is_string());
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn invite_is_single_use(pool: PgPool) {
-    let app = common::spawn(pool).await;
-    let code = app.invite().await;
-    assert_eq!(app.register(&code, "alice", PASSWORD).await.status(), 201);
-    let res = app.register(&code, "bob", PASSWORD).await;
-    assert_eq!(res.status(), 400);
-    assert_eq!(error_code(res).await, "bad_request");
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn invite_double_redeem_single_winner(pool: PgPool) {
-    let app = common::spawn(pool).await;
-    let code = app.invite().await;
-    let (a, b) = tokio::join!(
-        app.register(&code, "alice", PASSWORD),
-        app.register(&code, "bob", PASSWORD)
-    );
-    let mut statuses = [a.status().as_u16(), b.status().as_u16()];
-    statuses.sort();
-    assert_eq!(statuses, [201, 400]);
-    let users: i64 = sqlx::query_scalar("select count(*) from users")
+    let is_admin: bool = sqlx::query_scalar("select is_admin from users where username = 'alice'")
         .fetch_one(&app.pool)
         .await
         .unwrap();
-    assert_eq!(users, 1);
+    assert!(!is_admin);
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn expired_invite_rejected(pool: PgPool) {
+async fn registration_ignores_an_invite_code(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let code = app.invite().await;
-    sqlx::query("update invites set expires_at = now() - interval '1 second'")
-        .execute(&app.pool)
+    let res = app
+        .client
+        .post(app.url("/v1/register"))
+        .header("x-forwarded-for", common::fresh_ip())
+        .json(&json!({"invite_code": "x", "username": "alice", "password": PASSWORD}))
+        .send()
         .await
         .unwrap();
-    assert_eq!(app.register(&code, "alice", PASSWORD).await.status(), 400);
+    assert_eq!(res.status(), 201);
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn unknown_invite_rejected(pool: PgPool) {
+async fn duplicate_username_conflict(pool: PgPool) {
     let app = common::spawn(pool).await;
-    assert_eq!(app.register("nope", "alice", PASSWORD).await.status(), 400);
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn duplicate_username_conflict_keeps_invite(pool: PgPool) {
-    let app = common::spawn(pool).await;
-    let first = app.invite().await;
-    assert_eq!(app.register(&first, "alice", PASSWORD).await.status(), 201);
-    let second = app.invite().await;
-    let res = app.register(&second, "alice", PASSWORD).await;
+    assert_eq!(app.register("alice", PASSWORD).await.status(), 201);
+    let res = app.register("alice", PASSWORD).await;
     assert_eq!(res.status(), 409);
     assert_eq!(error_code(res).await, "conflict");
-    assert_eq!(app.register(&second, "bob", PASSWORD).await.status(), 201);
+    assert_eq!(app.register("bob", PASSWORD).await.status(), 201);
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn invalid_username_and_short_password_rejected(pool: PgPool) {
+async fn concurrent_registration_of_one_name_single_winner(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let code = app.invite().await;
-    for name in ["al", "Alice", "a b c", "x".repeat(33).as_str(), "élan"] {
-        assert_eq!(
-            app.register(&code, name, PASSWORD).await.status(),
-            400,
-            "{name}"
-        );
+    let (a, b) = tokio::join!(
+        app.register("alice", PASSWORD),
+        app.register("alice", PASSWORD)
+    );
+    let mut statuses = [a.status().as_u16(), b.status().as_u16()];
+    statuses.sort();
+    assert_eq!(statuses, [201, 409]);
+    assert_eq!(app.count("users", "true").await, 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn invalid_username_and_password_rejected(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    for name in [
+        "al",
+        "Alice",
+        "a b c",
+        "x".repeat(33).as_str(),
+        "élan",
+        "a/b",
+    ] {
+        let res = app.register(name, PASSWORD).await;
+        assert_eq!(res.status(), 400, "{name}");
+        assert_eq!(error_code(res).await, "bad_request");
     }
-    assert_eq!(app.register(&code, "alice", "short").await.status(), 400);
+    for name in ["abc", "a.b_c-d9", "x".repeat(32).as_str()] {
+        assert_eq!(app.register(name, PASSWORD).await.status(), 201, "{name}");
+    }
+    let res = app.register("alice", "nine char").await;
+    assert_eq!(res.status(), 400);
+    assert_eq!(error_code(res).await, "bad_request");
     let long = "p".repeat(257);
-    assert_eq!(app.register(&code, "alice", &long).await.status(), 400);
+    assert_eq!(app.register("alice", &long).await.status(), 400);
     let res = app
         .client
         .post(app.url("/v1/register"))
@@ -121,7 +114,8 @@ async fn invalid_username_and_short_password_rejected(pool: PgPool) {
         .unwrap();
     assert_eq!(res.status(), 400);
     assert_eq!(error_code(res).await, "bad_request");
-    assert_eq!(app.register(&code, "alice", PASSWORD).await.status(), 201);
+    assert_eq!(app.register("alice", "ten chars!").await.status(), 201);
+    assert_eq!(app.count("users", "true").await, 4);
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -263,16 +257,21 @@ async fn login_ip_rate_limited(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn register_ip_rate_limited(pool: PgPool) {
     let app = common::spawn(pool).await;
-    for _ in 0..5 {
+    for i in 0..5 {
         let res = app
-            .register_from("nope", "alice", PASSWORD, "10.4.0.1")
+            .register_from(&format!("user{i}"), PASSWORD, "10.4.0.1")
             .await;
-        assert_eq!(res.status(), 400);
+        assert_eq!(res.status(), 201);
     }
-    let res = app
-        .register_from("nope", "alice", PASSWORD, "10.4.0.1")
-        .await;
+    let res = app.register_from("user9", PASSWORD, "10.4.0.1").await;
     assert_eq!(res.status(), 429);
+    assert_eq!(error_code(res).await, "rate_limited");
+    assert_eq!(
+        app.register_from("user9", PASSWORD, "10.4.0.2")
+            .await
+            .status(),
+        201
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -302,29 +301,48 @@ async fn expired_session_rejected(pool: PgPool) {
     assert_eq!(probe(&app, &token).await, 401);
 }
 
-#[sqlx::test(migrations = "./migrations")]
-async fn session_use_slides_expiry(pool: PgPool) {
-    let app = common::spawn(pool).await;
-    let token = app.register_and_login("alice").await;
-    sqlx::query(
-        "update sessions set last_used_at = now() - interval '2 hours', \
-         expires_at = now() + interval '1 day'",
-    )
-    .execute(&app.pool)
-    .await
-    .unwrap();
-    let state = app.state.clone();
-    let user = surf_rac_server::sessions::authenticate(&state.db, &token)
-        .await
-        .unwrap();
-    assert!(user.is_some());
-    let days: f64 = sqlx::query_scalar(
+/// Returns the days until the only session expires.
+async fn days_left(app: &TestApp) -> f64 {
+    sqlx::query_scalar(
         "select extract(epoch from expires_at - now())::float8 / 86400 from sessions",
     )
     .fetch_one(&app.pool)
     .await
-    .unwrap();
+    .unwrap()
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn session_use_slides_expiry(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let token = app.register_and_login("alice").await;
+    sqlx::query("update sessions set expires_at = now() + interval '1 day'")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let user = surf_rac_server::sessions::authenticate(&app.state.db, &token)
+        .await
+        .unwrap();
+    assert_eq!(user.unwrap().username, "alice");
+    let days = days_left(&app).await;
     assert!(days > 29.9, "{days}");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn session_used_within_the_hour_keeps_expiry(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let token = app.register_and_login("alice").await;
+    sqlx::query(
+        "update sessions set expires_at = now() + interval '30 days' - interval '30 minutes'",
+    )
+    .execute(&app.pool)
+    .await
+    .unwrap();
+    let user = surf_rac_server::sessions::authenticate(&app.state.db, &token)
+        .await
+        .unwrap();
+    assert!(user.is_some());
+    let days = days_left(&app).await;
+    assert!(days < 29.99, "{days}");
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -337,4 +355,105 @@ async fn disabled_user_cannot_login(pool: PgPool) {
         .unwrap();
     assert_eq!(app.login("alice", PASSWORD, "10.5.0.1").await.status(), 401);
     assert_eq!(probe(&app, &token).await, 401);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn contacts_may_name_unknown_ids(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let alice = app.register_and_login("alice").await;
+    let device = app.online_device(1).await;
+    assert_eq!(
+        app.put_contact(&alice, "123456789", "nobody")
+            .await
+            .status(),
+        204
+    );
+    assert_eq!(
+        app.put_contact(&alice, &device.id, "laptop").await.status(),
+        204
+    );
+    let res = app
+        .client
+        .get(app.url("/v1/contacts"))
+        .bearer_auth(&alice)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(
+        body,
+        json!([
+            {"device_id": device.id, "alias": "laptop", "online": true},
+            {"device_id": "123456789", "alias": "nobody", "online": false},
+        ])
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn contacts_rename_delete_and_validate(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let alice = app.register_and_login("alice").await;
+    let bob = app.register_and_login("bob").await;
+    assert_eq!(
+        app.put_contact(&alice, "123456789", "one").await.status(),
+        204
+    );
+    assert_eq!(
+        app.put_contact(&alice, "123456789", "two").await.status(),
+        204
+    );
+    assert_eq!(
+        app.put_contact(&bob, "123456789", "bobs").await.status(),
+        204
+    );
+    let alias: String = sqlx::query_scalar(
+        "select c.alias from contacts c join users u on u.id = c.user_id where u.username = 'alice'",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(alias, "two");
+    assert_eq!(app.put_contact(&alice, "12345", "x").await.status(), 400);
+    assert_eq!(app.put_contact(&alice, "123456789", "").await.status(), 400);
+    assert_eq!(
+        app.put_contact("garbage", "123456789", "x").await.status(),
+        401
+    );
+    let res = app
+        .client
+        .delete(app.url("/v1/contacts/123456789"))
+        .bearer_auth(&alice)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 204);
+    assert_eq!(app.count("contacts", "true").await, 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn presence_lookup_needs_a_session(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let alice = app.register_and_login("alice").await;
+    let device = app.online_device(1).await;
+    let url = app.url(&format!("/v1/presence/{}", device.id));
+    let res = app
+        .client
+        .get(&url)
+        .bearer_auth(&alice)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body, json!({"device_id": device.id, "online": true}));
+    assert_eq!(app.client.get(&url).send().await.unwrap().status(), 401);
+    let res = app
+        .client
+        .get(app.url("/v1/presence/123456789"))
+        .bearer_auth(&alice)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404);
 }

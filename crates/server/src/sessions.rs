@@ -1,8 +1,10 @@
 //! Session tokens: creation, authentication and revocation.
 //!
 //! Tokens are 32 random bytes in base64url. Only their SHA-256 is stored. A
-//! session expires 30 days after its last use; use is recorded at most once
-//! per hour.
+//! session expires 30 days after its last use. A use moves the expiry only
+//! when it would move by more than an hour, so the row is written at most
+//! once per hour. Account sessions authenticate account endpoints only;
+//! devices never use them.
 
 use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
@@ -12,7 +14,7 @@ use crate::crypto::{random_token, sha256};
 /// Lifetime of a session after its last use.
 const SESSION_TTL_DAYS: i64 = 30;
 
-/// Minimum age of `last_used_at` before a use extends the session.
+/// Minimum distance by which a use must move the expiry before it is written.
 const SLIDE_AFTER_MINUTES: i64 = 60;
 
 /// An authenticated user, resolved from a valid session token.
@@ -33,8 +35,8 @@ struct SessionRow {
     user_id: i64,
     /// Owner's username.
     username: String,
-    /// When the session was last used.
-    last_used_at: DateTime<Utc>,
+    /// When the session expires.
+    expires_at: DateTime<Utc>,
 }
 
 /// Creates a session for `user_id` and returns the plaintext token and its expiry.
@@ -52,11 +54,11 @@ pub async fn create(db: &PgPool, user_id: i64) -> Result<(String, DateTime<Utc>)
 
 /// Resolves `token` to its user, or `None` when it is unknown, expired or the user is disabled.
 ///
-/// Extends the session to 30 days from now when it was last used more than an hour ago.
+/// Extends the session to 30 days from now when that moves its expiry by more than an hour.
 pub async fn authenticate(db: &PgPool, token: &str) -> Result<Option<AuthUser>, sqlx::Error> {
     let token_hash = sha256(token);
     let row: Option<SessionRow> = sqlx::query_as(
-        "select s.user_id, u.username, s.last_used_at from sessions s \
+        "select s.user_id, u.username, s.expires_at from sessions s \
          join users u on u.id = s.user_id \
          where s.token_hash = $1 and s.expires_at > now() and not u.disabled",
     )
@@ -66,14 +68,13 @@ pub async fn authenticate(db: &PgPool, token: &str) -> Result<Option<AuthUser>, 
     let Some(row) = row else {
         return Ok(None);
     };
-    if Utc::now() - row.last_used_at > Duration::minutes(SLIDE_AFTER_MINUTES) {
-        sqlx::query(
-            "update sessions set last_used_at = now(), expires_at = $2 where token_hash = $1",
-        )
-        .bind(&token_hash)
-        .bind(Utc::now() + Duration::days(SESSION_TTL_DAYS))
-        .execute(db)
-        .await?;
+    let slid = Utc::now() + Duration::days(SESSION_TTL_DAYS);
+    if slid - row.expires_at > Duration::minutes(SLIDE_AFTER_MINUTES) {
+        sqlx::query("update sessions set expires_at = $2 where token_hash = $1")
+            .bind(&token_hash)
+            .bind(slid)
+            .execute(db)
+            .await?;
     }
     Ok(Some(AuthUser {
         user_id: row.user_id,

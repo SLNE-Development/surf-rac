@@ -5,30 +5,17 @@ mod common;
 use std::time::Duration;
 
 use base64::Engine;
+use common::TEST_TURN_SECRET;
 use common::ws::{expect_silence, recv_type, send};
-use common::{TEST_TURN_SECRET, fingerprint};
 use hmac::{Hmac, Mac};
 use serde_json::json;
 use sha1::Sha1;
 use sqlx::PgPool;
 
-/// Adds `device_id` to the contacts of `token`.
-async fn add_contact(app: &common::TestApp, token: &str, device_id: &str) {
-    let res = app
-        .client
-        .put(app.url(&format!("/v1/contacts/{device_id}")))
-        .bearer_auth(token)
-        .json(&json!({"alias": "friend"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 204);
-}
-
 #[sqlx::test(migrations = "./migrations")]
 async fn ws_turn_request_returns_credentials(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let mut a = app.online_device("alice", 1).await;
+    let mut a = app.online_device(1).await;
     send(&mut a.ws, json!({"type":"turn_request"})).await;
     let creds = recv_type(&mut a.ws, "turn_credentials").await;
     assert_eq!(creds["ttl_secs"], 3600);
@@ -48,22 +35,20 @@ async fn ws_turn_request_returns_credentials(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn contact_sees_presence_online_and_offline(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let mut watcher = app.online_device("alice", 1).await;
-    let bob = app.register_and_login("bob").await;
-    let (bob_id, bob_secret) = app.new_device(&bob, &fingerprint(2)).await;
-    add_contact(&app, &watcher.token, &bob_id).await;
+    let alice = app.register_and_login("alice").await;
+    let mut watcher = app.linked_device(1, &alice).await;
+    let bob = app.new_device(2).await;
+    let bob_id = bob.id.clone();
+    assert_eq!(app.put_contact(&alice, &bob_id, "bob").await.status(), 204);
 
-    let ws = app
-        .ws_connect(Some(&bob), &bob_id, &bob_secret)
-        .await
-        .unwrap();
+    let device = app.connect_device(bob).await;
     let online = recv_type(&mut watcher.ws, "presence").await;
     assert_eq!(
         online,
         json!({"type":"presence","device_id":bob_id,"online":true})
     );
 
-    drop(ws);
+    drop(device);
     let offline = recv_type(&mut watcher.ws, "presence").await;
     assert_eq!(
         offline,
@@ -72,22 +57,64 @@ async fn contact_sees_presence_online_and_offline(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn owner_other_device_sees_presence(pool: PgPool) {
+async fn presence_reaches_every_online_device_of_a_watcher(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let mut first = app.online_device("alice", 1).await;
-    let second = app.connect_new_device(&first.token, 2).await;
-    let got = recv_type(&mut first.ws, "presence").await;
+    let alice = app.register_and_login("alice").await;
+    let mut first = app.linked_device(1, &alice).await;
+    let mut second = app.linked_device(2, &alice).await;
+    let target = app.new_device(3).await;
+    let target_id = target.id.clone();
+    assert_eq!(app.put_contact(&alice, &target_id, "t").await.status(), 204);
+    let _target = app.connect_device(target).await;
+    let expected = json!({"type":"presence","device_id":target_id,"online":true});
+    assert_eq!(recv_type(&mut first.ws, "presence").await, expected);
+    assert_eq!(recv_type(&mut second.ws, "presence").await, expected);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn linked_device_is_watched_by_its_account(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let alice = app.register_and_login("alice").await;
+    let mut watcher = app.linked_device(1, &alice).await;
+    let other = app.linked_device(2, &alice).await;
+    let identity = other.identity();
+    let id = identity.id.clone();
+    drop(other);
     assert_eq!(
-        got,
-        json!({"type":"presence","device_id":second.id,"online":true})
+        recv_type(&mut watcher.ws, "presence").await,
+        json!({"type":"presence","device_id":id,"online":false})
     );
+    let _again = app.connect_device(identity).await;
+    assert_eq!(
+        recv_type(&mut watcher.ws, "presence").await,
+        json!({"type":"presence","device_id":id,"online":true})
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn presence_stops_after_unlink(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let alice = app.register_and_login("alice").await;
+    let mut watcher = app.linked_device(1, &alice).await;
+    let other = app.linked_device(2, &alice).await;
+    let res = app
+        .client
+        .delete(app.url(&format!("/v1/my-devices/{}", other.id)))
+        .bearer_auth(&alice)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 204);
+    drop(other);
+    expect_silence(&mut watcher.ws, Duration::from_millis(400)).await;
 }
 
 #[sqlx::test(migrations = "./migrations")]
 async fn stranger_gets_no_presence(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let mut stranger = app.online_device("alice", 1).await;
-    let mut bob = app.online_device("bob", 2).await;
+    let alice = app.register_and_login("alice").await;
+    let mut stranger = app.linked_device(1, &alice).await;
+    let mut bob = app.online_device(2).await;
     expect_silence(&mut stranger.ws, Duration::from_millis(300)).await;
     expect_silence(&mut bob.ws, Duration::from_millis(100)).await;
 }
@@ -95,56 +122,43 @@ async fn stranger_gets_no_presence(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn device_gets_no_presence_about_itself(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let mut a = app.online_device("alice", 1).await;
-    expect_silence(&mut a.ws, Duration::from_millis(300)).await;
+    let alice = app.register_and_login("alice").await;
+    let a = app.linked_device(1, &alice).await;
+    let identity = a.identity();
+    drop(a);
+    let mut again = app.connect_device(identity).await;
+    expect_silence(&mut again.ws, Duration::from_millis(300)).await;
 }
 
 #[sqlx::test(migrations = "./migrations")]
 async fn replacement_does_not_broadcast_offline(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let mut watcher = app.online_device("alice", 1).await;
-    let bob = app.register_and_login("bob").await;
-    let (bob_id, bob_secret) = app.new_device(&bob, &fingerprint(2)).await;
-    add_contact(&app, &watcher.token, &bob_id).await;
+    let alice = app.register_and_login("alice").await;
+    let mut watcher = app.linked_device(1, &alice).await;
+    let bob = app.new_device(2).await;
+    assert_eq!(app.put_contact(&alice, &bob.id, "bob").await.status(), 204);
 
-    let _first = app
-        .ws_connect(Some(&bob), &bob_id, &bob_secret)
-        .await
-        .unwrap();
+    let first = app.connect_device(bob).await;
     assert_eq!(recv_type(&mut watcher.ws, "presence").await["online"], true);
-    let _second = app
-        .ws_connect(Some(&bob), &bob_id, &bob_secret)
-        .await
-        .unwrap();
+    let _second = app.connect_device(first.identity()).await;
     expect_silence(&mut watcher.ws, Duration::from_millis(400)).await;
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn rebind_and_delete_broadcast_offline(pool: PgPool) {
+async fn device_of_two_watching_accounts_gets_presence_once(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let mut watcher = app.online_device("alice", 1).await;
+    let alice = app.register_and_login("alice").await;
     let bob = app.register_and_login("bob").await;
-    for n in [2u32, 3] {
-        let (id, secret) = app.new_device(&bob, &fingerprint(n)).await;
-        add_contact(&app, &watcher.token, &id).await;
-        let _ws = app.ws_connect(Some(&bob), &id, &secret).await.unwrap();
-        assert_eq!(recv_type(&mut watcher.ws, "presence").await["online"], true);
-        if n == 2 {
-            app.new_device(&bob, &fingerprint(n)).await;
-        } else {
-            let res = app
-                .client
-                .delete(app.url(&format!("/v1/devices/{id}")))
-                .bearer_auth(&bob)
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(res.status(), 204);
-        }
-        let offline = recv_type(&mut watcher.ws, "presence").await;
-        assert_eq!(
-            offline,
-            json!({"type":"presence","device_id":id,"online":false})
-        );
+    let mut watcher = app.linked_device(1, &alice).await;
+    assert_eq!(
+        common::ws::link(&mut watcher.ws, &bob).await["type"],
+        "linked"
+    );
+    let target = app.new_device(2).await;
+    for token in [&alice, &bob] {
+        assert_eq!(app.put_contact(token, &target.id, "t").await.status(), 204);
     }
+    let _target = app.connect_device(target).await;
+    assert_eq!(recv_type(&mut watcher.ws, "presence").await["online"], true);
+    expect_silence(&mut watcher.ws, Duration::from_millis(400)).await;
 }

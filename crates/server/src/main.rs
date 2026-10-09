@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use surf_rac_server::admin;
 use surf_rac_server::config::Config;
 
-/// surf-rac signaling and account server.
+/// surf-rac signaling server with optional accounts.
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
@@ -25,19 +25,6 @@ enum Command {
     CreateAdmin {
         /// Username of the new admin.
         username: String,
-    },
-    /// Create a single-use invite code and print it.
-    CreateInvite {
-        /// Hours until the invite expires.
-        #[arg(long, default_value_t = 72)]
-        expires_hours: i64,
-    },
-    /// List invites and their status (codes are never shown).
-    ListInvites,
-    /// Revoke an unused invite by its ID.
-    RevokeInvite {
-        /// Invite ID from list-invites.
-        id: i64,
     },
     /// List users.
     ListUsers,
@@ -80,9 +67,6 @@ async fn main() -> anyhow::Result<()> {
         Command::CreateAdmin { username } => {
             admin::create_admin(&db, &username, &read_password()?).await?
         }
-        Command::CreateInvite { expires_hours } => admin::create_invite(&db, expires_hours).await?,
-        Command::ListInvites => admin::list_invites(&db).await?,
-        Command::RevokeInvite { id } => admin::revoke_invite(&db, id).await?,
         Command::ListUsers => admin::list_users(&db).await?,
         Command::DisableUser { username } => admin::set_disabled(&db, &username, true).await?,
         Command::EnableUser { username } => admin::set_disabled(&db, &username, false).await?,

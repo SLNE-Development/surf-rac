@@ -123,6 +123,26 @@ impl TestApp {
         let identity = self.new_device(n).await;
         self.connect_device(identity).await
     }
+
+    /// Registers and connects device `n`, then links it to the account of `token`.
+    pub async fn linked_device(&self, n: u32, token: &str) -> Device {
+        let mut device = self.online_device(n).await;
+        let reply = link(&mut device.ws, token).await;
+        assert_eq!(reply["type"], "linked", "{reply}");
+        device
+    }
+}
+
+/// Sends `link_account` with `token` and returns the server's reply.
+pub async fn link(ws: &mut Ws, token: &str) -> Value {
+    send(ws, json!({"type": "link_account", "token": token})).await;
+    recv(ws).await
+}
+
+/// Sends `unlink_account` with `token` and returns the server's reply.
+pub async fn unlink(ws: &mut Ws, token: &str) -> Value {
+    send(ws, json!({"type": "unlink_account", "token": token})).await;
+    recv(ws).await
 }
 
 impl Device {

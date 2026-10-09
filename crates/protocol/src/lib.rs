@@ -256,9 +256,6 @@ pub struct PresenceInfo {
     pub device_id: DeviceId,
     /// Whether the device is currently online.
     pub online: bool,
-    /// The device's X25519 public key (standard base64 of 32 bytes), when it has published one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub public_key: Option<String>,
 }
 
 /// Error body of every failed HTTP request.
@@ -730,10 +727,15 @@ mod tests {
     }
 
     #[test]
-    fn presence_public_key_optional() {
-        let p: PresenceInfo =
-            serde_json::from_value(json!({"device_id":"123456789","online":true})).unwrap();
-        assert!(p.public_key.is_none());
+    fn presence_info_has_id_and_online_only() {
+        let p = PresenceInfo {
+            device_id: DeviceId::new(123_456_789).unwrap(),
+            online: true,
+        };
+        assert_eq!(
+            serde_json::to_value(&p).unwrap(),
+            json!({"device_id":"123456789","online":true})
+        );
     }
 
     #[test]

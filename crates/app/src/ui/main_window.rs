@@ -42,7 +42,8 @@ pub(super) fn status(auth: &Auth) -> (&'static str, Tone) {
 pub(super) fn logo(ui: &mut egui::Ui, size: f32) {
     let p = theme::palette(ui.ctx());
     let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::hover());
-    ui.painter().rect_filled(rect, theme::RADIUS_CONTROL, p.accent);
+    ui.painter()
+        .rect_filled(rect, theme::RADIUS_CONTROL, p.accent);
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
@@ -120,7 +121,9 @@ fn app_bar(app: &mut ClientApp, ui: &mut egui::Ui) {
 fn account_menu(app: &mut ClientApp, ui: &mut egui::Ui, account: &str) {
     let p = theme::palette(ui.ctx());
     let button = egui::Button::new((
-        RichText::new(account).font(theme::semibold(13.0)).color(p.text),
+        RichText::new(account)
+            .font(theme::semibold(13.0))
+            .color(p.text),
         icons::text(icons::CHEVRON_DOWN, 14.0).color(p.muted),
     ))
     .frame_when_inactive(false)
@@ -131,7 +134,12 @@ fn account_menu(app: &mut ClientApp, ui: &mut egui::Ui, account: &str) {
         ui.label(widgets::muted(ui, format!("Signed in as {account}")).size(12.0));
         ui.separator();
         if ui
-            .add(widgets::btn(ui, Kind::Ghost, Some(icons::LOG_OUT), "Log out"))
+            .add(widgets::btn(
+                ui,
+                Kind::Ghost,
+                Some(icons::LOG_OUT),
+                "Log out",
+            ))
             .clicked()
         {
             app.send(Command::Logout);
@@ -232,8 +240,14 @@ mod tests {
     fn status_covers_every_auth() {
         assert_eq!(status(&Auth::Online), ("Online", Tone::Ok));
         assert_eq!(status(&Auth::Connecting), ("Connecting...", Tone::Neutral));
-        assert_eq!(status(&Auth::Offline), ("Offline - reconnecting", Tone::Warn));
-        assert_eq!(status(&Auth::Replaced), ("Signed in elsewhere", Tone::Danger));
+        assert_eq!(
+            status(&Auth::Offline),
+            ("Offline - reconnecting", Tone::Warn)
+        );
+        assert_eq!(
+            status(&Auth::Replaced),
+            ("Signed in elsewhere", Tone::Danger)
+        );
         let out = Auth::LoggedOut { message: None };
         assert_eq!(status(&out), ("Not signed in", Tone::Neutral));
         assert_eq!(

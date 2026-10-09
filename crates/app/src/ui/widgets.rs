@@ -158,7 +158,8 @@ pub(super) fn sized_field(
 /// Shows `button` stretched to the full available width with its label centred.
 pub(super) fn full_width(ui: &mut Ui, enabled: bool, button: Button<'static>) -> Response {
     let size = vec2(ui.available_width(), BUTTON_HEIGHT_LG);
-    ui.add_enabled_ui(enabled, |ui| ui.add_sized(size, button)).inner
+    ui.add_enabled_ui(enabled, |ui| ui.add_sized(size, button))
+        .inner
 }
 
 /// Shows a large text field for a device ID.
@@ -195,7 +196,11 @@ pub(super) fn title(text: impl Into<String>) -> RichText {
 
 /// Returns the width of `text` laid out in `font` on one line.
 pub(super) fn text_width(ui: &Ui, text: &str, font: egui::FontId) -> f32 {
-    ui.fonts_mut(|f| f.layout_no_wrap(text.to_string(), font, Color32::WHITE).size().x)
+    ui.fonts_mut(|f| {
+        f.layout_no_wrap(text.to_string(), font, Color32::WHITE)
+            .size()
+            .x
+    })
 }
 
 /// Shows a horizontal row of `width` points centred in the available width.
@@ -217,7 +222,8 @@ pub(super) fn switch(ui: &mut Ui, on: &mut bool) -> Response {
     let p = theme::palette(ui.ctx());
     let t = ui.ctx().animate_bool(response.id, *on);
     let track = if *on { p.accent } else { p.strong };
-    ui.painter().rect_filled(rect, CornerRadius::same(11), track);
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(11), track);
     let x = egui::lerp(rect.left() + 11.0..=rect.right() - 11.0, t);
     ui.painter()
         .circle_filled(egui::pos2(x, rect.center().y), 9.0, Color32::WHITE);
@@ -231,7 +237,9 @@ pub(super) fn switch(ui: &mut Ui, on: &mut bool) -> Response {
 pub(super) fn chip(ui: &mut Ui, tone: Tone, dot: bool, text: &str) -> Response {
     let p = theme::palette(ui.ctx());
     let (fg, bg) = tone.colors(p);
-    let galley = ui.painter().layout_no_wrap(text.to_string(), theme::semibold(12.0), fg);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), theme::semibold(12.0), fg);
     let dot_w = if dot { 13.0 } else { 0.0 };
     let size = vec2(galley.size().x + 20.0 + dot_w, 24.0);
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
@@ -386,13 +394,12 @@ pub(super) fn segmented<T: PartialEq + Copy>(
                     } else {
                         (p.muted, Color32::TRANSPARENT)
                     };
-                    let button = Button::new(
-                        RichText::new(*label).font(theme::semibold(13.0)).color(fg),
-                    )
-                    .fill(fill)
-                    .stroke(Stroke::NONE)
-                    .corner_radius(RADIUS_INNER)
-                    .min_size(vec2(0.0, 28.0));
+                    let button =
+                        Button::new(RichText::new(*label).font(theme::semibold(13.0)).color(fg))
+                            .fill(fill)
+                            .stroke(Stroke::NONE)
+                            .corner_radius(RADIUS_INNER)
+                            .min_size(vec2(0.0, 28.0));
                     if ui.add(button).clicked() && !selected {
                         *value = *item;
                         changed = true;
@@ -408,7 +415,11 @@ pub(super) fn segmented<T: PartialEq + Copy>(
 pub(super) fn toggle_chip(ui: &mut Ui, on: &mut bool, icon: char, label: &str) -> Response {
     let p = theme::palette(ui.ctx());
     let (fg, fill, stroke) = if *on {
-        (p.accent_text, p.accent_soft, Stroke::new(1.0, p.accent_soft))
+        (
+            p.accent_text,
+            p.accent_soft,
+            Stroke::new(1.0, p.accent_soft),
+        )
     } else {
         (p.muted, p.surface, Stroke::new(1.0, p.strong))
     };
@@ -460,7 +471,13 @@ pub(super) fn toggle_icon(ui: &mut Ui, on: &mut bool, icon: char, tooltip: &str)
 
 /// Shows a full-width strip in `tone` with an icon, wrapping text and
 /// actions laid out from the right edge.
-pub(super) fn banner(ui: &mut Ui, tone: Tone, icon: char, text: &str, actions: impl FnOnce(&mut Ui)) {
+pub(super) fn banner(
+    ui: &mut Ui,
+    tone: Tone,
+    icon: char,
+    text: &str,
+    actions: impl FnOnce(&mut Ui),
+) {
     let p = theme::palette(ui.ctx());
     let (fg, bg) = tone.colors(p);
     Frame::new()
@@ -516,7 +533,8 @@ pub(super) fn option_card(ui: &mut Ui, selected: bool, title_text: &str, desc: &
             ui.horizontal(|ui| {
                 let (rect, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
                 let ring = if selected { p.accent } else { p.strong };
-                ui.painter().circle_stroke(rect.center(), 7.0, Stroke::new(1.5, ring));
+                ui.painter()
+                    .circle_stroke(rect.center(), 7.0, Stroke::new(1.5, ring));
                 if selected {
                     ui.painter().circle_filled(rect.center(), 4.0, p.accent);
                 }
@@ -583,4 +601,3 @@ mod tests {
         assert_eq!(initials("élan vital"), "ÉV");
     }
 }
-

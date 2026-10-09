@@ -32,7 +32,12 @@ pub(super) fn show(app: &mut ClientApp, ui: &mut egui::Ui) {
         });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if ui
-                .add(widgets::btn(ui, Kind::Secondary, Some(icons::REFRESH), "Refresh"))
+                .add(widgets::btn(
+                    ui,
+                    Kind::Secondary,
+                    Some(icons::REFRESH),
+                    "Refresh",
+                ))
                 .clicked()
             {
                 app.send(Command::RefreshLists);

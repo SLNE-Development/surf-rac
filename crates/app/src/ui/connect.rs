@@ -20,7 +20,10 @@ const SEARCH_WIDTH: f32 = 220.0;
 /// Returns the contacts matching `query`: all for a blank query, by ID
 /// digits when the query is only digits and spaces, otherwise by alias,
 /// ignoring case.
-pub(super) fn filter_contacts<'a>(contacts: &'a [ContactView], query: &str) -> Vec<&'a ContactView> {
+pub(super) fn filter_contacts<'a>(
+    contacts: &'a [ContactView],
+    query: &str,
+) -> Vec<&'a ContactView> {
     let query = query.trim();
     if query.is_empty() {
         return contacts.iter().collect();
@@ -69,16 +72,19 @@ fn connect_card(app: &mut ClientApp, ui: &mut egui::Ui, online: bool) {
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
             ui.label(widgets::title("Connect to a device"));
-            ui.label(widgets::muted(ui, "Enter the 9-digit ID shown on the other computer.").size(13.0));
+            ui.label(
+                widgets::muted(ui, "Enter the 9-digit ID shown on the other computer.").size(13.0),
+            );
         });
         let mut submit = false;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
             let field_width = ui.available_width() - 130.0;
-            let field = widgets::id_field(ui, &mut app.forms.connect_id, "123 456 789", field_width);
+            let field =
+                widgets::id_field(ui, &mut app.forms.connect_id, "123 456 789", field_width);
             submit |= field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            let button = widgets::btn_lg(ui, Kind::Primary, None, "Connect")
-                .min_size(vec2(120.0, 46.0));
+            let button =
+                widgets::btn_lg(ui, Kind::Primary, None, "Connect").min_size(vec2(120.0, 46.0));
             submit |= ui.add_enabled(online, button).clicked();
         });
         ui.horizontal(|ui| {
@@ -128,9 +134,7 @@ fn id_card(app: &mut ClientApp, ui: &mut egui::Ui) {
         ui.label(widgets::muted(ui, "YOUR ID").font(theme::bold(11.0)));
         ui.horizontal(|ui| {
             let id = app.snap.device_id.map(format_id);
-            ui.label(
-                RichText::new(id.as_deref().unwrap_or("--- --- ---")).font(theme::bold(26.0)),
-            );
+            ui.label(RichText::new(id.as_deref().unwrap_or("--- --- ---")).font(theme::bold(26.0)));
             if let Some(id) = app.snap.device_id {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if widgets::icon_button(ui, icons::COPY, "Copy ID").clicked() {
@@ -175,7 +179,12 @@ fn contacts_card(app: &mut ClientApp, ui: &mut egui::Ui, online: bool) {
                     widgets::chip(ui, Tone::Neutral, false, &contacts.len().to_string());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
-                            .add(widgets::btn(ui, Kind::Secondary, Some(icons::PLUS), "Add contact"))
+                            .add(widgets::btn(
+                                ui,
+                                Kind::Secondary,
+                                Some(icons::PLUS),
+                                "Add contact",
+                            ))
                             .clicked()
                         {
                             app.forms.contact_dialog = Some(ContactDialog::default());
@@ -213,7 +222,10 @@ fn contact_row(app: &mut ClientApp, ui: &mut egui::Ui, c: &ContactView, online: 
     widgets::avatar(ui, &c.alias, 36.0);
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         widgets::icon_menu(ui, icons::ELLIPSIS, "More actions", |ui| {
-            if ui.add(widgets::btn(ui, Kind::Ghost, None, "Rename")).clicked() {
+            if ui
+                .add(widgets::btn(ui, Kind::Ghost, None, "Rename"))
+                .clicked()
+            {
                 app.forms.contact_dialog = Some(ContactDialog {
                     rename: true,
                     id: c.id.to_string(),
@@ -272,7 +284,10 @@ fn contact_dialog(app: &mut ClientApp, ctx: &egui::Context) {
             widgets::callout(ui, Tone::Danger, icons::CIRCLE_ALERT, error);
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui.add(widgets::btn(ui, Kind::Primary, None, "Save")).clicked() {
+            if ui
+                .add(widgets::btn(ui, Kind::Primary, None, "Save"))
+                .clicked()
+            {
                 let alias = dialog.alias.trim().to_string();
                 match parse_id(&dialog.id) {
                     Some(id) if !alias.is_empty() => {

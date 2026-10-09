@@ -201,9 +201,10 @@ fn font_definitions() -> FontDefinitions {
         FontFamily::Name(INTER_BOLD.into()),
         with_fallback(INTER_BOLD),
     );
-    fonts
-        .families
-        .insert(FontFamily::Name(LUCIDE.into()), vec![LUCIDE.into(), "inter-regular".into()]);
+    fonts.families.insert(
+        FontFamily::Name(LUCIDE.into()),
+        vec![LUCIDE.into(), "inter-regular".into()],
+    );
     fonts
 }
 
@@ -283,7 +284,10 @@ mod tests {
         let fonts = font_definitions();
         let proportional = &fonts.families[&FontFamily::Proportional];
         assert_eq!(proportional[0], "inter-regular");
-        assert!(proportional.len() > 1, "egui default fonts stay as fallback");
+        assert!(
+            proportional.len() > 1,
+            "egui default fonts stay as fallback"
+        );
         for family in [INTER_SEMIBOLD, INTER_BOLD, LUCIDE] {
             assert!(
                 fonts
@@ -291,7 +295,10 @@ mod tests {
                     .contains_key(&FontFamily::Name(family.into()))
             );
         }
-        assert_eq!(fonts.families[&FontFamily::Name(INTER_BOLD.into())][0], INTER_BOLD);
+        assert_eq!(
+            fonts.families[&FontFamily::Name(INTER_BOLD.into())][0],
+            INTER_BOLD
+        );
     }
 
     #[test]

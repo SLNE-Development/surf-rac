@@ -34,7 +34,10 @@ pub(super) fn show(app: &mut ClientApp, ui: &mut Ui) {
             saved_passwords_card(app, ui);
             advanced_card(app, ui);
             ui.vertical_centered(|ui| {
-                ui.label(widgets::muted(ui, format!("surf-rac {}", env!("CARGO_PKG_VERSION"))).size(12.0));
+                ui.label(
+                    widgets::muted(ui, format!("surf-rac {}", env!("CARGO_PKG_VERSION")))
+                        .size(12.0),
+                );
             });
         });
     });
@@ -80,76 +83,83 @@ fn incoming_card(app: &mut ClientApp, ui: &mut Ui) {
     let mut draft = app.forms.settings.take().unwrap_or_else(|| saved.clone());
     let mut save = false;
     let mut discard = false;
-    section(ui, "Incoming connections", |_| {}, |ui| {
-        setting_row(
-            ui,
-            true,
-            "Allow incoming connections",
-            "Others on your team can request to view this computer.",
-            |ui| {
-                widgets::switch(ui, &mut draft.allow_incoming);
-            },
-        );
-        widgets::hairline(ui);
-        Frame::new()
-            .inner_margin(Margin::symmetric(18, 14))
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 10.0;
-                ui.label(RichText::new("When someone connects").font(super::theme::semibold(14.0)));
-                ui.columns(2, |cols| {
-                    if widgets::option_card(
-                        &mut cols[0],
-                        !draft.unattended,
-                        "Always ask",
-                        "You accept or deny every request.",
-                    )
-                    .clicked()
-                    {
-                        draft.unattended = false;
-                    }
-                    if widgets::option_card(
-                        &mut cols[1],
-                        draft.unattended,
-                        "Unattended with password",
-                        "Viewers with the password connect without asking.",
-                    )
-                    .clicked()
-                    {
-                        draft.unattended = true;
-                    }
-                });
-            });
-        setting_row(
-            ui,
-            false,
-            "Sync clipboard in new sessions",
-            "Copy and paste between computers by default. Can be changed per session.",
-            |ui| {
-                widgets::switch(ui, &mut draft.clipboard_default);
-            },
-        );
-        if dirty(&draft, &saved) {
-            let p = super::theme::palette(ui.ctx());
+    section(
+        ui,
+        "Incoming connections",
+        |_| {},
+        |ui| {
+            setting_row(
+                ui,
+                true,
+                "Allow incoming connections",
+                "Others on your team can request to view this computer.",
+                |ui| {
+                    widgets::switch(ui, &mut draft.allow_incoming);
+                },
+            );
             widgets::hairline(ui);
             Frame::new()
-                .fill(p.surface2)
-                .inner_margin(Margin::symmetric(18, 10))
+                .inner_margin(Margin::symmetric(18, 14))
                 .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        ui.label(widgets::muted(ui, "Unsaved changes").size(13.0));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            save = ui
-                                .add(widgets::btn(ui, Kind::Primary, None, "Save changes"))
-                                .clicked();
-                            discard = ui
-                                .add(widgets::btn(ui, Kind::Ghost, None, "Discard"))
-                                .clicked();
-                        });
+                    ui.spacing_mut().item_spacing.y = 10.0;
+                    ui.label(
+                        RichText::new("When someone connects").font(super::theme::semibold(14.0)),
+                    );
+                    ui.columns(2, |cols| {
+                        if widgets::option_card(
+                            &mut cols[0],
+                            !draft.unattended,
+                            "Always ask",
+                            "You accept or deny every request.",
+                        )
+                        .clicked()
+                        {
+                            draft.unattended = false;
+                        }
+                        if widgets::option_card(
+                            &mut cols[1],
+                            draft.unattended,
+                            "Unattended with password",
+                            "Viewers with the password connect without asking.",
+                        )
+                        .clicked()
+                        {
+                            draft.unattended = true;
+                        }
                     });
                 });
-        }
-    });
+            setting_row(
+                ui,
+                false,
+                "Sync clipboard in new sessions",
+                "Copy and paste between computers by default. Can be changed per session.",
+                |ui| {
+                    widgets::switch(ui, &mut draft.clipboard_default);
+                },
+            );
+            if dirty(&draft, &saved) {
+                let p = super::theme::palette(ui.ctx());
+                widgets::hairline(ui);
+                Frame::new()
+                    .fill(p.surface2)
+                    .inner_margin(Margin::symmetric(18, 10))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(widgets::muted(ui, "Unsaved changes").size(13.0));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                save = ui
+                                    .add(widgets::btn(ui, Kind::Primary, None, "Save changes"))
+                                    .clicked();
+                                discard = ui
+                                    .add(widgets::btn(ui, Kind::Ghost, None, "Discard"))
+                                    .clicked();
+                            });
+                        });
+                    });
+            }
+        },
+    );
     if save {
         app.send(Command::SaveSettings(draft));
     } else if !discard {
@@ -198,7 +208,12 @@ fn password_card(app: &mut ClientApp, ui: &mut Ui) {
                             }
                             if set
                                 && ui
-                                    .add(widgets::btn(ui, Kind::DangerText, None, "Remove password"))
+                                    .add(widgets::btn(
+                                        ui,
+                                        Kind::DangerText,
+                                        None,
+                                        "Remove password",
+                                    ))
                                     .clicked()
                             {
                                 app.send(Command::SetUnattendedPassword(None));
@@ -232,59 +247,77 @@ fn set_password(app: &mut ClientApp) {
 /// Draws the passwords this computer remembers for other devices.
 fn saved_passwords_card(app: &mut ClientApp, ui: &mut Ui) {
     let saved = app.snap.saved_passwords.clone();
-    section(ui, "Saved passwords", |_| {}, |ui| {
-        if saved.is_empty() {
-            Frame::new()
-                .inner_margin(Margin::symmetric(18, 14))
-                .show(ui, |ui| ui.label(widgets::muted(ui, "No saved passwords.")));
-        }
-        for (i, id) in saved.into_iter().enumerate() {
-            let alias = app
-                .snap
-                .contacts
-                .iter()
-                .find(|c| c.id == id)
-                .map(|c| c.alias.clone())
-                .unwrap_or_default();
-            setting_row(ui, i == 0, &format_id(id), &alias, |ui| {
-                if ui.add(widgets::btn(ui, Kind::Ghost, None, "Forget")).clicked() {
-                    app.send(Command::ForgetPassword(id));
-                }
-            });
-        }
-    });
+    section(
+        ui,
+        "Saved passwords",
+        |_| {},
+        |ui| {
+            if saved.is_empty() {
+                Frame::new()
+                    .inner_margin(Margin::symmetric(18, 14))
+                    .show(ui, |ui| ui.label(widgets::muted(ui, "No saved passwords.")));
+            }
+            for (i, id) in saved.into_iter().enumerate() {
+                let alias = app
+                    .snap
+                    .contacts
+                    .iter()
+                    .find(|c| c.id == id)
+                    .map(|c| c.alias.clone())
+                    .unwrap_or_default();
+                setting_row(ui, i == 0, &format_id(id), &alias, |ui| {
+                    if ui
+                        .add(widgets::btn(ui, Kind::Ghost, None, "Forget"))
+                        .clicked()
+                    {
+                        app.send(Command::ForgetPassword(id));
+                    }
+                });
+            }
+        },
+    );
 }
 
 /// Draws the Defender exclusion and the server rows.
 fn advanced_card(app: &mut ClientApp, ui: &mut Ui) {
     let server = app.snap.server_url.clone();
-    section(ui, "Advanced", |_| {}, |ui| {
-        setting_row(
-            ui,
-            true,
-            "Microsoft Defender exclusion",
-            "surf-rac is not signed, so Defender may block it. Asks for administrator rights.",
-            |ui| {
+    section(
+        ui,
+        "Advanced",
+        |_| {},
+        |ui| {
+            setting_row(
+                ui,
+                true,
+                "Microsoft Defender exclusion",
+                "surf-rac is not signed, so Defender may block it. Asks for administrator rights.",
+                |ui| {
+                    if ui
+                        .add(widgets::btn(
+                            ui,
+                            Kind::Secondary,
+                            Some(icons::SHIELD),
+                            "Add exclusion",
+                        ))
+                        .clicked()
+                    {
+                        app.forms.notice = Some(match crate::defender::add_exclusion() {
+                            Ok(()) => "Exclusion requested.".into(),
+                            Err(e) => e,
+                        });
+                    }
+                },
+            );
+            setting_row(ui, false, "Server", &server, |ui| {
                 if ui
-                    .add(widgets::btn(ui, Kind::Secondary, Some(icons::SHIELD), "Add exclusion"))
+                    .add(widgets::btn(ui, Kind::Secondary, None, "Change\u{2026}"))
                     .clicked()
                 {
-                    app.forms.notice = Some(match crate::defender::add_exclusion() {
-                        Ok(()) => "Exclusion requested.".into(),
-                        Err(e) => e,
-                    });
+                    app.forms.server_dialog = true;
                 }
-            },
-        );
-        setting_row(ui, false, "Server", &server, |ui| {
-            if ui
-                .add(widgets::btn(ui, Kind::Secondary, None, "Change\u{2026}"))
-                .clicked()
-            {
-                app.forms.server_dialog = true;
-            }
-        });
-    });
+            });
+        },
+    );
 }
 
 #[cfg(test)]

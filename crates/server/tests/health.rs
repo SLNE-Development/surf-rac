@@ -13,7 +13,7 @@ async fn healthz_ok(pool: PgPool) {
 
 #[sqlx::test(migrations = "./migrations")]
 async fn migrations_create_tables(pool: PgPool) {
-    for table in ["users", "invites", "sessions", "devices", "contacts"] {
+    for table in ["users", "sessions", "devices", "device_links", "contacts"] {
         let count: i64 = sqlx::query_scalar(&format!("select count(*) from {table}"))
             .fetch_one(&pool)
             .await

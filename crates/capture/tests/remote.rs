@@ -29,8 +29,6 @@ use std::time::{Duration, Instant};
 
 use common::{host_event, viewer_event};
 use livekit::webrtc::native::yuv_helper;
-use rand::Rng;
-use serde_json::{Value, json};
 use surf_rac_capture::mf::{EncodeError, MfEncoder};
 use surf_rac_capture::{ScreenShare, ShareOptions};
 use surf_rac_protocol::DeviceId;
@@ -39,65 +37,35 @@ use surf_rac_session::Frame;
 use surf_rac_session::host::{HostEvent, HostSession};
 use surf_rac_session::signaling::SignalingClient;
 use surf_rac_session::viewer::{ViewerEvent, ViewerSession};
-use surf_rac_session::{DeviceKeys, EncodedFrame, KnownKeys, SessionConfig, VideoInput};
+use surf_rac_session::{EncodedFrame, IdentityKey, KnownKeys, SessionConfig, VideoInput};
 
 /// A device registered on the deployed server for a test.
 struct RemoteDevice {
     /// Device ID.
     id: DeviceId,
-    /// Device secret.
-    secret: String,
+    /// The device's identity key.
+    identity: Arc<IdentityKey>,
+    /// Lowercase hex SHA-256 of the device's hardware fingerprint.
+    fingerprint: String,
 }
 
-/// Registers a throwaway device named `name` for `token` on `server`.
-async fn register_device(
-    client: &reqwest::Client,
-    server: &str,
-    token: &str,
-    name: &str,
-) -> RemoteDevice {
-    let fingerprint: String = (0..64)
-        .map(|_| char::from_digit(rand::thread_rng().gen_range(0..16), 16).unwrap())
-        .collect();
-    let res = client
-        .post(format!("{server}/v1/devices"))
-        .bearer_auth(token)
-        .json(&json!({"fingerprint_hash": fingerprint, "name": name}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 200, "register {name}");
-    let body: Value = res.json().await.unwrap();
+/// Registers a throwaway device named `name` with a fresh identity key on `server`.
+async fn register_remote(client: &reqwest::Client, server: &str, name: &str) -> RemoteDevice {
+    let identity = Arc::new(IdentityKey::generate());
+    let fingerprint = common::random_fingerprint();
+    let id = common::register_device(client, server, None, &identity, &fingerprint, name).await;
     RemoteDevice {
-        id: body["device_id"].as_str().unwrap().parse().unwrap(),
-        secret: body["device_secret"].as_str().unwrap().to_owned(),
+        id,
+        identity,
+        fingerprint,
     }
 }
 
-/// Deletes device `id` of `token` on `server`.
-async fn delete_device(client: &reqwest::Client, server: &str, token: &str, id: DeviceId) {
-    let res = client
-        .delete(format!("{server}/v1/devices/{id}"))
-        .bearer_auth(token)
-        .send()
+/// Opens the signaling connection of `device` to `server`.
+async fn connect_remote(server: &str, device: &RemoteDevice) -> SignalingClient {
+    SignalingClient::connect(&ws_url(server), device.id, &device.identity, &device.fingerprint)
         .await
-        .unwrap();
-    println!("deleted device {id}: HTTP {}", res.status());
-}
-
-/// Logs in to `server` with the account from the environment and returns the session token.
-async fn login(client: &reqwest::Client, server: &str) -> String {
-    let res = client
-        .post(format!("{server}/v1/login"))
-        .json(&json!({"username": common::env("SURF_RAC_USERNAME"), "password": common::env("SURF_RAC_PASSWORD")}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 200, "login");
-    res.json::<Value>().await.unwrap()["token"]
-        .as_str()
-        .unwrap()
-        .to_owned()
+        .expect("signaling connect")
 }
 
 /// Returns the WebSocket base URL of the HTTP base `server`.
@@ -162,16 +130,13 @@ async fn passthrough_e2ee_reaches_viewer() {
     }
     let server = common::env("SURF_RAC_SERVER");
     let client = reqwest::Client::new();
-    let token = login(&client, &server).await;
-    let h = register_device(&client, &server, &token, "spike-host").await;
-    let v = register_device(&client, &server, &token, "spike-viewer").await;
+    let h = register_remote(&client, &server, "spike-host").await;
+    let v = register_remote(&client, &server, "spike-viewer").await;
     let outcome = async {
-        let host_sig = SignalingClient::connect(&ws_url(&server), &token, h.id, &h.secret)
-            .await
-            .expect("host signaling");
+        let host_sig = connect_remote(&server, &h).await;
         let (host, mut host_events) = HostSession::start(
             host_sig,
-            Arc::new(DeviceKeys::generate()),
+            Arc::clone(&h.identity),
             Arc::new(Mutex::new(KnownKeys::default())),
             1280,
             720,
@@ -190,12 +155,10 @@ async fn passthrough_e2ee_reaches_viewer() {
             std::thread::spawn(move || feed_encoded(host, stop, requests))
         };
 
-        let viewer_sig = SignalingClient::connect(&ws_url(&server), &token, v.id, &v.secret)
-            .await
-            .expect("viewer signaling");
+        let viewer_sig = connect_remote(&server, &v).await;
         let pending = tokio::spawn(ViewerSession::request(
             viewer_sig,
-            Arc::new(DeviceKeys::generate()),
+            Arc::clone(&v.identity),
             Arc::new(Mutex::new(KnownKeys::default())),
             h.id,
             SessionConfig::default(),
@@ -239,8 +202,6 @@ async fn passthrough_e2ee_reaches_viewer() {
         (patterned, requests)
     }
     .await;
-    delete_device(&client, &server, &token, h.id).await;
-    delete_device(&client, &server, &token, v.id).await;
     assert!(outcome.0 >= 100, "only {} patterned frames in 10 s", outcome.0);
     assert!(outcome.1 >= 1, "the host never saw a keyframe request");
 }
@@ -308,18 +269,15 @@ async fn remote_share_host() {
         .and_then(|d| d.parse().ok())
         .unwrap_or(120);
     let client = reqwest::Client::new();
-    let token = login(&client, &server).await;
-    let dev = register_device(&client, &server, &token, "share-host").await;
+    let dev = register_remote(&client, &server, "share-host").await;
     println!("HOST DEVICE ID: {}", dev.id);
     if let Ok(path) = std::env::var("SURF_RAC_HOST_ID_FILE") {
         std::fs::write(path, dev.id.to_string()).expect("write host id file");
     }
-    let signaling = SignalingClient::connect(&ws_url(&server), &token, dev.id, &dev.secret)
-        .await
-        .expect("host signaling");
+    let signaling = connect_remote(&server, &dev).await;
     let (host, mut events) = HostSession::start(
         signaling,
-        Arc::new(DeviceKeys::generate()),
+        Arc::clone(&dev.identity),
         Arc::new(Mutex::new(KnownKeys::default())),
         1280,
         720,
@@ -351,7 +309,6 @@ async fn remote_share_host() {
     let _ = tokio::time::timeout(Duration::from_secs(duration), run).await;
     share.stop().await;
     host.close().await;
-    delete_device(&client, &server, &token, dev.id).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -367,16 +324,13 @@ async fn remote_share_viewer() {
     .expect("host device ID");
     let png_path = std::env::var("SURF_RAC_FRAME_PNG").unwrap_or_else(|_| "frame.png".into());
     let client = reqwest::Client::new();
-    let token = login(&client, &server).await;
-    let dev = register_device(&client, &server, &token, "share-viewer").await;
+    let dev = register_remote(&client, &server, "share-viewer").await;
     let outcome = async {
-        let signaling = SignalingClient::connect(&ws_url(&server), &token, dev.id, &dev.secret)
-            .await
-            .expect("viewer signaling");
+        let signaling = connect_remote(&server, &dev).await;
         let started = Instant::now();
         let (viewer, mut events) = ViewerSession::request(
             signaling,
-            Arc::new(DeviceKeys::generate()),
+            Arc::clone(&dev.identity),
             Arc::new(Mutex::new(KnownKeys::default())),
             host,
             SessionConfig::default(),
@@ -430,6 +384,5 @@ async fn remote_share_viewer() {
         count
     }
     .await;
-    delete_device(&client, &server, &token, dev.id).await;
     assert!(outcome >= 100, "only {outcome} frames in 10 s");
 }

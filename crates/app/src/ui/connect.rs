@@ -50,14 +50,18 @@ pub(super) fn show(app: &mut ClientApp, ui: &mut egui::Ui) {
     let left = (ui.available_width() - ID_CARD_WIDTH - gap).max(260.0);
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = gap;
-        ui.allocate_ui(vec2(left, 0.0), |ui| {
+        ui.allocate_ui_with_layout(vec2(left, 0.0), Layout::top_down(Align::Min), |ui| {
             ui.set_width(left);
             connect_card(app, ui, online);
         });
-        ui.allocate_ui(vec2(ID_CARD_WIDTH, 0.0), |ui| {
-            ui.set_width(ID_CARD_WIDTH);
-            id_card(app, ui);
-        });
+        ui.allocate_ui_with_layout(
+            vec2(ID_CARD_WIDTH, 0.0),
+            Layout::top_down(Align::Min),
+            |ui| {
+                ui.set_width(ID_CARD_WIDTH);
+                id_card(app, ui);
+            },
+        );
     });
     ui.add_space(gap);
     contacts_card(app, ui, online);

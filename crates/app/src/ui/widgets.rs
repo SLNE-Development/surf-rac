@@ -168,9 +168,9 @@ pub(super) fn id_field(ui: &mut Ui, value: &mut String, hint: &str, width: f32) 
         TextEdit::singleline(value)
             .hint_text(hint.to_string())
             .font(theme::semibold(18.0))
-            .margin(Margin::symmetric(12, 11))
+            .margin(Margin::symmetric(12, 12))
             .desired_width(width)
-            .min_size(vec2(width, 46.0)),
+            .min_size(vec2(width, 0.0)),
     )
 }
 

@@ -2,6 +2,7 @@
 //! prompt, the host's connections and each viewer session.
 
 mod connect;
+mod devices;
 mod icons;
 mod login;
 mod main_window;

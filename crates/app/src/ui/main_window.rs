@@ -5,7 +5,7 @@ use eframe::egui::{self, Align, Frame, Layout, Margin, RichText};
 use surf_rac_protocol::DeviceId;
 
 use super::widgets::{self, Kind, Tone};
-use super::{ClientApp, Tab, connect, icons, login, theme};
+use super::{ClientApp, Tab, connect, devices, icons, login, theme};
 use crate::access::MIN_PASSWORD_LEN;
 use crate::runtime::{Auth, Command};
 
@@ -79,7 +79,7 @@ fn signed_in(app: &mut ClientApp, ui: &mut egui::Ui) {
                         .inner_margin(Margin::symmetric(24, 20))
                         .show(ui, |ui| match app.tab {
                             Tab::Connect => connect::show(app, ui),
-                            Tab::Devices => devices_tab(app, ui),
+                            Tab::Devices => devices::show(app, ui),
                             Tab::Settings => settings_tab(app, ui),
                         });
                 });
@@ -223,51 +223,6 @@ fn server_dialog(app: &mut ClientApp, ctx: &egui::Context) {
         app.forms.server_dialog = false;
         app.forms.server_url = None;
     }
-}
-
-/// Draws the account's devices.
-fn devices_tab(app: &mut ClientApp, ui: &mut egui::Ui) {
-    ui.heading("My devices");
-    let devices = app.snap.devices.clone();
-    egui::Grid::new("devices")
-        .num_columns(4)
-        .striped(true)
-        .show(ui, |ui| {
-            for d in devices {
-                ui.label(&d.name);
-                ui.monospace(format_id(d.device_id));
-                ui.label(if d.online {
-                    "online".to_string()
-                } else {
-                    d.last_seen_at
-                        .map(|t| format!("last seen {}", t.format("%Y-%m-%d %H:%M")))
-                        .unwrap_or_else(|| "offline".into())
-                });
-                if Some(d.device_id) == app.snap.device_id {
-                    ui.label("this device");
-                } else {
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(
-                                d.online && app.snap.auth == Auth::Online,
-                                egui::Button::new("Connect"),
-                            )
-                            .clicked()
-                        {
-                            app.send(Command::Connect {
-                                host: d.device_id,
-                                password: None,
-                                remember: false,
-                            });
-                        }
-                        if ui.small_button("Remove").clicked() {
-                            app.send(Command::DeleteDevice(d.device_id));
-                        }
-                    });
-                }
-                ui.end_row();
-            }
-        });
 }
 
 /// Draws the settings.

@@ -426,3 +426,162 @@ async fn tampered_session_key_is_dropped(pool: PgPool) {
     let pending = request(&v, h.id, SessionConfig::default());
     accept_next(&host, &mut host_events, pending).await;
 }
+
+/// Waits up to `wait` for the first signaling message on `events` that `pick` maps to a value.
+async fn next_signal<T>(
+    events: &mut surf_rac_session::signaling::SignalingEvents,
+    wait: Duration,
+    pick: impl Fn(ServerMessage) -> Option<T>,
+) -> T {
+    tokio::time::timeout(wait, async {
+        loop {
+            let msg = events.recv().await.expect("signaling ended");
+            if let Some(value) = pick(msg) {
+                return value;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for a signaling message")
+}
+
+#[sqlx::test(migrations = "../server/migrations")]
+async fn response_with_other_key_than_challenge_is_rejected(pool: PgPool) {
+    use base64::engine::general_purpose::STANDARD;
+    use surf_rac_session::viewer::RequestOptions;
+
+    let env = TestEnv::start(pool).await;
+    let (h, v) = (env.device("host", 1).await, env.device("viewer", 2).await);
+    let mut host_sig = h.signaling.subscribe();
+    let options = RequestOptions {
+        password: Some("hunter22".into()),
+    };
+    let pending = common::request_with(&v, h.id, options, SessionConfig::default());
+    let session_id = next_signal(&mut host_sig, Duration::from_secs(5), |m| match m {
+        ServerMessage::SessionRequest { session_id, .. } => Some(session_id),
+        _ => None,
+    })
+    .await;
+    let nonce = STANDARD.encode([3u8; 32]);
+    let signed = |key: &Ephemeral| {
+        crypto::signature_to_base64(&h.identity.sign_session(
+            Role::Host,
+            &session_id,
+            &key.public(),
+        ))
+    };
+    let (challenged, answered) = (Ephemeral::generate(), Ephemeral::generate());
+    h.signaling
+        .send(ClientMessage::PasswordChallenge {
+            to: v.id,
+            session_id: session_id.clone(),
+            session_key: challenged.public().to_base64(),
+            signature: signed(&challenged),
+            host_nonce: nonce.clone(),
+        })
+        .await
+        .unwrap();
+    next_signal(&mut host_sig, Duration::from_secs(5), |m| match m {
+        ServerMessage::SessionPassword { .. } => Some(()),
+        _ => None,
+    })
+    .await;
+    h.signaling
+        .send(ClientMessage::SessionResponse {
+            to: v.id,
+            session_id: session_id.clone(),
+            accepted: true,
+            reason: None,
+            session_key: Some(answered.public().to_base64()),
+            signature: Some(signed(&answered)),
+            host_nonce: Some(nonce),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        pending.await.unwrap().err(),
+        Some(RequestError::ChallengeMismatch)
+    );
+}
+
+#[sqlx::test(migrations = "../server/migrations")]
+async fn expired_challenge_is_denied_to_viewer(pool: PgPool) {
+    let env = TestEnv::start(pool).await;
+    let (h, v) = (env.device("host", 1).await, env.device("viewer", 2).await);
+    let config = SessionConfig {
+        challenge_timeout: Duration::from_secs(1),
+        ..SessionConfig::default()
+    };
+    let (host, mut host_events) = start_host(&h, config).await;
+    host.set_password_access(true);
+    let mut viewer_sig = v.signaling.subscribe();
+    let ephemeral = Ephemeral::generate();
+    let signature = v
+        .identity
+        .sign_session(Role::Viewer, "silent", &ephemeral.public());
+    v.signaling
+        .send(ClientMessage::SessionRequest {
+            to: h.id,
+            session_id: "silent".into(),
+            session_key: ephemeral.public().to_base64(),
+            signature: crypto::signature_to_base64(&signature),
+            unattended: true,
+        })
+        .await
+        .unwrap();
+    next_signal(&mut viewer_sig, Duration::from_secs(5), |m| match m {
+        ServerMessage::PasswordChallenge { session_id, .. } if session_id == "silent" => Some(()),
+        _ => None,
+    })
+    .await;
+    let started = Instant::now();
+    let accepted = next_signal(&mut viewer_sig, Duration::from_secs(4), |m| match m {
+        ServerMessage::SessionResponse {
+            session_id,
+            accepted,
+            ..
+        } if session_id == "silent" => Some(accepted),
+        _ => None,
+    })
+    .await;
+    assert!(!accepted, "an expired challenge is refused");
+    assert!(started.elapsed() < Duration::from_secs(4));
+    let ev = host_event(&mut host_events, Duration::from_secs(2), |e| {
+        matches!(e, HostEvent::RequestExpired { .. })
+    })
+    .await;
+    assert!(matches!(ev, HostEvent::RequestExpired { session_id, .. } if session_id == "silent"));
+}
+
+#[sqlx::test(migrations = "../server/migrations")]
+async fn request_awaiting_password_cannot_be_accepted(pool: PgPool) {
+    let env = TestEnv::start(pool).await;
+    let (h, v) = (env.device("host", 1).await, env.device("viewer", 2).await);
+    let (host, _host_events) = start_host(&h, SessionConfig::default()).await;
+    host.set_password_access(true);
+    let mut viewer_sig = v.signaling.subscribe();
+    let ephemeral = Ephemeral::generate();
+    let signature = v
+        .identity
+        .sign_session(Role::Viewer, "waiting", &ephemeral.public());
+    v.signaling
+        .send(ClientMessage::SessionRequest {
+            to: h.id,
+            session_id: "waiting".into(),
+            session_key: ephemeral.public().to_base64(),
+            signature: crypto::signature_to_base64(&signature),
+            unattended: true,
+        })
+        .await
+        .unwrap();
+    next_signal(&mut viewer_sig, Duration::from_secs(5), |m| match m {
+        ServerMessage::PasswordChallenge { .. } => Some(()),
+        _ => None,
+    })
+    .await;
+    assert!(
+        host.accept("waiting").await.is_err(),
+        "a request without its password cannot be accepted"
+    );
+    host.deny("waiting").await.unwrap();
+}

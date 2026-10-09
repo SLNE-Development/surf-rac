@@ -54,11 +54,6 @@ const REFUSAL_INTERVAL: Duration = Duration::from_secs(2);
 /// How long an accepted viewer may take to join before its slot is freed.
 const JOIN_WINDOW: Duration = Duration::from_secs(70);
 
-/// How long the host waits for the unattended password after sending its
-/// password challenge; after that the request expires and the host's
-/// per-session secret is dropped.
-pub const CHALLENGE_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// Highest frame rate the video track is encoded at.
 const MAX_FRAMERATE: f64 = 30.0;
 
@@ -111,7 +106,9 @@ pub enum HostEvent {
         /// The viewer device.
         viewer: DeviceId,
     },
-    /// A request was not answered within the request timeout; the viewer has given up.
+    /// A request expired: it was not answered within the request timeout, so
+    /// the viewer has given up, or the viewer did not send its password within
+    /// the challenge timeout, so the host refused it.
     RequestExpired {
         /// Identifies the request.
         session_id: String,
@@ -270,7 +267,11 @@ struct Pending {
 /// The step an unanswered session request is at.
 enum Stage {
     /// The user was asked to accept or deny it.
-    Prompt,
+    Prompt {
+        /// The session keys agreed in an earlier password challenge, which an
+        /// accept answers with; `None` when there was no challenge.
+        agreed: Option<Agreed>,
+    },
     /// A password challenge was sent at `sent_at`; the host waits for the password.
     AwaitingPassword {
         /// The host's per-session key pair offered in the challenge.
@@ -378,21 +379,34 @@ impl State {
     }
 
     /// Removes and returns requests older than `timeout`, and requests whose
-    /// password challenge is older than [`CHALLENGE_TIMEOUT`], as `(session_id, viewer)`.
-    fn expire_pending(&mut self, now: Instant, timeout: Duration) -> Vec<(String, DeviceId)> {
+    /// password challenge is older than `challenge_timeout`.
+    ///
+    /// Each entry is `(session_id, viewer, challenged)`, where `challenged`
+    /// says whether the request was still waiting for its password.
+    fn expire_pending(
+        &mut self,
+        now: Instant,
+        timeout: Duration,
+        challenge_timeout: Duration,
+    ) -> Vec<(String, DeviceId, bool)> {
         let expired: Vec<String> = self
             .pending
             .iter()
             .filter(|(_, p)| {
                 now.duration_since(p.requested_at) >= timeout
                     || matches!(p.stage, Stage::AwaitingPassword { sent_at, .. }
-                        if now.duration_since(sent_at) >= CHALLENGE_TIMEOUT)
+                        if now.duration_since(sent_at) >= challenge_timeout)
             })
             .map(|(sid, _)| sid.clone())
             .collect();
         expired
             .into_iter()
-            .filter_map(|sid| self.pending.remove(&sid).map(|p| (sid, p.viewer)))
+            .filter_map(|sid| {
+                self.pending.remove(&sid).map(|p| {
+                    let challenged = matches!(p.stage, Stage::AwaitingPassword { .. });
+                    (sid, p.viewer, challenged)
+                })
+            })
             .collect()
     }
 
@@ -559,31 +573,34 @@ impl HostSession {
     ///
     /// The viewer gets the host's per-session key, signed with the host's
     /// identity key, the host nonce and a join token for the room. After a
-    /// password challenge these are the key and nonce of the challenge;
-    /// otherwise they are fresh. When the room already has [`MAX_VIEWERS`]
-    /// viewers the request is refused as room full instead.
+    /// password challenge, also one whose password was rejected, these are the
+    /// key and nonce of the challenge; otherwise they are fresh. When the room
+    /// already has [`MAX_VIEWERS`] viewers the request is refused as room full
+    /// instead. Fails with [`HostError::UnknownRequest`] while the request
+    /// still waits for its password.
     pub async fn accept(&self, session_id: &str) -> Result<(), HostError> {
         let inner = &self.inner;
         inner.expire_requests().await;
         let (viewer, outcome) = {
             let mut st = lock(&inner.state);
+            if st
+                .pending
+                .get(session_id)
+                .is_some_and(|p| matches!(p.stage, Stage::AwaitingPassword { .. }))
+            {
+                return Err(HostError::UnknownRequest);
+            }
             let pending = st
                 .pending
                 .remove(session_id)
                 .ok_or(HostError::UnknownRequest)?;
             let agreed = match pending.stage {
-                Stage::PasswordReceived { agreed } => Ok(agreed),
-                Stage::AwaitingPassword {
-                    ephemeral, nonce, ..
-                } => Agreed::new(
-                    &ephemeral,
-                    nonce,
-                    &pending.session_key,
-                    session_id,
-                    inner.device,
-                    pending.viewer,
-                ),
-                Stage::Prompt => Agreed::new(
+                Stage::PasswordReceived { agreed }
+                | Stage::Prompt {
+                    agreed: Some(agreed),
+                } => Ok(agreed),
+                Stage::AwaitingPassword { .. } => unreachable!("checked above"),
+                Stage::Prompt { agreed: None } => Agreed::new(
                     &Ephemeral::generate(),
                     crypto::random_nonce(),
                     &pending.session_key,
@@ -620,10 +637,10 @@ impl HostSession {
 
     /// Reports that the password of request `session_id` was wrong.
     ///
-    /// The request falls back to asking the user: the host drops the
-    /// challenge's keys and emits [`HostEvent::ViewerRequested`] with
-    /// `unattended` set. Fails with [`HostError::UnknownRequest`] unless the
-    /// request's password was received and not yet answered.
+    /// The request falls back to asking the user: the host emits
+    /// [`HostEvent::ViewerRequested`] with `unattended` set and keeps the
+    /// challenge's keys for an accept. Fails with [`HostError::UnknownRequest`]
+    /// unless the request's password was received and not yet answered.
     pub async fn reject_password(&self, session_id: &str) -> Result<(), HostError> {
         let event = {
             let mut st = lock(&self.inner.state);
@@ -632,7 +649,14 @@ impl HostSession {
                 .get_mut(session_id)
                 .filter(|p| matches!(p.stage, Stage::PasswordReceived { .. }))
                 .ok_or(HostError::UnknownRequest)?;
-            pending.stage = Stage::Prompt;
+            let Stage::PasswordReceived { agreed } =
+                std::mem::replace(&mut pending.stage, Stage::Prompt { agreed: None })
+            else {
+                unreachable!("checked above")
+            };
+            pending.stage = Stage::Prompt {
+                agreed: Some(agreed),
+            };
             prompt_event(session_id, pending, true)
         };
         tracing::info!(%session_id, "password rejected, asking the user");
@@ -908,11 +932,23 @@ impl Inner {
         let _ = self.events.send(HostEvent::ViewerLeft { viewer }).await;
     }
 
-    /// Drops requests the viewer has given up on and reports each one.
+    /// Drops expired requests and reports each one.
+    ///
+    /// A request whose viewer did not send its password within the challenge
+    /// timeout is also refused to the viewer.
     async fn expire_requests(&self) {
-        let expired = lock(&self.state).expire_pending(Instant::now(), self.config.request_timeout);
-        for (session_id, viewer) in expired {
-            tracing::info!(viewer = %viewer, %session_id, "session request expired");
+        let expired = lock(&self.state).expire_pending(
+            Instant::now(),
+            self.config.request_timeout,
+            self.config.challenge_timeout,
+        );
+        for (session_id, viewer, challenged) in expired {
+            tracing::info!(viewer = %viewer, %session_id, challenged, "session request expired");
+            if challenged {
+                let _ = self
+                    .respond(viewer, &session_id, Err(DenyReason::Denied))
+                    .await;
+            }
             let _ = self
                 .events
                 .send(HostEvent::RequestExpired { session_id, viewer })
@@ -1012,7 +1048,7 @@ impl Inner {
                             };
                             (stage, Some(offer))
                         } else {
-                            (Stage::Prompt, None)
+                            (Stage::Prompt { agreed: None }, None)
                         };
                         let pending = Pending {
                             viewer,
@@ -1448,7 +1484,7 @@ mod tests {
     }
 
     fn pending(st: &mut State, sid: &str, viewer: DeviceId, at: Instant) {
-        pending_at(st, sid, viewer, at, Stage::Prompt);
+        pending_at(st, sid, viewer, at, Stage::Prompt { agreed: None });
     }
 
     fn pending_at(st: &mut State, sid: &str, viewer: DeviceId, at: Instant, stage: Stage) {
@@ -1486,13 +1522,18 @@ mod tests {
             awaiting(t0 + Duration::from_secs(10)),
         );
         pending(&mut st, "prompt", id(3), t0);
-        let later = t0 + CHALLENGE_TIMEOUT;
-        let gone = st.expire_pending(later, Duration::from_secs(60));
-        assert_eq!(gone, vec![("challenged".to_owned(), id(1))]);
+        let challenge = Duration::from_secs(30);
+        let later = t0 + challenge;
+        let gone = st.expire_pending(later, Duration::from_secs(60), challenge);
+        assert_eq!(gone, vec![("challenged".to_owned(), id(1), true)]);
         assert!(st.pending.contains_key("fresh"));
         assert!(st.pending.contains_key("prompt"));
-        let gone = st.expire_pending(later + Duration::from_secs(10), Duration::from_secs(60));
-        assert_eq!(gone, vec![("fresh".to_owned(), id(2))]);
+        let gone = st.expire_pending(
+            later + Duration::from_secs(10),
+            Duration::from_secs(60),
+            challenge,
+        );
+        assert_eq!(gone, vec![("fresh".to_owned(), id(2), true)]);
         assert!(
             st.pending.contains_key("prompt"),
             "a prompt waits for the request timeout"
@@ -1562,8 +1603,12 @@ mod tests {
         let t0 = Instant::now();
         pending(&mut st, "old", id(1), t0);
         pending(&mut st, "new", id(2), t0 + Duration::from_secs(50));
-        let gone = st.expire_pending(t0 + Duration::from_secs(61), Duration::from_secs(60));
-        assert_eq!(gone, vec![("old".to_owned(), id(1))]);
+        let gone = st.expire_pending(
+            t0 + Duration::from_secs(61),
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        );
+        assert_eq!(gone, vec![("old".to_owned(), id(1), false)]);
         assert!(st.pending.contains_key("new"));
     }
 

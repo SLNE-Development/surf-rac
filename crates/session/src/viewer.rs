@@ -94,6 +94,10 @@ pub enum RequestError {
     /// The host presented a key that differs from its pinned key.
     #[error(transparent)]
     KeyChanged(#[from] KeyChanged),
+    /// The host accepted with a per-session key, signature or host nonce that
+    /// differs from the ones of its password challenge.
+    #[error("host answered with other keys than its password challenge")]
+    ChallengeMismatch,
     /// The signaling connection failed.
     #[error(transparent)]
     Signaling(#[from] SignalingError),
@@ -162,7 +166,10 @@ impl ViewerSession {
     /// per-session key and sent. A wrong password leaves the decision to the
     /// host's user. A challenge with an invalid signature fails the request
     /// with [`RequestError::Denied`], one from a host whose identity key
-    /// differs from the pin with [`RequestError::KeyChanged`].
+    /// differs from the pin with [`RequestError::KeyChanged`]. After a
+    /// challenge, an accepted response must carry the challenge's per-session
+    /// key, signature and host nonce, or the request fails with
+    /// [`RequestError::ChallengeMismatch`].
     pub async fn request_with(
         signaling: SignalingClient,
         identity: Arc<IdentityKey>,
@@ -191,6 +198,7 @@ impl ViewerSession {
             let mut key = None;
             let mut token = None;
             let mut password = options.password.as_deref();
+            let mut challenge: Option<(String, String, String)> = None;
             loop {
                 match sig_events.recv().await {
                     None => return Err(RequestError::Signaling(SignalingError::Closed)),
@@ -205,8 +213,8 @@ impl ViewerSession {
                         session_id: sid,
                         session_key,
                         signature,
+                        host_nonce,
                         identity_key,
-                        ..
                     }) if from == host && sid == session_id => {
                         let Some(pw) = password.take() else {
                             tracing::warn!(%host, %session_id, "unexpected password challenge ignored");
@@ -231,6 +239,7 @@ impl ViewerSession {
                             })
                             .await?;
                         tracing::info!(%host, %session_id, "unattended password sent");
+                        challenge = Some((session_key, signature, host_nonce));
                     }
                     Some(ServerMessage::SessionResponse {
                         from,
@@ -247,6 +256,15 @@ impl ViewerSession {
                                 Some(DenyReason::RoomFull) => RequestError::RoomFull,
                                 _ => RequestError::Denied,
                             });
+                        }
+                        if let Some((c_key, c_sig, c_nonce)) = &challenge {
+                            let same = session_key.as_ref() == Some(c_key)
+                                && signature.as_ref() == Some(c_sig)
+                                && host_nonce.as_ref() == Some(c_nonce);
+                            if !same {
+                                tracing::warn!(%host, %session_id, "accepted keys differ from the password challenge");
+                                return Err(RequestError::ChallengeMismatch);
+                            }
                         }
                         let accepted = AcceptedKeys {
                             identity_key: identity_key.as_deref(),

@@ -14,15 +14,20 @@ pub struct SessionConfig {
     pub reconnect_window: Duration,
     /// Whether media must go through the TURN relay only (default false).
     pub force_relay: bool,
+    /// How long a host waits for the unattended password after its password
+    /// challenge before it refuses the request (default 30 s).
+    pub challenge_timeout: Duration,
 }
 
 impl Default for SessionConfig {
-    /// Returns the production settings: 60 s request timeout, 30 s reconnect window, no forced relay.
+    /// Returns the production settings: 60 s request timeout, 30 s reconnect
+    /// window, no forced relay and a 30 s password challenge timeout.
     fn default() -> Self {
         Self {
             request_timeout: Duration::from_secs(60),
             reconnect_window: Duration::from_secs(30),
             force_relay: false,
+            challenge_timeout: Duration::from_secs(30),
         }
     }
 }

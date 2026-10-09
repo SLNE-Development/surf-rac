@@ -1,9 +1,11 @@
 //! The egui user interface: the main window plus one native window per
 //! prompt, the host's connections and each viewer session.
 
+mod icons;
 mod main_window;
 mod sessions;
 mod theme;
+mod widgets;
 
 use std::collections::HashMap;
 

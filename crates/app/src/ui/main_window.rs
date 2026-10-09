@@ -5,8 +5,7 @@ use eframe::egui::{self, Align, Frame, Layout, Margin, RichText};
 use surf_rac_protocol::DeviceId;
 
 use super::widgets::{self, Kind, Tone};
-use super::{ClientApp, Tab, connect, devices, icons, login, theme};
-use crate::access::MIN_PASSWORD_LEN;
+use super::{ClientApp, Tab, connect, devices, icons, login, settings, theme};
 use crate::runtime::{Auth, Command};
 
 /// Draws the main window.
@@ -80,7 +79,7 @@ fn signed_in(app: &mut ClientApp, ui: &mut egui::Ui) {
                         .show(ui, |ui| match app.tab {
                             Tab::Connect => connect::show(app, ui),
                             Tab::Devices => devices::show(app, ui),
-                            Tab::Settings => settings_tab(app, ui),
+                            Tab::Settings => settings::show(app, ui),
                         });
                 });
         });
@@ -223,105 +222,6 @@ fn server_dialog(app: &mut ClientApp, ctx: &egui::Context) {
         app.forms.server_dialog = false;
         app.forms.server_url = None;
     }
-}
-
-/// Draws the settings.
-fn settings_tab(app: &mut ClientApp, ui: &mut egui::Ui) {
-    let draft = app
-        .forms
-        .settings
-        .get_or_insert_with(|| app.snap.settings.clone());
-    ui.heading("Incoming connections");
-    ui.checkbox(&mut draft.allow_incoming, "Allow incoming connections");
-    ui.radio_value(
-        &mut draft.unattended,
-        false,
-        "Always ask before someone connects",
-    );
-    ui.radio_value(
-        &mut draft.unattended,
-        true,
-        "Let viewers with the unattended password connect without asking",
-    );
-    ui.checkbox(
-        &mut draft.clipboard_default,
-        "Sync the clipboard in new sessions",
-    );
-    if ui.button("Save settings").clicked() {
-        let settings = draft.clone();
-        app.send(Command::SaveSettings(settings));
-        app.forms.settings = None;
-    }
-
-    ui.add_space(12.0);
-    ui.heading("Unattended password");
-    ui.label(if app.snap.unattended_password_set {
-        "A password is set."
-    } else {
-        "No password is set."
-    });
-    ui.add(
-        egui::TextEdit::singleline(&mut app.forms.new_password)
-            .password(true)
-            .hint_text("New password"),
-    );
-    ui.add(
-        egui::TextEdit::singleline(&mut app.forms.new_password_again)
-            .password(true)
-            .hint_text("Repeat password"),
-    );
-    ui.horizontal(|ui| {
-        if ui.button("Set password").clicked() {
-            let (a, b) = (&app.forms.new_password, &app.forms.new_password_again);
-            app.forms.notice = if a != b {
-                Some("The passwords differ.".into())
-            } else if a.chars().count() < MIN_PASSWORD_LEN {
-                Some(format!("Use at least {MIN_PASSWORD_LEN} characters."))
-            } else {
-                app.commands
-                    .send(Command::SetUnattendedPassword(Some(a.clone())));
-                Some("Password set.".into())
-            };
-            app.forms.new_password.clear();
-            app.forms.new_password_again.clear();
-        }
-        if app.snap.unattended_password_set && ui.button("Remove password").clicked() {
-            app.send(Command::SetUnattendedPassword(None));
-        }
-    });
-    if let Some(notice) = &app.forms.notice {
-        ui.label(notice);
-    }
-
-    ui.add_space(12.0);
-    ui.heading("Saved passwords");
-    if app.snap.saved_passwords.is_empty() {
-        ui.label("None.");
-    }
-    for id in app.snap.saved_passwords.clone() {
-        ui.horizontal(|ui| {
-            ui.monospace(format_id(id));
-            if ui.small_button("Forget").clicked() {
-                app.send(Command::ForgetPassword(id));
-            }
-        });
-    }
-
-    ui.add_space(12.0);
-    ui.heading("Microsoft Defender");
-    ui.label("surf-rac is not signed, so Defender may block or remove it. This adds an exclusion for its folder (asks for administrator rights).");
-    if ui.button("Add Defender exclusion").clicked() {
-        app.forms.notice = Some(match crate::defender::add_exclusion() {
-            Ok(()) => "Exclusion requested.".into(),
-            Err(e) => e,
-        });
-    }
-
-    ui.add_space(12.0);
-    if ui.button("Change server").clicked() {
-        app.forms.server_dialog = true;
-    }
-    ui.small(format!("surf-rac {}", env!("CARGO_PKG_VERSION")));
 }
 
 #[cfg(test)]

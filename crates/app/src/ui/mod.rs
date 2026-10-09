@@ -7,6 +7,7 @@ mod icons;
 mod login;
 mod main_window;
 mod sessions;
+mod settings;
 mod theme;
 mod widgets;
 

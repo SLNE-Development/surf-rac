@@ -24,7 +24,7 @@ pub const PROTOCOL_VERSION: u32 = 2;
 /// Largest WebSocket message, in bytes, the server accepts.
 pub const MAX_WS_MESSAGE_BYTES: usize = 65_536;
 
-/// Longest sealed unattended password, in base64 characters, a session request may carry.
+/// Longest sealed unattended password, in base64 characters, a session password message may carry.
 pub const MAX_SEALED_PASSWORD_LEN: usize = 1024;
 
 /// Smallest valid device ID.
@@ -297,10 +297,33 @@ pub enum ClientMessage {
         /// The viewer's Ed25519 signature over the session role, session ID and
         /// `session_key`, standard base64 of 64 bytes.
         signature: String,
-        /// The unattended password sealed for the host, standard base64 of nonce and
-        /// ciphertext, at most [`MAX_SEALED_PASSWORD_LEN`] characters; absent when none is offered.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        password: Option<String>,
+        /// Whether the viewer intends to authenticate with the unattended password.
+        unattended: bool,
+    },
+    /// Offer viewer `to` the chance to send the unattended password; relayed as a server
+    /// `password_challenge`.
+    PasswordChallenge {
+        /// Viewer device.
+        to: DeviceId,
+        /// Session identifier of the request.
+        session_id: String,
+        /// The host's per-session X25519 public key, standard base64 of 32 bytes.
+        session_key: String,
+        /// The host's Ed25519 signature over the session role, session ID and
+        /// `session_key`, standard base64 of 64 bytes.
+        signature: String,
+        /// Random bytes the host chose for this session's key, standard base64 of 32 bytes.
+        host_nonce: String,
+    },
+    /// Send host `to` the unattended password; relayed as a server `session_password`.
+    SessionPassword {
+        /// Host device.
+        to: DeviceId,
+        /// Session identifier of the request.
+        session_id: String,
+        /// The password sealed for the host's per-session key, standard base64 of a 12-byte
+        /// nonce followed by the ciphertext, at most [`MAX_SEALED_PASSWORD_LEN`] characters.
+        password: String,
     },
     /// Answer a session request from viewer `to`; relayed as a server `session_response`.
     SessionResponse {
@@ -397,9 +420,35 @@ pub enum ServerMessage {
         identity_key: String,
         /// The viewer device's name.
         name: String,
-        /// The unattended password sealed for this device, as the viewer sent it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        password: Option<String>,
+        /// Whether the viewer intends to authenticate with the unattended password.
+        unattended: bool,
+    },
+    /// A host offers this device the chance to send the unattended password.
+    PasswordChallenge {
+        /// Host device, set by the server.
+        from: DeviceId,
+        /// Session identifier of the request.
+        session_id: String,
+        /// The host's per-session X25519 public key, standard base64 of 32 bytes.
+        session_key: String,
+        /// The host's Ed25519 signature over the session role, session ID and
+        /// `session_key`, standard base64 of 64 bytes.
+        signature: String,
+        /// Random bytes the host chose for this session's key, standard base64 of 32 bytes.
+        host_nonce: String,
+        /// The host's Ed25519 identity public key as attested by the server,
+        /// standard base64 of 32 bytes.
+        identity_key: String,
+    },
+    /// A viewer sends this device the unattended password.
+    SessionPassword {
+        /// Viewer device, set by the server.
+        from: DeviceId,
+        /// Session identifier of the request.
+        session_id: String,
+        /// The password sealed for this device's per-session key, as the viewer sent it;
+        /// at most [`MAX_SEALED_PASSWORD_LEN`] characters.
+        password: String,
     },
     /// A host answered this device's session request.
     SessionResponse {
@@ -669,20 +718,49 @@ mod tests {
     #[test]
     fn signed_session_request_round_trip() {
         let raw = json!({"type":"session_request","to":"123456789","session_id":"s1",
-                         "session_key":"a2V5","signature":"c2ln"});
+                         "session_key":"a2V5","signature":"c2ln","unattended":true});
         let msg: ClientMessage = serde_json::from_value(raw.clone()).unwrap();
-        assert!(matches!(msg, ClientMessage::SessionRequest { password: None, .. }));
+        assert!(matches!(msg, ClientMessage::SessionRequest { unattended: true, .. }));
         assert_eq!(serde_json::to_value(&msg).unwrap(), raw);
+        assert!(serde_json::to_value(&msg).unwrap().get("password").is_none());
 
         let relayed = json!({"type":"session_request","from":"123456789","session_id":"s1",
                              "session_key":"a2V5","signature":"c2ln","identity_key":"aWQ=",
-                             "name":"pc","password":"c2VhbGVk"});
+                             "name":"pc","unattended":false});
         let msg: ServerMessage = serde_json::from_value(relayed.clone()).unwrap();
         let ServerMessage::SessionRequest { identity_key, name, .. } = &msg else {
             panic!("not a session request");
         };
         assert_eq!(identity_key, "aWQ=");
         assert_eq!(name, "pc");
+        assert_eq!(serde_json::to_value(&msg).unwrap(), relayed);
+    }
+
+    #[test]
+    fn password_challenge_and_session_password_round_trip() {
+        let challenge = json!({"type":"password_challenge","to":"123456789","session_id":"s1",
+                               "session_key":"a2V5","signature":"c2ln","host_nonce":"bm9uY2U="});
+        let msg: ClientMessage = serde_json::from_value(challenge.clone()).unwrap();
+        assert!(matches!(msg, ClientMessage::PasswordChallenge { .. }));
+        assert_eq!(serde_json::to_value(&msg).unwrap(), challenge);
+
+        let relayed = json!({"type":"password_challenge","from":"123456789","session_id":"s1",
+                             "session_key":"a2V5","signature":"c2ln","host_nonce":"bm9uY2U=",
+                             "identity_key":"aWQ="});
+        let msg: ServerMessage = serde_json::from_value(relayed.clone()).unwrap();
+        assert!(matches!(msg, ServerMessage::PasswordChallenge { .. }));
+        assert_eq!(serde_json::to_value(&msg).unwrap(), relayed);
+
+        let password = json!({"type":"session_password","to":"123456789","session_id":"s1",
+                              "password":"c2VhbGVk"});
+        let msg: ClientMessage = serde_json::from_value(password.clone()).unwrap();
+        assert!(matches!(msg, ClientMessage::SessionPassword { .. }));
+        assert_eq!(serde_json::to_value(&msg).unwrap(), password);
+
+        let relayed = json!({"type":"session_password","from":"123456789","session_id":"s1",
+                             "password":"c2VhbGVk"});
+        let msg: ServerMessage = serde_json::from_value(relayed.clone()).unwrap();
+        assert!(matches!(msg, ServerMessage::SessionPassword { .. }));
         assert_eq!(serde_json::to_value(&msg).unwrap(), relayed);
     }
 

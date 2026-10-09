@@ -79,6 +79,10 @@ pub enum RequestError {
     /// The host refused the request.
     #[error("host denied the session")]
     Denied,
+    /// The host refused the request because this device's identity key
+    /// differs from the key the host pinned for it.
+    #[error("host does not recognise this device's identity key")]
+    KeyNotRecognised,
     /// The host's room has no free viewer slot.
     #[error("host room is full")]
     RoomFull,
@@ -267,6 +271,7 @@ impl ViewerSession {
                         if !accepted {
                             return Err(match reason {
                                 Some(DenyReason::RoomFull) => RequestError::RoomFull,
+                                Some(DenyReason::KeyChanged) => RequestError::KeyNotRecognised,
                                 _ => RequestError::Denied,
                             });
                         }

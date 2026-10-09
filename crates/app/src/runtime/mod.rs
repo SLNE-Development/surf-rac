@@ -493,6 +493,7 @@ pub fn request_error_text(error: &RequestError) -> String {
     match error {
         RequestError::Offline => "The host is offline.".into(),
         RequestError::Denied => "The host denied the connection.".into(),
+        RequestError::KeyNotRecognised => "The host does not recognise this device's key.".into(),
         RequestError::RoomFull => "The host already has the maximum number of viewers.".into(),
         RequestError::Timeout => "The host did not answer in time.".into(),
         RequestError::TokenRejected => "The media server rejected the session.".into(),
@@ -618,6 +619,7 @@ mod tests {
         assert!(!offer_forget(false, &RequestError::Denied));
         assert!(!offer_forget(true, &RequestError::Offline));
         assert!(!offer_forget(true, &RequestError::RateLimited));
+        assert!(!offer_forget(true, &RequestError::KeyNotRecognised));
     }
 
     #[test]
@@ -648,9 +650,14 @@ mod tests {
             RequestError::MediaUnavailable("x".into()),
             RequestError::ChallengeMismatch,
             RequestError::RateLimited,
+            RequestError::KeyNotRecognised,
         ] {
             assert!(request_error_text(&error).ends_with('.'));
         }
+        assert_eq!(
+            request_error_text(&RequestError::KeyNotRecognised),
+            "The host does not recognise this device's key."
+        );
         assert!(end_text(EndReason::Timeout).contains("lost"));
     }
 }

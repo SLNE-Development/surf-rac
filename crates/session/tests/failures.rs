@@ -108,7 +108,10 @@ async fn changed_viewer_key_blocks_on_host(pool: PgPool) {
     })
     .await;
     assert!(matches!(ev, HostEvent::KeyChanged(k) if k.device_id == v.id));
-    assert_eq!(pending.await.unwrap().err(), Some(RequestError::Denied));
+    assert_eq!(
+        pending.await.unwrap().err(),
+        Some(RequestError::KeyNotRecognised)
+    );
 }
 
 #[sqlx::test(migrations = "../server/migrations")]
@@ -339,7 +342,7 @@ async fn unread_host_events_do_not_stall_requests(pool: PgPool) {
     let result = request(&other, h.id, config).await.unwrap();
     assert_eq!(
         result.err(),
-        Some(RequestError::Denied),
+        Some(RequestError::KeyNotRecognised),
         "host refused the changed key without the app reading events"
     );
 }

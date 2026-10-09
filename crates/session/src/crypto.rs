@@ -557,6 +557,7 @@ mod tests {
         )
     }
 
+    /// Signs `msg` with `id` directly through ed25519-dalek.
     fn reference_sign(id: &IdentityKey, msg: &[u8]) -> [u8; 64] {
         use ed25519_dalek::Signer;
         ed25519_dalek::SigningKey::from_bytes(&id.to_bytes())
@@ -746,13 +747,18 @@ mod tests {
 
     /// Keys and IDs of one test session.
     struct Fixture {
+        /// The host's per-session key.
         host: Ephemeral,
+        /// The viewer's per-session key.
         viewer: Ephemeral,
+        /// The host's device ID.
         host_id: DeviceId,
+        /// The viewer's device ID.
         viewer_id: DeviceId,
     }
 
     impl Fixture {
+        /// Returns fresh per-session keys for the test host and viewer.
         fn new() -> Self {
             let (host_id, viewer_id) = ids();
             Self {

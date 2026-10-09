@@ -38,6 +38,7 @@ impl InstallationStore for MemoryStore {
     }
 }
 
+/// Fingerprint hash the tests register with.
 const FINGERPRINT: &str = "00000000000000000000000000000000000000000000000000000000000000a7";
 
 #[sqlx::test(migrations = "../server/migrations")]

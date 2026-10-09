@@ -245,6 +245,7 @@ mod tests {
         }
     }
 
+    /// Fingerprint hash the tests register with.
     const FINGERPRINT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     #[tokio::test]

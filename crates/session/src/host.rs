@@ -1479,14 +1479,17 @@ mod tests {
         DeviceId::new(100_000_000 + n).unwrap()
     }
 
+    /// Returns a host-side channel for session `sid` with a fixed key.
     fn channel(sid: &str) -> PeerChannel {
         PeerChannel::new(sid.into(), SessionKey::from_bytes([1; 32]), Side::Host)
     }
 
+    /// Adds request `sid` from `viewer`, made at `at`, waiting for the host user.
     fn pending(st: &mut State, sid: &str, viewer: DeviceId, at: Instant) {
         pending_at(st, sid, viewer, at, Stage::Prompt { agreed: None });
     }
 
+    /// Adds request `sid` from `viewer`, made at `at`, in `stage`.
     fn pending_at(st: &mut State, sid: &str, viewer: DeviceId, at: Instant, stage: Stage) {
         st.pending.insert(
             sid.into(),
@@ -1501,6 +1504,7 @@ mod tests {
         );
     }
 
+    /// Returns the stage of a request whose password challenge went out at `sent_at`.
     fn awaiting(sent_at: Instant) -> Stage {
         Stage::AwaitingPassword {
             ephemeral: Ephemeral::generate(),

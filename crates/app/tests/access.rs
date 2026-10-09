@@ -57,6 +57,7 @@ async fn correct_password_is_admitted_and_wrong_one_prompts(pool: PgPool) {
     }
 }
 
+/// Returns device ID number `n` above 100000000.
 fn id(n: u32) -> DeviceId {
     DeviceId::new(100_000_000 + n).unwrap()
 }

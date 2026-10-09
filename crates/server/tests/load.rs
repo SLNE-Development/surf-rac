@@ -173,6 +173,7 @@ async fn register_1000_devices_from_one_64(pool: PgPool) {
 #[ignore = "load test"]
 #[sqlx::test(migrations = "./migrations")]
 async fn session_request_flood_relays_at_most_the_per_minute_limit(pool: PgPool) {
+    /// Number of devices that send session requests to the target.
     const SENDERS: usize = 50;
     let app = common::spawn(pool).await;
     let mut target = app.online_device(1).await;
@@ -195,13 +196,18 @@ async fn session_request_flood_relays_at_most_the_per_minute_limit(pool: PgPool)
     let elapsed = started.elapsed();
     let mut refused = 0;
     for sender in senders.iter_mut() {
-        refused += drain_counts(&mut sender.ws, Duration::from_millis(200)).await.1;
+        refused += drain_counts(&mut sender.ws, Duration::from_millis(200))
+            .await
+            .1;
     }
     println!(
         "[flood 1000 requests, 50 senders] sent={} relayed={relayed} refused={refused} window={elapsed:?}",
         SENDERS * per_sender,
     );
-    assert!(elapsed < Duration::from_secs(60), "flood must fit one minute");
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "flood must fit one minute"
+    );
     assert!(
         relayed <= SESSION_REQUESTS_PER_MINUTE,
         "relayed {relayed} over the per-minute limit"

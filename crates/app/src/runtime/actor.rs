@@ -40,6 +40,9 @@ const SIGN_IN_FIRST_TEXT: &str = "Sign in to an account to keep contacts and dev
 /// Banner shown while this installation's identity is in use but not stored.
 const IDENTITY_NOT_SAVED_TEXT: &str = "This device's identity could not be saved.";
 
+/// Banner shown when an action needs the signaling connection.
+const NOT_CONNECTED_TEXT: &str = "Not connected to the server.";
+
 /// Events from tasks the actor spawned.
 pub(super) enum Internal {
     /// Setting up the installation's identity of generation `.0` finished.
@@ -958,13 +961,12 @@ impl Actor {
             .unwrap_or_else(|| id.to_string())
     }
 
-    /// Starts a viewer session with `host`.
+    /// Starts a viewer session with `host`, or shows that the server is not
+    /// connected when there is no identity or signaling connection yet.
     fn connect_to(&mut self, host: DeviceId, password: Option<String>, remember: bool) {
-        let Some(identity) = self.identity.clone() else {
-            return;
-        };
-        let Some(signaling) = self.signaling.clone() else {
-            self.banner = Some("Not connected to the server.".into());
+        let (Some(identity), Some(signaling)) = (self.identity.clone(), self.signaling.clone())
+        else {
+            self.banner = Some(NOT_CONNECTED_TEXT.into());
             return;
         };
         let session = self.next_session;
@@ -1350,5 +1352,14 @@ mod tests {
             unsaved: None,
         }));
         assert_eq!(actor.banner, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connecting_without_an_identity_says_not_connected() {
+        let installation = Arc::new(CountingStore::default());
+        let mut actor = actor("no-identity", installation);
+        actor.connect_to(DeviceId::new(987_654_321).unwrap(), None, false);
+        assert_eq!(actor.banner.as_deref(), Some(NOT_CONNECTED_TEXT));
+        assert!(actor.viewers.is_empty());
     }
 }

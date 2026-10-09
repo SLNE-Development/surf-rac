@@ -55,10 +55,11 @@ pub async fn delete(db: &PgPool, user_id: i64, device: DeviceId) -> Result<(), s
     Ok(())
 }
 
-/// Returns the users who watch `device`: its owner and everyone with it as a contact.
+/// Returns the users who watch `device`: every account linked to it and every
+/// account with it as a contact.
 pub async fn watchers(db: &PgPool, device: DeviceId) -> Result<Vec<i64>, sqlx::Error> {
     sqlx::query_scalar(
-        "select user_id from devices where id = $1 \
+        "select user_id from device_links where device_id = $1 \
          union select user_id from contacts where device_id = $1",
     )
     .bind(i64::from(device.get()))

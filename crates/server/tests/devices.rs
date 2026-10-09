@@ -1,130 +1,152 @@
-//! Device registration, re-bind, contacts and presence query tests.
+//! Device registration tests.
 
 mod common;
 
-use common::{TestApp, fingerprint};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use common::{fingerprint, identity_key, public_key_b64};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
-/// Registers a device for `token` and returns the response body, asserting 200.
-async fn register_ok(app: &TestApp, token: &str, fp: &str, device_id: Option<&str>) -> Value {
-    let res = app.register_device(token, fp, "pc", device_id).await;
-    assert_eq!(res.status(), 200);
-    res.json().await.unwrap()
-}
-
 #[sqlx::test(migrations = "./migrations")]
-async fn register_new_device_returns_9_digit_id_and_secret(pool: PgPool) {
+async fn register_returns_9_digit_id_without_account(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let token = app.register_and_login("alice").await;
-    let body = register_ok(&app, &token, &fingerprint(1), None).await;
+    let key = identity_key();
+    let res = app.register_device(&key, &fingerprint(1), "pc").await;
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.unwrap();
     let id = body["device_id"].as_str().unwrap();
     assert_eq!(id.len(), 9);
     assert!(id.bytes().all(|b| b.is_ascii_digit()) && !id.starts_with('0'));
-    assert_eq!(body["device_secret"].as_str().unwrap().len(), 43);
-    assert_eq!(body["rebound"], false);
-    let stored: Vec<u8> = sqlx::query_scalar("select secret_hash from devices")
-        .fetch_one(&app.pool)
-        .await
-        .unwrap();
-    assert_eq!(stored.len(), 32);
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn same_fingerprint_same_account_rebinds(pool: PgPool) {
-    let app = common::spawn(pool).await;
-    let token = app.register_and_login("alice").await;
-    let first = register_ok(&app, &token, &fingerprint(1), None).await;
-    let second = register_ok(&app, &token, &fingerprint(1), None).await;
-    assert_eq!(first["device_id"], second["device_id"]);
-    assert_eq!(second["rebound"], true);
-    assert_ne!(first["device_secret"], second["device_secret"]);
-    let count: i64 = sqlx::query_scalar("select count(*) from devices")
-        .fetch_one(&app.pool)
-        .await
-        .unwrap();
-    assert_eq!(count, 1);
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn rebind_by_device_id_with_new_fingerprint(pool: PgPool) {
-    let app = common::spawn(pool).await;
-    let token = app.register_and_login("alice").await;
-    let first = register_ok(&app, &token, &fingerprint(1), None).await;
-    let id = first["device_id"].as_str().unwrap();
-    let second = register_ok(&app, &token, &fingerprint(2), Some(id)).await;
-    assert_eq!(second["device_id"], id);
-    assert_eq!(second["rebound"], true);
-    let fp: String = sqlx::query_scalar("select fingerprint_hash from devices")
-        .fetch_one(&app.pool)
-        .await
-        .unwrap();
-    assert_eq!(fp, fingerprint(2));
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn rebind_foreign_device_id_forbidden(pool: PgPool) {
-    let app = common::spawn(pool).await;
-    let alice = app.register_and_login("alice").await;
-    let bob = app.register_and_login("bob").await;
-    let dev = register_ok(&app, &alice, &fingerprint(1), None).await;
-    let id = dev["device_id"].as_str().unwrap();
-    let res = app
-        .register_device(&bob, &fingerprint(9), "evil", Some(id))
-        .await;
-    assert_eq!(res.status(), 403);
-    let owner: String =
-        sqlx::query_scalar("select u.username from devices d join users u on u.id = d.user_id")
+    let (stored_key, fp, name): (Vec<u8>, String, String) =
+        sqlx::query_as("select public_key, fingerprint_hash, name from devices")
             .fetch_one(&app.pool)
             .await
             .unwrap();
-    assert_eq!(owner, "alice");
+    assert_eq!(stored_key, key.verifying_key().as_bytes());
+    assert_eq!(fp, fingerprint(1));
+    assert_eq!(name, "pc");
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn rebind_unknown_device_id_not_found(pool: PgPool) {
+async fn distinct_keys_get_distinct_ids(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let token = app.register_and_login("alice").await;
-    let res = app
-        .register_device(&token, &fingerprint(1), "pc", Some("123456789"))
-        .await;
-    assert_eq!(res.status(), 404);
+    let a = app.new_device(1).await;
+    let b = app.new_device(1).await;
+    assert_ne!(a.id, b.id);
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn rebind_onto_fingerprint_of_other_own_device_conflicts(pool: PgPool) {
+async fn same_key_and_fingerprint_returns_existing_id_and_updates_name(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let token = app.register_and_login("alice").await;
-    let a = register_ok(&app, &token, &fingerprint(1), None).await;
-    register_ok(&app, &token, &fingerprint(2), None).await;
-    let res = app
-        .register_device(&token, &fingerprint(2), "pc", a["device_id"].as_str())
-        .await;
+    let key = identity_key();
+    let first: Value = app
+        .register_device(&key, &fingerprint(1), "old name")
+        .await
+        .json()
+        .await
+        .unwrap();
+    let res = app.register_device(&key, &fingerprint(1), "new name").await;
+    assert_eq!(res.status(), 200);
+    let second: Value = res.json().await.unwrap();
+    assert_eq!(first["device_id"], second["device_id"]);
+    let rows: Vec<(String,)> = sqlx::query_as("select name from devices")
+        .fetch_all(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![("new name".to_owned(),)]);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn same_key_other_fingerprint_is_clone_detected_and_never_rebinds(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let key = identity_key();
+    let first: Value = app
+        .register_device(&key, &fingerprint(1), "pc")
+        .await
+        .json()
+        .await
+        .unwrap();
+    let res = app.register_device(&key, &fingerprint(2), "clone").await;
     assert_eq!(res.status(), 409);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["error"], "clone_detected");
+    let rows: Vec<(i64, String, String)> =
+        sqlx::query_as("select id, fingerprint_hash, name from devices")
+            .fetch_all(&app.pool)
+            .await
+            .unwrap();
+    let id: i64 = first["device_id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(rows, vec![(id, fingerprint(1), "pc".to_owned())]);
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn fingerprint_of_other_account_gets_new_id(pool: PgPool) {
+async fn wrong_protocol_version_is_update_required(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let alice = app.register_and_login("alice").await;
-    let bob = app.register_and_login("bob").await;
-    let a = register_ok(&app, &alice, &fingerprint(1), None).await;
-    let b = register_ok(&app, &bob, &fingerprint(1), None).await;
-    assert_ne!(a["device_id"], b["device_id"]);
-    assert_eq!(b["rebound"], false);
+    let key = identity_key();
+    for version in [1, 3] {
+        let res = app
+            .register_device_raw(json!({
+                "public_key": public_key_b64(&key),
+                "fingerprint_hash": fingerprint(1),
+                "name": "pc",
+                "protocol_version": version,
+            }))
+            .await;
+        assert_eq!(res.status(), 426, "version {version}");
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["error"], "update_required");
+    }
+    let count: i64 = sqlx::query_scalar("select count(*) from devices")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn concurrent_same_fingerprint_registers_one_device(pool: PgPool) {
+async fn invalid_registration_input_400(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let token = app.register_and_login("alice").await;
+    let good_key = public_key_b64(&identity_key());
+    let weak_key = STANDARD.encode([0u8; 32]);
+    let short_key = STANDARD.encode([7u8; 31]);
+    let cases = [
+        json!({"public_key": good_key, "fingerprint_hash": "xyz", "name": "pc", "protocol_version": 2}),
+        json!({"public_key": good_key, "fingerprint_hash": "AB".repeat(32), "name": "pc", "protocol_version": 2}),
+        json!({"public_key": good_key, "fingerprint_hash": fingerprint(1), "name": "", "protocol_version": 2}),
+        json!({"public_key": good_key, "fingerprint_hash": fingerprint(1), "name": "x".repeat(65), "protocol_version": 2}),
+        json!({"public_key": "not base64!", "fingerprint_hash": fingerprint(1), "name": "pc", "protocol_version": 2}),
+        json!({"public_key": short_key, "fingerprint_hash": fingerprint(1), "name": "pc", "protocol_version": 2}),
+        json!({"public_key": weak_key, "fingerprint_hash": fingerprint(1), "name": "pc", "protocol_version": 2}),
+        json!({"fingerprint_hash": fingerprint(1), "name": "pc", "protocol_version": 2}),
+    ];
+    for body in cases {
+        let res = app.register_device_raw(body.clone()).await;
+        assert_eq!(res.status(), 400, "{body}");
+        let err: Value = res.json().await.unwrap();
+        assert_eq!(err["error"], "bad_request", "{body}");
+    }
+    let count: i64 = sqlx::query_scalar("select count(*) from devices")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn concurrent_registration_of_one_key_creates_one_device(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let key = identity_key();
     let fp = fingerprint(1);
     let (a, b) = tokio::join!(
-        app.register_device(&token, &fp, "pc", None),
-        app.register_device(&token, &fp, "pc", None)
+        app.register_device(&key, &fp, "pc"),
+        app.register_device(&key, &fp, "pc"),
     );
     assert_eq!(a.status(), 200);
     assert_eq!(b.status(), 200);
+    let a: Value = a.json().await.unwrap();
+    let b: Value = b.json().await.unwrap();
+    assert_eq!(a["device_id"], b["device_id"]);
     let count: i64 = sqlx::query_scalar("select count(*) from devices")
         .fetch_one(&app.pool)
         .await
@@ -133,344 +155,19 @@ async fn concurrent_same_fingerprint_registers_one_device(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn invalid_device_input_400(pool: PgPool) {
+async fn identity_key_lookup_returns_registered_key(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let token = app.register_and_login("alice").await;
-    for fp in [
-        "abc".to_string(),
-        fingerprint(0xabcdef).to_uppercase(),
-        "g".repeat(64),
-    ] {
-        assert_eq!(
-            app.register_device(&token, &fp, "pc", None).await.status(),
-            400
-        );
-    }
-    assert_eq!(
-        app.register_device(&token, &fingerprint(1), "", None)
-            .await
-            .status(),
-        400
-    );
-    let long = "n".repeat(65);
-    assert_eq!(
-        app.register_device(&token, &fingerprint(1), &long, None)
-            .await
-            .status(),
-        400
-    );
-    assert_eq!(
-        app.register_device(&token, &fingerprint(1), "pc", Some("12"))
-            .await
-            .status(),
-        400
-    );
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn list_devices_only_own(pool: PgPool) {
-    let app = common::spawn(pool).await;
-    let alice = app.register_and_login("alice").await;
-    let bob = app.register_and_login("bob").await;
-    let a = register_ok(&app, &alice, &fingerprint(1), None).await;
-    register_ok(&app, &bob, &fingerprint(2), None).await;
-    let res = app
-        .client
-        .get(app.url("/v1/devices"))
-        .bearer_auth(&alice)
-        .send()
+    let dev = app.new_device(1).await;
+    let id: surf_rac_protocol::DeviceId = dev.id.parse().unwrap();
+    let key = surf_rac_server::devices::identity_key(&app.pool, id)
         .await
         .unwrap();
-    assert_eq!(res.status(), 200);
-    let list: Value = res.json().await.unwrap();
-    assert_eq!(
-        list,
-        json!([{"device_id": a["device_id"], "name": "pc", "online": false, "last_seen_at": null}])
-    );
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn delete_device_owner_only(pool: PgPool) {
-    let app = common::spawn(pool).await;
-    let alice = app.register_and_login("alice").await;
-    let bob = app.register_and_login("bob").await;
-    let a = register_ok(&app, &alice, &fingerprint(1), None).await;
-    let path = format!("/v1/devices/{}", a["device_id"].as_str().unwrap());
-    let res = app
-        .client
-        .delete(app.url(&path))
-        .bearer_auth(&bob)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 404);
-    let res = app
-        .client
-        .delete(app.url(&path))
-        .bearer_auth(&alice)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 204);
-    let res = app
-        .client
-        .delete(app.url(&path))
-        .bearer_auth(&alice)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 404);
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn contacts_crud(pool: PgPool) {
-    let app = common::spawn(pool).await;
-    let alice = app.register_and_login("alice").await;
-    let bob = app.register_and_login("bob").await;
-    let b = register_ok(&app, &bob, &fingerprint(2), None).await;
-    let id = b["device_id"].as_str().unwrap();
-    let path = format!("/v1/contacts/{id}");
-
-    let put = |alias: &str| {
-        app.client
-            .put(app.url(&path))
-            .bearer_auth(&alice)
-            .json(&json!({"alias": alias}))
-            .send()
-    };
-    assert_eq!(put("Bob's PC").await.unwrap().status(), 204);
-    assert_eq!(put("Bob laptop").await.unwrap().status(), 204);
-    assert_eq!(put("").await.unwrap().status(), 400);
-
-    let list: Value = app
-        .client
-        .get(app.url("/v1/contacts"))
-        .bearer_auth(&alice)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(
-        list,
-        json!([{"device_id": id, "alias": "Bob laptop", "online": false}])
-    );
-
-    let bob_list: Value = app
-        .client
-        .get(app.url("/v1/contacts"))
-        .bearer_auth(&bob)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(bob_list, json!([]));
-
-    let res = app
-        .client
-        .delete(app.url(&path))
-        .bearer_auth(&alice)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 204);
-    let list: Value = app
-        .client
-        .get(app.url("/v1/contacts"))
-        .bearer_auth(&alice)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(list, json!([]));
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn put_contact_unknown_device_404(pool: PgPool) {
-    let app = common::spawn(pool).await;
-    let alice = app.register_and_login("alice").await;
-    let res = app
-        .client
-        .put(app.url("/v1/contacts/123456789"))
-        .bearer_auth(&alice)
-        .json(&json!({"alias": "ghost"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 404);
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn presence_query_offline_and_unknown_404(pool: PgPool) {
-    let app = common::spawn(pool).await;
-    let alice = app.register_and_login("alice").await;
-    let a = register_ok(&app, &alice, &fingerprint(1), None).await;
-    let id = a["device_id"].as_str().unwrap();
-    let res = app
-        .client
-        .get(app.url(&format!("/v1/presence/{id}")))
-        .bearer_auth(&alice)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 200);
-    let body: Value = res.json().await.unwrap();
-    assert_eq!(body, json!({"device_id": id, "online": false}));
-    let res = app
-        .client
-        .get(app.url("/v1/presence/123456789"))
-        .bearer_auth(&alice)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 404);
-    let res = app
-        .client
-        .get(app.url("/v1/presence/abc"))
-        .bearer_auth(&alice)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 400);
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn device_routes_require_auth(pool: PgPool) {
-    let app = common::spawn(pool).await;
-    let checks = [
-        app.client.get(app.url("/v1/devices")),
-        app.client
-            .post(app.url("/v1/devices"))
-            .json(&json!({"fingerprint_hash": fingerprint(1), "name": "x"})),
-        app.client.delete(app.url("/v1/devices/123456789")),
-        app.client.get(app.url("/v1/contacts")),
-        app.client
-            .put(app.url("/v1/contacts/123456789"))
-            .json(&json!({"alias": "x"})),
-        app.client.delete(app.url("/v1/contacts/123456789")),
-        app.client.get(app.url("/v1/presence/123456789")),
-    ];
-    for req in checks {
-        assert_eq!(req.send().await.unwrap().status(), 401);
-    }
-}
-
-/// Calls `PUT /v1/devices/{id}/public-key` for `token` with `key`.
-async fn put_key(app: &TestApp, token: &str, id: &str, key: &str) -> reqwest::Response {
-    app.client
-        .put(app.url(&format!("/v1/devices/{id}/public-key")))
-        .bearer_auth(token)
-        .json(&json!({"public_key": key}))
-        .send()
-        .await
-        .unwrap()
-}
-
-/// Returns the presence body of device `id` as seen by `token`.
-async fn presence_of(app: &TestApp, token: &str, id: &str) -> Value {
-    let res = app
-        .client
-        .get(app.url(&format!("/v1/presence/{id}")))
-        .bearer_auth(token)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 200);
-    res.json().await.unwrap()
-}
-
-/// Standard base64 of 32 bytes of `b`.
-fn b64_key(b: u8) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.encode([b; 32])
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn public_key_set_and_returned_on_presence(pool: PgPool) {
-    let app = common::spawn(pool).await;
-    let alice = app.register_and_login("alice").await;
-    let bob = app.register_and_login("bob").await;
-    let (id, _) = app.new_device(&alice, &fingerprint(1)).await;
-    assert_eq!(put_key(&app, &alice, &id, &b64_key(5)).await.status(), 204);
-    assert_eq!(
-        presence_of(&app, &bob, &id).await["public_key"],
-        b64_key(5).as_str()
-    );
-    assert_eq!(put_key(&app, &alice, &id, &b64_key(6)).await.status(), 204);
-    assert_eq!(
-        presence_of(&app, &bob, &id).await["public_key"],
-        b64_key(6).as_str()
-    );
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn public_key_rejects_wrong_length(pool: PgPool) {
-    use base64::Engine;
-    let app = common::spawn(pool).await;
-    let alice = app.register_and_login("alice").await;
-    let (id, _) = app.new_device(&alice, &fingerprint(1)).await;
-    let short = base64::engine::general_purpose::STANDARD.encode([1u8; 31]);
-    assert_eq!(put_key(&app, &alice, &id, &short).await.status(), 400);
-    assert_eq!(
-        put_key(&app, &alice, &id, "not base64!").await.status(),
-        400
-    );
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn public_key_of_other_account_forbidden(pool: PgPool) {
-    let app = common::spawn(pool).await;
-    let alice = app.register_and_login("alice").await;
-    let bob = app.register_and_login("bob").await;
-    let (id, _) = app.new_device(&alice, &fingerprint(1)).await;
-    assert_eq!(put_key(&app, &bob, &id, &b64_key(5)).await.status(), 403);
-    assert_eq!(
-        put_key(&app, &bob, "123456789", &b64_key(5)).await.status(),
-        404
-    );
-    assert!(
-        presence_of(&app, &alice, &id)
-            .await
-            .get("public_key")
-            .is_none()
-    );
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn presence_without_key_omits_field(pool: PgPool) {
-    let app = common::spawn(pool).await;
-    let alice = app.register_and_login("alice").await;
-    let (id, _) = app.new_device(&alice, &fingerprint(1)).await;
-    let body = presence_of(&app, &alice, &id).await;
-    assert!(body.get("public_key").is_none(), "{body}");
-}
-
-#[sqlx::test(migrations = "./migrations")]
-async fn rebind_clears_public_key(pool: PgPool) {
-    let app = common::spawn(pool).await;
-    let alice = app.register_and_login("alice").await;
-    let (id, _) = app.new_device(&alice, &fingerprint(1)).await;
-    assert_eq!(put_key(&app, &alice, &id, &b64_key(5)).await.status(), 204);
-    register_ok(&app, &alice, &fingerprint(2), Some(&id)).await;
-    assert!(
-        presence_of(&app, &alice, &id)
-            .await
-            .get("public_key")
-            .is_none()
-    );
-
-    let (id2, _) = app.new_device(&alice, &fingerprint(3)).await;
-    assert_eq!(put_key(&app, &alice, &id2, &b64_key(6)).await.status(), 204);
-    register_ok(&app, &alice, &fingerprint(3), None).await;
-    assert!(
-        presence_of(&app, &alice, &id2)
-            .await
-            .get("public_key")
-            .is_none()
-    );
+    assert_eq!(key, Some(*dev.key.verifying_key().as_bytes()));
+    let unknown = surf_rac_server::devices::identity_key(
+        &app.pool,
+        surf_rac_protocol::DeviceId::new(123_456_789).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(unknown, None);
 }

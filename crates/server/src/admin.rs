@@ -112,7 +112,7 @@ struct UserListRow {
     disabled: bool,
     /// Creation time.
     created_at: DateTime<Utc>,
-    /// Number of registered devices.
+    /// Number of linked devices.
     devices: i64,
 }
 
@@ -120,7 +120,7 @@ struct UserListRow {
 pub async fn list_users(db: &PgPool) -> anyhow::Result<String> {
     let rows: Vec<UserListRow> = sqlx::query_as(
         "select u.username, u.is_admin, u.disabled, u.created_at, \
-         (select count(*) from devices d where d.user_id = u.id) as devices \
+         (select count(*) from device_links l where l.user_id = u.id) as devices \
          from users u order by u.username",
     )
     .fetch_all(db)

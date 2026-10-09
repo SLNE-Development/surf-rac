@@ -1,22 +1,27 @@
 //! Lifecycle of one device's WebSocket connection.
 //!
-//! A connection registers in the hub, sends `hello`, then relays signaling
-//! until the client leaves, the hub closes it (replacement, re-bind, delete)
-//! or a periodic re-validation finds its session, user or secret invalid or
-//! cannot reach the database several times in a row.
+//! A new connection first receives a `challenge` with a fresh random nonce and
+//! must answer it with an `authenticate` signed by the device's identity key.
+//! Only then does it register in the hub and receive `hello`. It then relays
+//! signaling until the client leaves, the hub closes it (replacement) or a
+//! periodic re-validation finds the device disabled or cannot reach the
+//! database several times in a row.
 
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
-use surf_rac_protocol::{ClientMessage, DeviceId, MAX_SEALED_PASSWORD_LEN, ServerMessage, WsErrorCode};
+use rand::RngCore;
+use surf_rac_protocol::{
+    ClientMessage, DeviceId, MAX_SEALED_PASSWORD_LEN, ServerMessage, WsErrorCode,
+};
 
-use crate::devices;
+use crate::devices::{self, DeviceError, DeviceIdentity};
 use crate::livekit::{self, Role};
 use crate::presence;
-use crate::sessions::{self, AuthUser};
 use crate::state::AppState;
 use crate::turn;
 
@@ -89,16 +94,34 @@ fn frame(msg: &ServerMessage) -> Message {
     )
 }
 
-/// Runs the connection of `device`, authenticated as `user` with device `secret`, until it ends.
-pub async fn run(
-    state: AppState,
-    socket: WebSocket,
-    user: AuthUser,
+/// The authenticated device of a connection, as stamped on the messages it sends.
+struct Sender {
+    /// The device's ID.
     device: DeviceId,
-    secret: String,
-) {
+    /// The device's identity public key as standard base64.
+    identity_key: String,
+    /// The device's name.
+    name: String,
+}
+
+/// Runs the connection of `device`, whose registered identity is `identity`, until it ends.
+///
+/// The device is connected only after it answers the challenge; a connection
+/// that fails the challenge never replaces a live connection of the device.
+pub async fn run(state: AppState, socket: WebSocket, device: DeviceId, identity: DeviceIdentity) {
+    let (mut sink, mut stream) = socket.split();
+    if !handshake(&state, &mut sink, &mut stream, device).await {
+        let _ = sink.send(Message::Close(None)).await;
+        return;
+    }
+    let sender = Sender {
+        device,
+        identity_key: STANDARD.encode(identity.public_key),
+        name: identity.name,
+    };
+
     let (conn_id, mut outbound, was_offline) = state.hub.register(device);
-    tracing::info!(device_id = %device, username = %user.username, "device connected");
+    tracing::info!(device_id = %device, "device connected");
     if let Err(err) = devices::touch_last_seen(&state.db, device).await {
         tracing::warn!(error = %err, "recording last seen failed");
     }
@@ -106,7 +129,6 @@ pub async fn run(
         presence::spawn_broadcast(&state, device, true);
     }
 
-    let (mut sink, mut stream) = socket.split();
     let mut bucket = TokenBucket::new(RATE_PER_SEC, BURST, Instant::now());
     let mut revalidate = tokio::time::interval(state.ws_revalidate_interval);
     revalidate.tick().await;
@@ -134,10 +156,10 @@ pub async fn run(
                 },
                 incoming = stream.next() => match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        if let Some(reply) = handle_text(&state, device, &mut bucket, text.as_str()) {
-                            if sink.send(frame(&reply)).await.is_err() {
-                                break;
-                            }
+                        if let Some(reply) = handle_text(&state, &sender, &mut bucket, text.as_str())
+                            && sink.send(frame(&reply)).await.is_err()
+                        {
+                            break;
                         }
                     }
                     Some(Ok(Message::Binary(_))) => {
@@ -150,9 +172,9 @@ pub async fn run(
                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
                 },
                 _ = revalidate.tick() => {
-                    let verdict = check_authorized(&state, &user, device, &secret).await;
+                    let verdict = check_active(&state, device).await;
                     if !revalidation.keep(verdict) {
-                        tracing::info!(device_id = %device, "credentials no longer valid, closing");
+                        tracing::info!(device_id = %device, "device no longer active, closing");
                         let _ = sink.send(Message::Close(None)).await;
                         break;
                     }
@@ -175,10 +197,93 @@ pub async fn run(
     tracing::info!(device_id = %device, "device disconnected");
 }
 
-/// Handles one text frame and returns the reply to send, if any.
+/// Sends a challenge with a fresh random nonce and checks the device's answer.
+///
+/// The nonce exists only for this call, so a signature is valid for this one
+/// connection only. Returns true when an `authenticate` arrives within
+/// `state.ws_auth_timeout` whose signature verifies against `device`'s
+/// identity key and whose fingerprint matches. On any other outcome the
+/// client is sent an error, where one applies, and false is returned.
+async fn handshake(
+    state: &AppState,
+    sink: &mut SplitSink<WebSocket, Message>,
+    stream: &mut SplitStream<WebSocket>,
+    device: DeviceId,
+) -> bool {
+    let mut nonce = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let challenge = ServerMessage::Challenge {
+        nonce: STANDARD.encode(nonce),
+    };
+    if sink.send(frame(&challenge)).await.is_err() {
+        return false;
+    }
+    let text = match tokio::time::timeout(state.ws_auth_timeout, next_text(stream)).await {
+        Ok(Some(text)) => text,
+        Ok(None) => return false,
+        Err(_) => {
+            tracing::info!(device_id = %device, "no challenge answer in time");
+            return false;
+        }
+    };
+    let verdict = match serde_json::from_str::<ClientMessage>(&text) {
+        Ok(ClientMessage::Authenticate {
+            signature,
+            fingerprint_hash,
+        }) => match decode_array::<64>(&signature) {
+            Some(signature) => {
+                devices::authenticate(&state.db, device, &fingerprint_hash, &nonce, &signature)
+                    .await
+            }
+            None => Err(DeviceError::BadSignature),
+        },
+        _ => {
+            let reply = error(WsErrorCode::BadMessage, "expected authenticate");
+            let _ = sink.send(frame(&reply)).await;
+            return false;
+        }
+    };
+    let reply = match verdict {
+        Ok(()) => return true,
+        Err(DeviceError::CloneDetected) => {
+            tracing::warn!(device_id = %device, "clone detected");
+            error(
+                WsErrorCode::CloneDetected,
+                "identity key is registered for another installation",
+            )
+        }
+        Err(DeviceError::Disabled) => error(WsErrorCode::Forbidden, "device is disabled"),
+        Err(DeviceError::Db(err)) => {
+            tracing::warn!(error = %err, "challenge check failed, database unavailable");
+            return false;
+        }
+        Err(_) => {
+            tracing::info!(device_id = %device, "bad challenge signature");
+            error(WsErrorCode::BadSignature, "signature does not verify")
+        }
+    };
+    let _ = sink.send(frame(&reply)).await;
+    false
+}
+
+/// Returns the next text frame of `stream`, skipping pings and pongs.
+///
+/// Returns `None` when the client closes, the connection fails or a binary
+/// frame arrives.
+async fn next_text(stream: &mut SplitStream<WebSocket>) -> Option<String> {
+    loop {
+        match stream.next().await? {
+            Ok(Message::Text(text)) => return Some(text.as_str().to_owned()),
+            Ok(Message::Ping(_) | Message::Pong(_)) => continue,
+            Ok(Message::Binary(_) | Message::Close(_)) | Err(_) => return None,
+        }
+    }
+}
+
+/// Handles one text frame from `sender` and returns the reply to send, if any.
 fn handle_text(
     state: &AppState,
-    device: DeviceId,
+    sender: &Sender,
     bucket: &mut TokenBucket,
     text: &str,
 ) -> Option<ServerMessage> {
@@ -189,6 +294,7 @@ fn handle_text(
         Ok(m) => m,
         Err(_) => return Some(error(WsErrorCode::BadMessage, "malformed message")),
     };
+    let device = sender.device;
     match msg {
         ClientMessage::Signal {
             to,
@@ -214,17 +320,18 @@ fn handle_text(
         ClientMessage::SessionRequest {
             to,
             session_id,
-            viewer_public_key,
-            password,
+            session_key,
+            signature,
+            unattended,
         } => {
             if !valid_session_id(&session_id) {
                 return Some(bad_session_id());
             }
-            if !valid_public_key(&viewer_public_key) {
-                return Some(bad_public_key());
+            if !valid_key(&session_key) {
+                return Some(bad_key());
             }
-            if password.as_ref().is_some_and(|p| p.len() > MAX_SEALED_PASSWORD_LEN) {
-                return Some(error(WsErrorCode::BadMessage, "password too long"));
+            if !valid_signature(&signature) {
+                return Some(bad_signature_format());
             }
             tracing::info!(viewer = %device, host = %to, %session_id, "session requested");
             relay(
@@ -233,7 +340,62 @@ fn handle_text(
                 ServerMessage::SessionRequest {
                     from: device,
                     session_id,
-                    viewer_public_key,
+                    session_key,
+                    signature,
+                    identity_key: sender.identity_key.clone(),
+                    name: sender.name.clone(),
+                    unattended,
+                },
+            )
+        }
+        ClientMessage::PasswordChallenge {
+            to,
+            session_id,
+            session_key,
+            signature,
+            host_nonce,
+        } => {
+            if !valid_session_id(&session_id) {
+                return Some(bad_session_id());
+            }
+            if !valid_key(&session_key) || !valid_key(&host_nonce) {
+                return Some(bad_key());
+            }
+            if !valid_signature(&signature) {
+                return Some(bad_signature_format());
+            }
+            tracing::info!(host = %device, viewer = %to, %session_id, "password challenge");
+            relay(
+                state,
+                to,
+                ServerMessage::PasswordChallenge {
+                    from: device,
+                    session_id,
+                    session_key,
+                    signature,
+                    host_nonce,
+                    identity_key: sender.identity_key.clone(),
+                },
+            )
+        }
+        ClientMessage::SessionPassword {
+            to,
+            session_id,
+            password,
+        } => {
+            if !valid_session_id(&session_id) {
+                return Some(bad_session_id());
+            }
+            if password.len() > MAX_SEALED_PASSWORD_LEN {
+                return Some(error(WsErrorCode::BadMessage, "password too long"));
+            }
+            tracing::info!(viewer = %device, host = %to, %session_id, "session password");
+            relay(
+                state,
+                to,
+                ServerMessage::SessionPassword {
+                    from: device,
+                    session_id,
                     password,
                 },
             )
@@ -243,18 +405,20 @@ fn handle_text(
             session_id,
             accepted,
             reason,
-            host_public_key,
+            session_key,
+            signature,
             host_nonce,
         } => {
             if !valid_session_id(&session_id) {
                 return Some(bad_session_id());
             }
-            if host_public_key
-                .as_deref()
-                .is_some_and(|k| !valid_public_key(k))
-                || host_nonce.as_deref().is_some_and(|n| !valid_public_key(n))
+            if session_key.as_deref().is_some_and(|k| !valid_key(k))
+                || host_nonce.as_deref().is_some_and(|n| !valid_key(n))
             {
-                return Some(bad_public_key());
+                return Some(bad_key());
+            }
+            if signature.as_deref().is_some_and(|s| !valid_signature(s)) {
+                return Some(bad_signature_format());
             }
             tracing::info!(host = %device, viewer = %to, %session_id, accepted, "session answered");
             relay(
@@ -265,11 +429,21 @@ fn handle_text(
                     session_id,
                     accepted,
                     reason,
-                    host_public_key,
+                    session_key,
+                    signature,
                     host_nonce,
+                    identity_key: accepted.then(|| sender.identity_key.clone()),
                 },
             )
         }
+        ClientMessage::Authenticate { .. } => Some(error(
+            WsErrorCode::BadMessage,
+            "connection is already authenticated",
+        )),
+        ClientMessage::LinkAccount { .. } | ClientMessage::UnlinkAccount { .. } => Some(error(
+            WsErrorCode::BadMessage,
+            "account linking is not supported",
+        )),
         ClientMessage::HostTokenRequest => {
             let room = livekit::room_for(device);
             tracing::info!(device_id = %device, "host token issued");
@@ -333,9 +507,19 @@ fn valid_session_id(session_id: &str) -> bool {
     (1..=MAX_SESSION_ID_CHARS).contains(&session_id.chars().count())
 }
 
-/// Returns whether `key` (a public key or nonce) is standard base64 of exactly 32 bytes.
-fn valid_public_key(key: &str) -> bool {
-    STANDARD.decode(key).is_ok_and(|bytes| bytes.len() == 32)
+/// Decodes standard base64 of exactly `N` bytes.
+fn decode_array<const N: usize>(s: &str) -> Option<[u8; N]> {
+    STANDARD.decode(s).ok()?.try_into().ok()
+}
+
+/// Returns whether `key` (a per-session key or nonce) is standard base64 of exactly 32 bytes.
+fn valid_key(key: &str) -> bool {
+    decode_array::<32>(key).is_some()
+}
+
+/// Returns whether `signature` is standard base64 of exactly 64 bytes.
+fn valid_signature(signature: &str) -> bool {
+    decode_array::<64>(signature).is_some()
 }
 
 /// Builds the error for an invalid session ID.
@@ -346,11 +530,19 @@ fn bad_session_id() -> ServerMessage {
     )
 }
 
-/// Builds the error for an invalid public key.
-fn bad_public_key() -> ServerMessage {
+/// Builds the error for an invalid per-session key or nonce.
+fn bad_key() -> ServerMessage {
     error(
         WsErrorCode::BadMessage,
-        "public key and nonce must be base64 of 32 bytes",
+        "session key and nonce must be base64 of 32 bytes",
+    )
+}
+
+/// Builds the error for a signature that is not base64 of 64 bytes.
+fn bad_signature_format() -> ServerMessage {
+    error(
+        WsErrorCode::BadMessage,
+        "signature must be base64 of 64 bytes",
     )
 }
 
@@ -377,15 +569,15 @@ struct Revalidation {
 impl Revalidation {
     /// Returns whether the connection may stay open after a check.
     ///
-    /// `verdict` is `Some(valid)` when the check completed, or `None` when the
-    /// database could not be reached. Invalid credentials close at once;
+    /// `verdict` is `Some(active)` when the check completed, or `None` when the
+    /// database could not be reached. An inactive device closes at once;
     /// unreachable databases close after [`MAX_REVALIDATION_ERRORS`]
     /// consecutive failures.
     fn keep(&mut self, verdict: Option<bool>) -> bool {
         match verdict {
-            Some(valid) => {
+            Some(active) => {
                 self.errors = 0;
-                valid
+                active
             }
             None => {
                 self.errors += 1;
@@ -395,20 +587,13 @@ impl Revalidation {
     }
 }
 
-/// Checks that the session is unexpired, the user enabled and the device secret current.
+/// Checks that `device` still exists and is not disabled.
 ///
 /// Returns `None` when the database could not be reached.
-async fn check_authorized(
-    state: &AppState,
-    user: &AuthUser,
-    device: DeviceId,
-    secret: &str,
-) -> Option<bool> {
-    let session = sessions::is_valid(&state.db, &user.token_hash).await;
-    let device_ok = devices::authenticate(&state.db, user.user_id, device, secret).await;
-    match (session, device_ok) {
-        (Ok(s), Ok(d)) => Some(s && d),
-        (Err(err), _) | (_, Err(err)) => {
+async fn check_active(state: &AppState, device: DeviceId) -> Option<bool> {
+    match devices::is_active(&state.db, device).await {
+        Ok(active) => Some(active),
+        Err(err) => {
             tracing::warn!(error = %err, "re-validation failed, database unavailable");
             None
         }
@@ -435,6 +620,15 @@ mod tests {
         }
         assert!(!b.try_take(later));
     }
+
+    #[test]
+    fn base64_lengths_are_checked() {
+        assert!(valid_key(&STANDARD.encode([1u8; 32])));
+        assert!(!valid_key(&STANDARD.encode([1u8; 31])));
+        assert!(valid_signature(&STANDARD.encode([1u8; 64])));
+        assert!(!valid_signature(&STANDARD.encode([1u8; 32])));
+        assert!(!valid_signature("not base64!"));
+    }
 }
 
 #[cfg(test)]
@@ -455,7 +649,7 @@ mod revalidation_tests {
     }
 
     #[test]
-    fn revalidation_closes_when_invalid() {
+    fn revalidation_closes_when_inactive() {
         let mut r = Revalidation::default();
         assert!(!r.keep(Some(false)));
     }

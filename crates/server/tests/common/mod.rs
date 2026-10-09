@@ -8,7 +8,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use serde_json::json;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use ed25519_dalek::{Signer, SigningKey};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use surf_rac_server::config::Config;
 use surf_rac_server::state::AppState;
@@ -85,9 +88,38 @@ pub fn fingerprint(n: u32) -> String {
 static NEXT_IP: AtomicU32 = AtomicU32::new(1);
 
 /// Returns a fresh fake client IP in 172.16.0.0/12.
-fn fresh_ip() -> String {
+pub fn fresh_ip() -> String {
     let n = NEXT_IP.fetch_add(1, Ordering::Relaxed);
     format!("172.16.{}.{}", (n >> 8) & 0xff, n & 0xff)
+}
+
+/// Generates a random Ed25519 identity key.
+pub fn identity_key() -> SigningKey {
+    SigningKey::generate(&mut rand::rngs::OsRng)
+}
+
+/// Returns the identity public key of `key` as standard base64.
+pub fn public_key_b64(key: &SigningKey) -> String {
+    STANDARD.encode(key.verifying_key().as_bytes())
+}
+
+/// Signs the connect challenge `nonce` with `key` and returns the signature as standard base64.
+///
+/// The signed message is the challenge domain tag followed by the nonce bytes.
+pub fn sign_challenge(key: &SigningKey, nonce: &[u8]) -> String {
+    let mut msg = b"surf-rac/challenge/v1".to_vec();
+    msg.extend_from_slice(nonce);
+    STANDARD.encode(key.sign(&msg).to_bytes())
+}
+
+/// A registered device identity: its ID, key and fingerprint.
+pub struct Identity {
+    /// The device ID the server assigned.
+    pub id: String,
+    /// The device's identity key.
+    pub key: SigningKey,
+    /// The device's fingerprint hash.
+    pub fingerprint: String,
 }
 
 impl TestApp {
@@ -96,23 +128,14 @@ impl TestApp {
         format!("{}{}", self.base, path)
     }
 
-    /// Creates an invite code directly in the database.
-    pub async fn invite(&self) -> String {
-        surf_rac_server::accounts::create_invite(&self.pool, "test", chrono::Duration::hours(72))
-            .await
-            .unwrap()
-    }
-
     /// Calls `POST /v1/register` from a fresh client IP.
-    pub async fn register(&self, code: &str, username: &str, password: &str) -> reqwest::Response {
-        self.register_from(code, username, password, &fresh_ip())
-            .await
+    pub async fn register(&self, username: &str, password: &str) -> reqwest::Response {
+        self.register_from(username, password, &fresh_ip()).await
     }
 
     /// Calls `POST /v1/register` with `ip` as the forwarded client address.
     pub async fn register_from(
         &self,
-        code: &str,
         username: &str,
         password: &str,
         ip: &str,
@@ -120,7 +143,7 @@ impl TestApp {
         self.client
             .post(self.url("/v1/register"))
             .header("x-forwarded-for", ip)
-            .json(&json!({"invite_code": code, "username": username, "password": password}))
+            .json(&json!({"username": username, "password": password}))
             .send()
             .await
             .unwrap()
@@ -137,48 +160,54 @@ impl TestApp {
             .unwrap()
     }
 
-    /// Calls `POST /v1/devices` for `token`.
-    pub async fn register_device(
-        &self,
-        token: &str,
-        fingerprint_hash: &str,
-        name: &str,
-        device_id: Option<&str>,
-    ) -> reqwest::Response {
-        let mut body = json!({"fingerprint_hash": fingerprint_hash, "name": name});
-        if let Some(id) = device_id {
-            body["device_id"] = json!(id);
-        }
+    /// Registers `username` with [`PASSWORD`] and returns a session token.
+    pub async fn register_and_login(&self, username: &str) -> String {
+        let res = self.register(username, PASSWORD).await;
+        assert_eq!(res.status(), 201, "register {username}");
+        let res = self.login(username, PASSWORD, &fresh_ip()).await;
+        assert_eq!(res.status(), 200, "login {username}");
+        let body: Value = res.json().await.unwrap();
+        body["token"].as_str().unwrap().to_owned()
+    }
+
+    /// Calls `POST /v1/devices` with `body`, from a fresh client IP and without credentials.
+    pub async fn register_device_raw(&self, body: Value) -> reqwest::Response {
         self.client
             .post(self.url("/v1/devices"))
-            .bearer_auth(token)
+            .header("x-forwarded-for", fresh_ip())
             .json(&body)
             .send()
             .await
             .unwrap()
     }
 
-    /// Registers a device for `token` and returns `(device_id, device_secret)`.
-    pub async fn new_device(&self, token: &str, fingerprint_hash: &str) -> (String, String) {
-        let res = self
-            .register_device(token, fingerprint_hash, "pc", None)
-            .await;
-        assert_eq!(res.status(), 200);
-        let body: serde_json::Value = res.json().await.unwrap();
-        (
-            body["device_id"].as_str().unwrap().to_owned(),
-            body["device_secret"].as_str().unwrap().to_owned(),
-        )
+    /// Calls `POST /v1/devices` for `key`, `fingerprint_hash` and `name` at the current protocol version.
+    pub async fn register_device(
+        &self,
+        key: &SigningKey,
+        fingerprint_hash: &str,
+        name: &str,
+    ) -> reqwest::Response {
+        self.register_device_raw(json!({
+            "public_key": public_key_b64(key),
+            "fingerprint_hash": fingerprint_hash,
+            "name": name,
+            "protocol_version": surf_rac_protocol::PROTOCOL_VERSION,
+        }))
+        .await
     }
 
-    /// Registers `username` with [`PASSWORD`] and returns a session token.
-    pub async fn register_and_login(&self, username: &str) -> String {
-        let code = self.invite().await;
-        let res = self.register(&code, username, PASSWORD).await;
-        assert_eq!(res.status(), 201, "register {username}");
-        let res = self.login(username, PASSWORD, &fresh_ip()).await;
-        assert_eq!(res.status(), 200, "login {username}");
-        let body: serde_json::Value = res.json().await.unwrap();
-        body["token"].as_str().unwrap().to_owned()
+    /// Registers a device with a fresh identity key and fingerprint `n` and returns it.
+    pub async fn new_device(&self, n: u32) -> Identity {
+        let key = identity_key();
+        let fingerprint = fingerprint(n);
+        let res = self.register_device(&key, &fingerprint, "pc").await;
+        assert_eq!(res.status(), 200);
+        let body: Value = res.json().await.unwrap();
+        Identity {
+            id: body["device_id"].as_str().unwrap().to_owned(),
+            key,
+            fingerprint,
+        }
     }
 }

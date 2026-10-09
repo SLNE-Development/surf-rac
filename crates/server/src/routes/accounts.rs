@@ -17,7 +17,7 @@ use crate::limits::rate_key;
 use crate::sessions::{self, AuthUser};
 use crate::state::AppState;
 
-/// `POST /v1/register`: redeems an invite and creates an account.
+/// `POST /v1/register`: creates an account.
 pub async fn register(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -42,18 +42,8 @@ pub async fn register(
             "password must be 10 to 256 characters",
         ));
     }
-    if req.invite_code.is_empty() {
-        return Err(ApiError::bad_request("invalid or expired invite"));
-    }
     let password_hash = hash_password(req.password).await?;
-    match accounts::redeem_invite_and_create_user(
-        &state.db,
-        &req.invite_code,
-        &req.username,
-        &password_hash,
-    )
-    .await
-    {
+    match accounts::create_user(&state.db, &req.username, &password_hash, false).await {
         Ok(_) => {
             tracing::info!(username = %req.username, "account registered");
             Ok((
@@ -63,11 +53,9 @@ pub async fn register(
                 }),
             ))
         }
-        Err(RegisterError::InvalidInvite) => {
-            Err(ApiError::bad_request("invalid or expired invite"))
-        }
         Err(RegisterError::UsernameTaken) => Err(ApiError::conflict("username already taken")),
         Err(RegisterError::Db(err)) => Err(err.into()),
+        Err(err @ RegisterError::InvalidInvite) => Err(ApiError::internal(err)),
     }
 }
 

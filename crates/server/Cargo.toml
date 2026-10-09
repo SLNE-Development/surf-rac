@@ -18,6 +18,7 @@ axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
+ed25519-dalek.workspace = true
 futures-util.workspace = true
 hmac.workspace = true
 rand.workspace = true
@@ -34,6 +35,7 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 base64.workspace = true
 chrono.workspace = true
+ed25519-dalek.workspace = true
 futures-util.workspace = true
 hmac.workspace = true
 serde_json.workspace = true

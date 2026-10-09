@@ -20,8 +20,10 @@ pub struct AppState {
     pub limits: Arc<Limits>,
     /// Online devices and their connections.
     pub hub: Hub,
-    /// How often a WebSocket re-checks its session, user and device secret.
+    /// How often a WebSocket re-checks that its device is still enabled.
     pub ws_revalidate_interval: Duration,
+    /// How long a new WebSocket may take to answer the challenge.
+    pub ws_auth_timeout: Duration,
 }
 
 impl AppState {
@@ -33,6 +35,7 @@ impl AppState {
             limits: Arc::new(Limits::default()),
             hub: Hub::default(),
             ws_revalidate_interval: Duration::from_secs(60),
+            ws_auth_timeout: Duration::from_secs(10),
         }
     }
 }

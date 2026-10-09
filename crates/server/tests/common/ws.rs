@@ -2,14 +2,17 @@
 
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use ed25519_dalek::SigningKey;
 use futures_util::{SinkExt, StreamExt};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use super::{TestApp, fingerprint};
+use super::{Identity, TestApp, sign_challenge};
 
 /// A client WebSocket connection to the test server.
 pub type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -17,60 +20,118 @@ pub type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// How long helpers wait for an expected frame.
 const RECV_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// An online test device: its credentials and open socket.
+/// A refused WebSocket upgrade: the HTTP status and the JSON body, if any.
+#[derive(Debug)]
+pub struct Refused {
+    /// HTTP status of the refusal.
+    pub status: u16,
+    /// Response body parsed as JSON, when it is JSON.
+    pub body: Option<Value>,
+}
+
+/// An online test device: its identity and open socket.
 pub struct Device {
-    /// Session token of the owning account.
-    pub token: String,
     /// Device ID.
     pub id: String,
-    /// Device secret.
-    pub secret: String,
+    /// Identity key of the device.
+    pub key: SigningKey,
+    /// Fingerprint hash of the device.
+    pub fingerprint: String,
     /// Open socket, past the `hello` message.
     pub ws: Ws,
 }
 
 impl TestApp {
-    /// Opens `/v1/ws` with the given credentials; `Err` carries the HTTP status of a refusal.
-    pub async fn ws_connect(
+    /// Opens `/v1/ws` with the given device ID and protocol version headers, omitting
+    /// each one that is `None`; `Err` carries the refusal.
+    pub async fn ws_open(
         &self,
-        token: Option<&str>,
-        device_id: &str,
-        secret: &str,
-    ) -> Result<Ws, u16> {
+        device_id: Option<&str>,
+        protocol_version: Option<&str>,
+    ) -> Result<Ws, Refused> {
         let mut req = format!("ws://{}/v1/ws", self.addr)
             .into_client_request()
             .unwrap();
         let h = req.headers_mut();
-        if let Some(t) = token {
-            h.insert("authorization", format!("Bearer {t}").parse().unwrap());
+        if let Some(id) = device_id {
+            h.insert("x-device-id", id.parse().unwrap());
         }
-        h.insert("x-device-id", device_id.parse().unwrap());
-        h.insert("x-device-secret", secret.parse().unwrap());
+        if let Some(v) = protocol_version {
+            h.insert("x-protocol-version", v.parse().unwrap());
+        }
         match tokio_tungstenite::connect_async(req).await {
             Ok((ws, _)) => Ok(ws),
-            Err(tokio_tungstenite::tungstenite::Error::Http(res)) => Err(res.status().as_u16()),
+            Err(tokio_tungstenite::tungstenite::Error::Http(res)) => Err(Refused {
+                status: res.status().as_u16(),
+                body: res
+                    .body()
+                    .as_deref()
+                    .and_then(|b| serde_json::from_slice(b).ok()),
+            }),
             Err(e) => panic!("websocket connect failed: {e}"),
         }
     }
 
-    /// Registers `username` with a device `n` and connects it, consuming `hello`.
-    pub async fn online_device(&self, username: &str, n: u32) -> Device {
-        let token = self.register_and_login(username).await;
-        self.connect_new_device(&token, n).await
+    /// Opens `/v1/ws` for `device_id` at the current protocol version and returns
+    /// the socket together with the decoded challenge nonce.
+    pub async fn ws_challenged(&self, device_id: &str) -> (Ws, Vec<u8>) {
+        let version = surf_rac_protocol::PROTOCOL_VERSION.to_string();
+        let mut ws = self
+            .ws_open(Some(device_id), Some(&version))
+            .await
+            .expect("upgrade refused");
+        let challenge = recv(&mut ws).await;
+        assert_eq!(challenge["type"], "challenge");
+        let nonce = STANDARD
+            .decode(challenge["nonce"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(nonce.len(), 32);
+        (ws, nonce)
     }
 
-    /// Registers device `n` for `token` and connects it, consuming `hello`.
-    pub async fn connect_new_device(&self, token: &str, n: u32) -> Device {
-        let (id, secret) = self.new_device(token, &fingerprint(n)).await;
-        let mut ws = self.ws_connect(Some(token), &id, &secret).await.unwrap();
+    /// Opens `/v1/ws` as `identity` and answers the challenge; the next message is `hello`.
+    pub async fn ws_connect(&self, identity: &Identity) -> Ws {
+        let (mut ws, nonce) = self.ws_challenged(&identity.id).await;
+        send(
+            &mut ws,
+            json!({
+                "type": "authenticate",
+                "signature": sign_challenge(&identity.key, &nonce),
+                "fingerprint_hash": identity.fingerprint,
+            }),
+        )
+        .await;
+        ws
+    }
+
+    /// Connects `identity` and consumes `hello`.
+    pub async fn connect_device(&self, identity: Identity) -> Device {
+        let mut ws = self.ws_connect(&identity).await;
         let hello = recv(&mut ws).await;
         assert_eq!(hello["type"], "hello");
-        assert_eq!(hello["device_id"], id.as_str());
+        assert_eq!(hello["device_id"], identity.id.as_str());
         Device {
-            token: token.to_owned(),
-            id,
-            secret,
+            id: identity.id,
+            key: identity.key,
+            fingerprint: identity.fingerprint,
             ws,
+        }
+    }
+
+    /// Registers device `n` with a fresh identity key and connects it, consuming `hello`.
+    pub async fn online_device(&self, n: u32) -> Device {
+        let identity = self.new_device(n).await;
+        self.connect_device(identity).await
+    }
+}
+
+impl Device {
+    /// Returns this device's identity without the socket, for opening another connection.
+    pub fn identity(&self) -> Identity {
+        Identity {
+            id: self.id.clone(),
+            key: self.key.clone(),
+            fingerprint: self.fingerprint.clone(),
         }
     }
 }
@@ -117,7 +178,12 @@ pub async fn recv_type(ws: &mut Ws, ty: &str) -> Value {
 
 /// Asserts that the server closes the socket within the timeout, skipping data frames.
 pub async fn expect_closed(ws: &mut Ws) {
-    let deadline = tokio::time::Instant::now() + RECV_TIMEOUT;
+    expect_closed_within(ws, RECV_TIMEOUT).await;
+}
+
+/// Asserts that the server closes the socket within `wait`, skipping data frames.
+pub async fn expect_closed_within(ws: &mut Ws, wait: Duration) {
+    let deadline = tokio::time::Instant::now() + wait;
     loop {
         match tokio::time::timeout_at(deadline, ws.next()).await {
             Err(_) => panic!("socket was not closed"),

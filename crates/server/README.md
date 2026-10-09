@@ -33,8 +33,10 @@ docker compose -f compose.test.yaml run --rm test
 | `RUST_LOG` | no | `info` | Log filter |
 
 The server refuses to start when a required value is missing or invalid.
-Migrations run automatically on start. They are forward-only and additive, so
-the previous image keeps working against a migrated database.
+Migrations run automatically on start and are forward-only. Migration
+`0003_device_identity` drops every user, session, device and contact and
+creates the device-identity schema, so the image before it does not work
+against a migrated database; rolling back past it needs the database backup.
 
 ## Deploying on Coolify
 
@@ -83,14 +85,26 @@ All endpoints are under `/v1`. The wire types are defined in the
 `surf-rac-protocol` crate.
 
 - `POST /register`, `POST /login`, `POST /logout`
-- `POST /devices`, `GET /devices`, `DELETE /devices/{id}`
-- `PUT /devices/{id}/public-key`: sets the device's X25519 public key
-  (`{"public_key": "<base64 of 32 bytes>"}`); owner only
+- `POST /devices`: registers an installation without an account. Body:
+  `public_key` (standard base64 of the 32-byte Ed25519 identity public key),
+  `fingerprint_hash` (64 lowercase hex characters), `name` (1 to 64
+  characters) and `protocol_version`. Returns the 9-digit `device_id`. The
+  same key and fingerprint return the existing ID and update the name; the
+  same key with another fingerprint is a 409 `clone_detected`; another
+  protocol version is a 426 `update_required`.
+- `GET /devices`, `DELETE /devices/{id}`: the devices linked to the account
 - `GET /contacts`, `PUT /contacts/{id}`, `DELETE /contacts/{id}`
-- `GET /presence/{id}`: online state and, once set, the device's public key
-- `GET /ws`: WebSocket. Send `Authorization: Bearer <token>`, `X-Device-Id`
-  and `X-Device-Secret` on the upgrade request. Besides `signal` relaying it
-  carries session negotiation (`session_request`, `session_response`) and
+- `GET /presence/{id}`: online state of a device
+- `GET /ws`: WebSocket. Send `X-Device-Id` and `X-Protocol-Version` on the
+  upgrade request; another or a missing version is a 426 `update_required`,
+  an unknown or disabled device a 401. The server then sends `challenge` with
+  a random 32-byte nonce, and the device must answer within 10 seconds with
+  `authenticate`: an Ed25519 signature over `surf-rac/challenge/v1` followed
+  by the nonce, and its fingerprint hash. A wrong signature closes the socket
+  with `bad_signature`, a different fingerprint with `clone_detected`; a valid
+  answer is followed by `hello`. Besides `signal` relaying it
+  carries session negotiation (`session_request`, `password_challenge`,
+  `session_password`, `session_response`) and
   LiveKit tokens: `host_token_request` returns a token for the device's own
   room `host-<device_id>`; `viewer_token_request` sends a 60-second
   subscribe-only token for that room to the named viewer.

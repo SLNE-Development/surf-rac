@@ -67,6 +67,24 @@ impl ApiError {
         Self::new(StatusCode::CONFLICT, ErrorCode::Conflict, message)
     }
 
+    /// 409: the identity key is registered for another installation.
+    pub fn clone_detected() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            ErrorCode::CloneDetected,
+            "identity key is registered for another installation",
+        )
+    }
+
+    /// 426: the client's protocol version is not supported and it must be updated.
+    pub fn update_required() -> Self {
+        Self::new(
+            StatusCode::UPGRADE_REQUIRED,
+            ErrorCode::UpdateRequired,
+            "protocol version not supported, update required",
+        )
+    }
+
     /// 429: too many requests from this client.
     pub fn rate_limited() -> Self {
         Self::new(

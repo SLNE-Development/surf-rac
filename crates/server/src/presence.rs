@@ -8,8 +8,8 @@ use crate::state::AppState;
 
 /// Sends `presence` for `device` to every online device of its watchers.
 ///
-/// Watchers are the device's owner and every account that has it as a
-/// contact; the device itself is skipped. Database errors are logged and the
+/// Watchers are the accounts linked to the device and every account that has
+/// it as a contact; the device itself is skipped. Database errors are logged and the
 /// broadcast is dropped.
 pub async fn broadcast(state: &AppState, device: DeviceId, online: bool) {
     let watchers = match contacts::watchers(&state.db, device).await {

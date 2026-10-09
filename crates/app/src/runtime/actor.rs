@@ -19,8 +19,8 @@ use super::hosting::Hosting;
 use super::identity::{self, Identity};
 use super::{
     Auth, Command, ContactView, DEFAULT_SERVER, FrameImage, Repaint, SERVER_ENV, Snapshot,
-    ViewerStatus, ViewerView, backoff, end_text, lock, may_fetch_host_key, password_offer,
-    request_error_text,
+    ViewerStatus, ViewerView, backoff, end_text, lock, may_fetch_host_key, offer_forget,
+    password_offer, request_error_text,
 };
 use crate::access;
 use crate::api::{Api, ApiError};
@@ -68,7 +68,7 @@ pub(super) enum Internal {
         session: u64,
         /// The outcome.
         result: Result<(ViewerSession, mpsc::Receiver<ViewerEvent>), RequestError>,
-        /// Whether the saved password was offered.
+        /// Whether the saved password was sealed into the request.
         used_saved: bool,
         /// A typed password to save once the session started.
         remember: Option<String>,
@@ -272,7 +272,10 @@ impl Actor {
                     }
                 },
                 Some(event) = internal_rx.recv() => self.event(event).await,
-                _ = tick.tick() => self.poll_clipboard().await,
+                _ = tick.tick() => {
+                    self.poll_clipboard().await;
+                    self.prune_unjoined().await;
+                }
             }
             self.publish();
         }
@@ -558,6 +561,7 @@ impl Actor {
     /// Ends every session and the signaling connection.
     async fn stop_all(&mut self) {
         self.generation += 1;
+        self.attempts = 0;
         self.signaling = None;
         for (_, viewing) in std::mem::take(&mut self.viewers) {
             if let Some(s) = viewing.session {
@@ -651,10 +655,11 @@ impl Actor {
                 self.generation += 1;
                 self.signaling = None;
                 self.auth = Auth::Replaced;
+                self.mark_hosting_stale().await;
             }
             ServerMessage::SessionRequest {
                 from, session_id, ..
-            } if self.host.is_none() && !self.host_starting => {
+            } if !self.host_starting && self.host.as_ref().is_none_or(|h| h.is_stale()) => {
                 if let Some(signaling) = &self.signaling {
                     let _ = signaling
                         .send(ClientMessage::SessionResponse {
@@ -759,10 +764,11 @@ impl Actor {
         let known = Arc::clone(&self.known);
         let tx = self.internal.clone();
         tokio::spawn(async move {
-            let used_saved = offer.as_ref().is_some_and(|(_, saved)| *saved);
+            let offered_saved = offer.as_ref().is_some_and(|(_, saved)| *saved);
             let pinned = lock(&known).get(host).is_some();
+            let used_saved = offered_saved && pinned;
             let host_key = match &offer {
-                Some(_) if may_fetch_host_key(used_saved, pinned) => api
+                Some(_) if may_fetch_host_key(offered_saved, pinned) => api
                     .presence(host)
                     .await
                     .ok()
@@ -842,7 +848,7 @@ impl Actor {
                 self.persist_known();
             }
             Err(e) => {
-                viewing.offer_forget = used_saved && e == RequestError::Denied;
+                viewing.offer_forget = offer_forget(used_saved, &e);
                 viewing.status = ViewerStatus::Ended(request_error_text(&e));
             }
         }
@@ -859,6 +865,7 @@ impl Actor {
             ViewerEvent::Ended { reason } => {
                 viewing.status = ViewerStatus::Ended(end_text(reason));
                 viewing.session = None;
+                viewing.input = InputState::default();
             }
             ViewerEvent::DataReceived(DataMessage::Control(Control::ScreenState(state))) => {
                 viewing.screen = Some(state)

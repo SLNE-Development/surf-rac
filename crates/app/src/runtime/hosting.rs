@@ -9,21 +9,22 @@ use surf_rac_capture::{ScreenShare, ShareOptions};
 use surf_rac_input::{Grants, InputHost, InputStatus};
 use surf_rac_protocol::DeviceId;
 use surf_rac_protocol::data::{Control, DataMessage};
-use surf_rac_session::SessionConfig;
-use surf_rac_session::crypto::open_password;
 use surf_rac_session::host::{HostEvent, HostSession};
-use surf_rac_session::{PublicKey, crypto::CryptoError};
+use surf_rac_session::{PublicKey, SessionConfig};
 use tokio::sync::{mpsc, watch};
 
 use super::actor::{Actor, Internal};
 use super::{Auth, HostViewerView, PromptView};
-use crate::access::{self, Decision, PasswordCheck};
+use crate::access::{self, Decision};
 
 /// Placeholder size of the screen track until capture starts.
 const INITIAL_TRACK: (u32, u32) = (1280, 720);
 
 /// Wait before hosting is retried after it failed or ended.
 const RESTART_DELAY: Duration = Duration::from_secs(10);
+
+/// How long an accepted viewer has to join the room before it is given up.
+const JOIN_WINDOW: Duration = Duration::from_secs(70);
 
 /// A viewer accepted by this host.
 struct HostViewer {
@@ -33,6 +34,8 @@ struct HostViewer {
     clipboard: bool,
     /// Whether it joined the room.
     joined: bool,
+    /// When it was accepted.
+    accepted: Instant,
 }
 
 /// A running host session with its capture and input, while viewers are connected.
@@ -58,6 +61,11 @@ pub(super) struct Hosting {
 }
 
 impl Hosting {
+    /// Returns whether the signaling connection this session used has closed.
+    pub(super) fn is_stale(&self) -> bool {
+        self.stale
+    }
+
     /// Returns whether host input currently locks out remote input.
     pub(super) fn input_locked(&self) -> bool {
         self.status.as_ref().is_some_and(|s| s.borrow().locked)
@@ -94,33 +102,9 @@ impl Hosting {
     }
 }
 
-/// Checks a request's sealed password against the host's password hash.
-fn check_password(
-    identity: &super::identity::Identity,
-    viewer_key: &PublicKey,
-    session_id: &str,
-    viewer: DeviceId,
-    sealed: Option<&str>,
-    hash: Option<&str>,
-) -> PasswordCheck {
-    let Some(sealed) = sealed else {
-        return PasswordCheck::Absent;
-    };
-    let opened: Result<String, CryptoError> = open_password(
-        &identity.keys,
-        viewer_key,
-        session_id,
-        viewer,
-        identity.id,
-        sealed,
-    );
-    match (opened, hash) {
-        (Err(_), _) => PasswordCheck::Unreadable,
-        (Ok(password), Some(hash)) if access::verify_password(&password, hash) => {
-            PasswordCheck::Correct
-        }
-        (Ok(_), _) => PasswordCheck::Wrong,
-    }
+/// Returns whether a viewer accepted at `accepted` that has not joined by `now` is given up.
+fn join_expired(accepted: Instant, joined: bool, now: Instant) -> bool {
+    !joined && now.saturating_duration_since(accepted) >= JOIN_WINDOW
 }
 
 impl Actor {
@@ -263,6 +247,7 @@ impl Actor {
                         grants: remembered.unwrap_or_default(),
                         clipboard,
                         joined: false,
+                        accepted: Instant::now(),
                     })
                     .joined = true;
             }
@@ -329,8 +314,9 @@ impl Actor {
             .as_ref()
             .map(|h| h.expose().to_string());
         let unattended = settings.unattended && hash.is_some();
-        let check = check_password(
-            &identity,
+        let check = access::check_sealed(
+            &identity.keys,
+            identity.id,
             viewer_key,
             session_id,
             viewer,
@@ -407,6 +393,7 @@ impl Actor {
                     grants,
                     clipboard,
                     joined: false,
+                    accepted: Instant::now(),
                 });
             }
             Err(e) => {
@@ -527,6 +514,27 @@ impl Actor {
         }
     }
 
+    /// Gives up accepted viewers that did not join in time, stopping capture
+    /// and restarting stale hosting when no viewer remains.
+    pub(super) async fn prune_unjoined(&mut self) {
+        let now = Instant::now();
+        let Some(host) = self.host.as_mut() else {
+            return;
+        };
+        let before = host.viewers.len();
+        host.viewers
+            .retain(|_, v| !join_expired(v.accepted, v.joined, now));
+        if host.viewers.len() == before || !host.viewers.is_empty() {
+            return;
+        }
+        tracing::info!("accepted viewers never joined, stopping capture");
+        host.stop_capture().await;
+        if host.stale {
+            self.stop_hosting().await;
+            self.start_hosting();
+        }
+    }
+
     /// Returns the viewers the local clipboard is sent to.
     pub(super) fn host_clipboard_targets(&self) -> Vec<DeviceId> {
         self.host
@@ -558,5 +566,18 @@ impl Actor {
                     .collect()
             })
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unjoined_viewers_expire_after_the_join_window() {
+        let accepted = Instant::now();
+        assert!(!join_expired(accepted, false, accepted + JOIN_WINDOW / 2));
+        assert!(join_expired(accepted, false, accepted + JOIN_WINDOW));
+        assert!(!join_expired(accepted, true, accepted + JOIN_WINDOW * 10));
     }
 }

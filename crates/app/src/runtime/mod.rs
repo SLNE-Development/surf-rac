@@ -404,6 +404,13 @@ pub fn may_fetch_host_key(saved_password: bool, pinned: bool) -> bool {
     !saved_password && !pinned
 }
 
+/// Returns whether a failed request should offer to forget the saved
+/// password: only when the saved password was actually sent and the host
+/// refused or never answered, as a host with a changed password does.
+pub fn offer_forget(sent_saved: bool, error: &RequestError) -> bool {
+    sent_saved && matches!(error, RequestError::Denied | RequestError::Timeout)
+}
+
 /// Returns the text a viewer window shows when a request fails.
 pub fn request_error_text(error: &RequestError) -> String {
     match error {
@@ -447,6 +454,14 @@ mod tests {
         assert!(!may_fetch_host_key(true, false));
         assert!(!may_fetch_host_key(false, true));
         assert!(!may_fetch_host_key(true, true));
+    }
+
+    #[test]
+    fn forget_is_offered_only_when_the_saved_password_was_sent() {
+        assert!(offer_forget(true, &RequestError::Denied));
+        assert!(offer_forget(true, &RequestError::Timeout));
+        assert!(!offer_forget(false, &RequestError::Denied));
+        assert!(!offer_forget(true, &RequestError::Offline));
     }
 
     #[test]

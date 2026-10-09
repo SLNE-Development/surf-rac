@@ -121,20 +121,31 @@ impl ClientApp {
 
     /// Routes captured keys to the focused viewer window whose host grants the keyboard.
     fn update_key_target(&self) {
-        let target = self.snap.viewers.iter().find(|v| {
-            v.input.keyboard
-                && !v.input.locked
-                && self.viewers.get(&v.session).is_some_and(|ui| ui.focused)
+        let target = key_target(&self.snap.viewers, |session| {
+            self.viewers.get(&session).is_some_and(|ui| ui.focused)
         });
-        crate::keyhook::set_target(target.map(|v| {
+        crate::keyhook::set_target(target.map(|session| {
             let commands = self.commands.clone();
-            let session = v.session;
             let sink: crate::keyhook::Sink = std::sync::Arc::new(move |message| {
                 commands.send(Command::ViewerSend { session, message });
             });
             (session, sink)
         }));
     }
+}
+
+/// Returns the session that receives captured keys: a connected session
+/// whose window is focused and whose host grants the keyboard without a lock.
+fn key_target(views: &[crate::runtime::ViewerView], focused: impl Fn(u64) -> bool) -> Option<u64> {
+    views
+        .iter()
+        .find(|v| {
+            v.status == crate::runtime::ViewerStatus::Connected
+                && v.input.keyboard
+                && !v.input.locked
+                && focused(v.session)
+        })
+        .map(|v| v.session)
 }
 
 impl eframe::App for ClientApp {
@@ -157,5 +168,58 @@ impl eframe::App for ClientApp {
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use surf_rac_protocol::DeviceId;
+    use surf_rac_protocol::data::InputState;
+
+    use super::*;
+    use crate::runtime::{ViewerStatus, ViewerView};
+
+    fn view(session: u64, status: ViewerStatus, keyboard: bool, locked: bool) -> ViewerView {
+        ViewerView {
+            session,
+            host: DeviceId::new(123_456_789).unwrap(),
+            name: "host".into(),
+            status,
+            frame: Arc::new(Mutex::new(None)),
+            screen: None,
+            input: InputState {
+                pointer: true,
+                keyboard,
+                locked,
+                follow: false,
+            },
+            clipboard: false,
+            offer_forget: false,
+        }
+    }
+
+    #[test]
+    fn keys_go_only_to_a_focused_connected_session_with_keyboard() {
+        let focused = |s: u64| s != 9;
+        let ended = ViewerStatus::Ended("over".into());
+        assert_eq!(
+            key_target(&[view(1, ViewerStatus::Connected, true, false)], focused),
+            Some(1)
+        );
+        assert_eq!(key_target(&[view(1, ended, true, false)], focused), None);
+        assert_eq!(
+            key_target(&[view(1, ViewerStatus::Connected, false, false)], focused),
+            None
+        );
+        assert_eq!(
+            key_target(&[view(1, ViewerStatus::Connected, true, true)], focused),
+            None
+        );
+        assert_eq!(
+            key_target(&[view(9, ViewerStatus::Connected, true, false)], focused),
+            None
+        );
     }
 }

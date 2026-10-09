@@ -8,6 +8,8 @@ use argon2::Argon2;
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use surf_rac_protocol::DeviceId;
+use surf_rac_session::crypto::open_password;
+use surf_rac_session::{DeviceKeys, PublicKey};
 
 /// Wrong passwords from one viewer device that lock it out.
 pub const VIEWER_LIMIT: u32 = 5;
@@ -116,6 +118,33 @@ pub enum PasswordCheck {
     Unreadable,
 }
 
+/// Checks the password `sealed` that `viewer` offered in `session_id`
+/// against the host's password `hash`.
+///
+/// `own` and `host` are the host's key pair and device ID, `viewer_key` the
+/// key the request came with. Without a hash every offered password is wrong.
+pub fn check_sealed(
+    own: &DeviceKeys,
+    host: DeviceId,
+    viewer_key: &PublicKey,
+    session_id: &str,
+    viewer: DeviceId,
+    sealed: Option<&str>,
+    hash: Option<&str>,
+) -> PasswordCheck {
+    let Some(sealed) = sealed else {
+        return PasswordCheck::Absent;
+    };
+    match (
+        open_password(own, viewer_key, session_id, viewer, host, sealed),
+        hash,
+    ) {
+        (Err(_), _) => PasswordCheck::Unreadable,
+        (Ok(password), Some(hash)) if verify_password(&password, hash) => PasswordCheck::Correct,
+        (Ok(_), _) => PasswordCheck::Wrong,
+    }
+}
+
 /// Extra information shown with a prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptNote {
@@ -182,6 +211,34 @@ mod tests {
 
     fn id(n: u32) -> DeviceId {
         DeviceId::new(100_000_000 + n).unwrap()
+    }
+
+    #[test]
+    fn sealed_passwords_are_checked_against_the_hash() {
+        use surf_rac_session::DeviceKeys;
+        use surf_rac_session::crypto::seal_password;
+        let (host, viewer) = (DeviceKeys::generate(), DeviceKeys::generate());
+        let (hid, vid) = (id(1), id(2));
+        let hash = hash_password("hunter22").unwrap();
+        let seal =
+            |pw: &str| seal_password(&viewer, &host.public_key(), "s1", vid, hid, pw).unwrap();
+        let check = |sealed: Option<&str>, hash: Option<&str>| {
+            check_sealed(&host, hid, &viewer.public_key(), "s1", vid, sealed, hash)
+        };
+        assert_eq!(check(None, Some(&hash)), PasswordCheck::Absent);
+        assert_eq!(
+            check(Some(&seal("hunter22")), Some(&hash)),
+            PasswordCheck::Correct
+        );
+        assert_eq!(
+            check(Some(&seal("hunter23")), Some(&hash)),
+            PasswordCheck::Wrong
+        );
+        assert_eq!(check(Some(&seal("hunter22")), None), PasswordCheck::Wrong);
+        assert_eq!(
+            check(Some("garbage"), Some(&hash)),
+            PasswordCheck::Unreadable
+        );
     }
 
     #[test]

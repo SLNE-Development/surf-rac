@@ -116,6 +116,21 @@ impl IdentityKey {
         self.signing.sign(&challenge_message(nonce)).to_bytes()
     }
 
+    /// Signs a device registration of this key with `fingerprint_hash` and `name`.
+    ///
+    /// The signed message is [`surf_rac_protocol::register_message`] of the
+    /// public key, the fingerprint hash and the name.
+    pub fn sign_registration(&self, fingerprint_hash: &str, name: &str) -> [u8; 64] {
+        let public = self.signing.verifying_key().to_bytes();
+        self.signing
+            .sign(&surf_rac_protocol::register_message(
+                &public,
+                fingerprint_hash,
+                name,
+            ))
+            .to_bytes()
+    }
+
     /// Signs the per-session public `key` this device uses as `role` in `session_id`.
     ///
     /// The signed message is [`SESSION_DOMAIN`], the role tag (`viewer` or
@@ -547,6 +562,22 @@ mod tests {
         ed25519_dalek::SigningKey::from_bytes(&id.to_bytes())
             .sign(msg)
             .to_bytes()
+    }
+
+    #[test]
+    fn registration_signature_covers_the_register_message() {
+        let id = IdentityKey::generate();
+        let fingerprint = "ab".repeat(32);
+        let msg =
+            surf_rac_protocol::register_message(&id.public().to_bytes(), &fingerprint, "laptop");
+        assert_eq!(
+            id.sign_registration(&fingerprint, "laptop"),
+            reference_sign(&id, &msg)
+        );
+        assert_ne!(
+            id.sign_registration(&fingerprint, "desktop"),
+            reference_sign(&id, &msg)
+        );
     }
 
     #[test]

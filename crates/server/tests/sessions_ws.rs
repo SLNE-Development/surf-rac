@@ -11,9 +11,14 @@ use serde_json::{Value, json};
 use sha2::Sha256;
 use sqlx::PgPool;
 
-/// Standard base64 of 32 zero bytes, a well-formed public key.
+/// Standard base64 of 32 bytes, a well-formed per-session key or nonce.
 fn key_b64() -> String {
     STANDARD.encode([7u8; 32])
+}
+
+/// Standard base64 of 64 bytes, a well-formed signature.
+fn signature_b64() -> String {
+    STANDARD.encode([9u8; 64])
 }
 
 /// Verifies `token`'s signature under the test secret and returns its claims.
@@ -32,55 +37,119 @@ async fn session_request_is_relayed_with_sender(pool: PgPool) {
     let app = common::spawn(pool).await;
     let mut alice = app.online_device(1).await;
     let mut bob = app.online_device(2).await;
-    send(
-        &mut bob.ws,
-        json!({"type":"session_request","to":alice.id,"session_id":"s1","viewer_public_key":key_b64()}),
-    )
-    .await;
+    send(&mut bob.ws, session_request(&alice.id, "s1")).await;
     let got = recv_type(&mut alice.ws, "session_request").await;
     assert_eq!(
         got,
-        json!({"type":"session_request","from":bob.id,"session_id":"s1","viewer_public_key":key_b64()})
+        json!({"type":"session_request","from":bob.id,"session_id":"s1",
+               "session_key":key_b64(),"signature":signature_b64(),
+               "identity_key":common::public_key_b64(&bob.key),"name":"pc","unattended":false})
     );
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn session_request_relays_sealed_password(pool: PgPool) {
+async fn relayed_identity_key_is_the_registered_key(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let mut alice = app.online_device(1).await;
+    let mut bob = app.online_device(2).await;
+    let mut request = session_request(&alice.id, "s1");
+    request["identity_key"] = json!(STANDARD.encode([1u8; 32]));
+    send(&mut bob.ws, request).await;
+    let got = recv_type(&mut alice.ws, "session_request").await;
+    assert_eq!(
+        got["identity_key"],
+        common::public_key_b64(&bob.key).as_str()
+    );
+    send(&mut alice.ws, accepted_response(&bob.id, "s1")).await;
+    let got = recv_type(&mut bob.ws, "session_response").await;
+    assert_eq!(
+        got["identity_key"],
+        common::public_key_b64(&alice.key).as_str()
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn password_challenge_is_relayed_with_sender(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let mut alice = app.online_device(1).await;
+    let mut bob = app.online_device(2).await;
+    send(
+        &mut alice.ws,
+        json!({"type":"password_challenge","to":bob.id,"session_id":"s1",
+               "session_key":key_b64(),"signature":signature_b64(),"host_nonce":key_b64()}),
+    )
+    .await;
+    let got = recv_type(&mut bob.ws, "password_challenge").await;
+    assert_eq!(
+        got,
+        json!({"type":"password_challenge","from":alice.id,"session_id":"s1",
+               "session_key":key_b64(),"signature":signature_b64(),"host_nonce":key_b64(),
+               "identity_key":common::public_key_b64(&alice.key)})
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn password_challenge_rejects_bad_fields(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let mut alice = app.online_device(1).await;
+    let bob = app.online_device(2).await;
+    for (key, signature, nonce) in [
+        ("AAAA".to_owned(), signature_b64(), key_b64()),
+        (key_b64(), "AAAA".to_owned(), key_b64()),
+        (key_b64(), signature_b64(), "AAAA".to_owned()),
+    ] {
+        send(
+            &mut alice.ws,
+            json!({"type":"password_challenge","to":bob.id,"session_id":"s1",
+                   "session_key":key,"signature":signature,"host_nonce":nonce}),
+        )
+        .await;
+        assert_eq!(
+            recv_type(&mut alice.ws, "error").await["code"],
+            "bad_message"
+        );
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn session_password_is_relayed_with_sender(pool: PgPool) {
     let app = common::spawn(pool).await;
     let mut alice = app.online_device(1).await;
     let mut bob = app.online_device(2).await;
     send(
         &mut bob.ws,
-        json!({"type":"session_request","to":alice.id,"session_id":"s1",
-               "viewer_public_key":key_b64(),"password":"c2VhbGVk"}),
+        json!({"type":"session_password","to":alice.id,"session_id":"s1","password":"c2VhbGVk"}),
     )
     .await;
-    let got = recv_type(&mut alice.ws, "session_request").await;
-    assert_eq!(got["password"], "c2VhbGVk");
+    let got = recv_type(&mut alice.ws, "session_password").await;
+    assert_eq!(
+        got,
+        json!({"type":"session_password","from":bob.id,"session_id":"s1","password":"c2VhbGVk"})
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn session_request_rejects_oversized_password(pool: PgPool) {
+async fn session_password_rejects_oversized_password(pool: PgPool) {
     let app = common::spawn(pool).await;
     let mut alice = app.online_device(1).await;
     let mut bob = app.online_device(2).await;
     let long = "A".repeat(surf_rac_protocol::MAX_SEALED_PASSWORD_LEN + 1);
     send(
         &mut bob.ws,
-        json!({"type":"session_request","to":alice.id,"session_id":"s1",
-               "viewer_public_key":key_b64(),"password":long}),
+        json!({"type":"session_password","to":alice.id,"session_id":"s1","password":long}),
     )
     .await;
     assert_eq!(recv_type(&mut bob.ws, "error").await["code"], "bad_message");
+    let longest = "A".repeat(surf_rac_protocol::MAX_SEALED_PASSWORD_LEN);
     send(
         &mut bob.ws,
-        json!({"type":"session_request","to":alice.id,"session_id":"s2","viewer_public_key":key_b64()}),
+        json!({"type":"session_password","to":alice.id,"session_id":"s2","password":longest}),
     )
     .await;
-    let got = recv_type(&mut alice.ws, "session_request").await;
+    let got = recv_type(&mut alice.ws, "session_password").await;
     assert_eq!(
         got["session_id"], "s2",
-        "the oversized request must not be relayed"
+        "the oversized password must not be relayed"
     );
 }
 
@@ -90,14 +159,23 @@ async fn session_request_rejects_bad_key(pool: PgPool) {
     let alice = app.online_device(1).await;
     let mut bob = app.online_device(2).await;
     for key in ["AAAA", "not base64!", ""] {
-        send(
-            &mut bob.ws,
-            json!({"type":"session_request","to":alice.id,"session_id":"s1","viewer_public_key":key}),
-        )
-        .await;
+        let mut request = session_request(&alice.id, "s1");
+        request["session_key"] = json!(key);
+        send(&mut bob.ws, request).await;
         let err = recv_type(&mut bob.ws, "error").await;
         assert_eq!(err["code"], "bad_message", "{key}");
     }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn session_request_rejects_bad_signature_format(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let alice = app.online_device(1).await;
+    let mut bob = app.online_device(2).await;
+    let mut request = session_request(&alice.id, "s1");
+    request["signature"] = json!(key_b64());
+    send(&mut bob.ws, request).await;
+    assert_eq!(recv_type(&mut bob.ws, "error").await["code"], "bad_message");
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -105,11 +183,7 @@ async fn session_request_rejects_bad_session_id(pool: PgPool) {
     let app = common::spawn(pool).await;
     let alice = app.online_device(1).await;
     let mut bob = app.online_device(2).await;
-    send(
-        &mut bob.ws,
-        json!({"type":"session_request","to":alice.id,"session_id":"","viewer_public_key":key_b64()}),
-    )
-    .await;
+    send(&mut bob.ws, session_request(&alice.id, "")).await;
     assert_eq!(recv_type(&mut bob.ws, "error").await["code"], "bad_message");
 }
 
@@ -117,11 +191,7 @@ async fn session_request_rejects_bad_session_id(pool: PgPool) {
 async fn session_request_to_offline_host(pool: PgPool) {
     let app = common::spawn(pool).await;
     let mut bob = app.online_device(2).await;
-    send(
-        &mut bob.ws,
-        json!({"type":"session_request","to":"123456789","session_id":"s1","viewer_public_key":key_b64()}),
-    )
-    .await;
+    send(&mut bob.ws, session_request("123456789", "s1")).await;
     assert_eq!(
         recv_type(&mut bob.ws, "error").await["code"],
         "target_offline"
@@ -133,15 +203,13 @@ async fn session_response_is_relayed(pool: PgPool) {
     let app = common::spawn(pool).await;
     let mut alice = app.online_device(1).await;
     let mut bob = app.online_device(2).await;
-    send(
-        &mut alice.ws,
-        json!({"type":"session_response","to":bob.id,"session_id":"s1","accepted":true,"host_public_key":key_b64(),"host_nonce":key_b64()}),
-    )
-    .await;
+    send(&mut alice.ws, accepted_response(&bob.id, "s1")).await;
     let got = recv_type(&mut bob.ws, "session_response").await;
     assert_eq!(
         got,
-        json!({"type":"session_response","from":alice.id,"session_id":"s1","accepted":true,"host_public_key":key_b64(),"host_nonce":key_b64()})
+        json!({"type":"session_response","from":alice.id,"session_id":"s1","accepted":true,
+               "session_key":key_b64(),"signature":signature_b64(),"host_nonce":key_b64(),
+               "identity_key":common::public_key_b64(&alice.key)})
     );
     send(
         &mut alice.ws,
@@ -150,7 +218,11 @@ async fn session_response_is_relayed(pool: PgPool) {
     .await;
     let got = recv_type(&mut bob.ws, "session_response").await;
     assert_eq!(got["reason"], "room_full");
-    assert!(got.get("host_public_key").is_none());
+    assert!(got.get("session_key").is_none());
+    assert!(
+        got.get("identity_key").is_none(),
+        "a refusal carries no identity key"
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -158,11 +230,9 @@ async fn session_response_rejects_bad_host_key(pool: PgPool) {
     let app = common::spawn(pool).await;
     let mut alice = app.online_device(1).await;
     let bob = app.online_device(2).await;
-    send(
-        &mut alice.ws,
-        json!({"type":"session_response","to":bob.id,"session_id":"s1","accepted":true,"host_public_key":"AAAA"}),
-    )
-    .await;
+    let mut response = accepted_response(&bob.id, "s1");
+    response["session_key"] = json!("AAAA");
+    send(&mut alice.ws, response).await;
     assert_eq!(
         recv_type(&mut alice.ws, "error").await["code"],
         "bad_message"
@@ -256,12 +326,9 @@ async fn session_response_rejects_bad_nonce(pool: PgPool) {
     let app = common::spawn(pool).await;
     let mut alice = app.online_device(1).await;
     let bob = app.online_device(2).await;
-    send(
-        &mut alice.ws,
-        json!({"type":"session_response","to":bob.id,"session_id":"s1","accepted":true,
-               "host_public_key":key_b64(),"host_nonce":"AAAA"}),
-    )
-    .await;
+    let mut response = accepted_response(&bob.id, "s1");
+    response["host_nonce"] = json!("AAAA");
+    send(&mut alice.ws, response).await;
     assert_eq!(
         recv_type(&mut alice.ws, "error").await["code"],
         "bad_message"
@@ -271,7 +338,13 @@ async fn session_response_rejects_bad_nonce(pool: PgPool) {
 /// Returns a well-formed session request to `to` with session ID `session_id`.
 fn session_request(to: &str, session_id: &str) -> Value {
     json!({"type":"session_request","to":to,"session_id":session_id,
-           "session_key":key_b64(),"signature":STANDARD.encode([9u8; 64]),"unattended":false})
+           "session_key":key_b64(),"signature":signature_b64(),"unattended":false})
+}
+
+/// Returns a well-formed accepted session response to `to` for session `session_id`.
+fn accepted_response(to: &str, session_id: &str) -> Value {
+    json!({"type":"session_response","to":to,"session_id":session_id,"accepted":true,
+           "session_key":key_b64(),"signature":signature_b64(),"host_nonce":key_b64()})
 }
 
 #[sqlx::test(migrations = "./migrations")]

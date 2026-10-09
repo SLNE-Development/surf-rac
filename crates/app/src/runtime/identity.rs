@@ -69,9 +69,29 @@ pub enum IdentityError {
     /// The server refused the registration or could not be reached.
     #[error(transparent)]
     Api(#[from] ApiError),
-    /// The installation store could not be written.
+    /// The installation store could not be changed.
     #[error("the installation could not be stored: {0}")]
     Store(String),
+}
+
+/// An identity that is ready to use.
+#[derive(Debug, Clone)]
+pub struct Ready {
+    /// The loaded or newly registered identity.
+    pub identity: Identity,
+    /// Why the installation store could not be written, when the identity was
+    /// newly registered but not stored; `None` when it is stored.
+    pub unsaved: Option<String>,
+}
+
+impl Ready {
+    /// Returns a stored identity that is ready to use.
+    fn stored(identity: Identity) -> Ready {
+        Ready {
+            identity,
+            unsaved: None,
+        }
+    }
 }
 
 /// Something that registers an installation's identity key with the server.
@@ -100,40 +120,56 @@ pub fn device_name() -> String {
 ///
 /// A new installation gets a fresh identity key; it is stored only after the
 /// server assigned an ID. A stored installation is used as it is, without
-/// contacting the server.
+/// contacting the server. A registered identity that could not be stored is
+/// still returned, with the reason in [`Ready::unsaved`], so that the caller
+/// can use it and store it later with [`save`] instead of registering again.
 pub async fn ensure<R: Registrar>(
     store: &dyn InstallationStore,
     registrar: &R,
     fingerprint_hash: &str,
     name: &str,
-) -> Result<Identity, IdentityError> {
+) -> Result<Ready, IdentityError> {
     if let Some(identity) = store.load().as_ref().and_then(Identity::from_installation) {
-        return Ok(identity);
+        return Ok(Ready::stored(identity));
     }
     register(store, registrar, fingerprint_hash, name).await
 }
 
 /// Discards the stored installation and registers a new one with a fresh
 /// identity key, as after the server reported a clone or an unknown ID.
+///
+/// Fails with [`IdentityError::Store`] when the stored installation cannot be
+/// removed; a registered identity that cannot be stored is returned as in
+/// [`ensure`].
 pub async fn renew<R: Registrar>(
     store: &dyn InstallationStore,
     registrar: &R,
     fingerprint_hash: &str,
     name: &str,
-) -> Result<Identity, IdentityError> {
+) -> Result<Ready, IdentityError> {
     store
         .clear()
         .map_err(|e| IdentityError::Store(e.to_string()))?;
     register(store, registrar, fingerprint_hash, name).await
 }
 
+/// Writes `identity` to the installation store.
+pub fn save(store: &dyn InstallationStore, identity: &Identity) -> Result<(), IdentityError> {
+    store
+        .save(&identity.to_installation())
+        .map_err(|e| IdentityError::Store(e.to_string()))
+}
+
 /// Generates an identity key, registers it and stores the installation.
+///
+/// When storing fails, the registered identity is returned with the reason in
+/// [`Ready::unsaved`].
 async fn register<R: Registrar>(
     store: &dyn InstallationStore,
     registrar: &R,
     fingerprint_hash: &str,
     name: &str,
-) -> Result<Identity, IdentityError> {
+) -> Result<Ready, IdentityError> {
     let key = IdentityKey::generate();
     let id = registrar
         .register_device(&key, fingerprint_hash, name)
@@ -143,11 +179,15 @@ async fn register<R: Registrar>(
         key: Arc::new(key),
         name: name.to_string(),
     };
-    store
-        .save(&identity.to_installation())
-        .map_err(|e| IdentityError::Store(e.to_string()))?;
     tracing::info!(device_id = %id, "installation registered");
-    Ok(identity)
+    if let Err(IdentityError::Store(reason)) = save(store, &identity) {
+        tracing::error!(device_id = %id, error = %reason, "registered installation not stored");
+        return Ok(Ready {
+            identity,
+            unsaved: Some(reason),
+        });
+    }
+    Ok(Ready::stored(identity))
 }
 
 #[cfg(test)]
@@ -213,7 +253,8 @@ mod tests {
         let registrar = MockRegistrar::default();
         let identity = ensure(&store, &registrar, FINGERPRINT, "laptop")
             .await
-            .unwrap();
+            .unwrap()
+            .identity;
         let seen = registrar.seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].0, identity.key.public().to_bytes());
@@ -232,10 +273,12 @@ mod tests {
         let registrar = MockRegistrar::default();
         let first = ensure(&store, &registrar, FINGERPRINT, "laptop")
             .await
-            .unwrap();
+            .unwrap()
+            .identity;
         let second = ensure(&store, &registrar, FINGERPRINT, "laptop")
             .await
-            .unwrap();
+            .unwrap()
+            .identity;
         assert_eq!(registrar.seen.lock().unwrap().len(), 1);
         assert_eq!(second.id, first.id);
         assert_eq!(second.key.public(), first.key.public());
@@ -247,10 +290,12 @@ mod tests {
         let registrar = MockRegistrar::default();
         let old = ensure(&store, &registrar, FINGERPRINT, "laptop")
             .await
-            .unwrap();
+            .unwrap()
+            .identity;
         let new = renew(&store, &registrar, FINGERPRINT, "laptop")
             .await
-            .unwrap();
+            .unwrap()
+            .identity;
         assert_eq!(registrar.seen.lock().unwrap().len(), 2);
         assert_ne!(new.id, old.id);
         assert_ne!(new.key.public(), old.key.public());
@@ -278,6 +323,65 @@ mod tests {
             Some(IdentityError::Api(ApiError::UpdateRequired))
         );
         assert!(store.load().is_none());
+    }
+
+    /// An installation store whose first `failures` writes fail.
+    struct FailingStore {
+        /// The installation that was written last.
+        inner: MemoryStore,
+        /// Writes that still fail.
+        failures: Mutex<u32>,
+    }
+
+    impl InstallationStore for FailingStore {
+        /// Returns the held installation.
+        fn load(&self) -> Option<InstallationState> {
+            self.inner.load()
+        }
+        /// Fails while failures remain, then replaces the held installation.
+        fn save(&self, state: &InstallationState) -> std::io::Result<()> {
+            let mut failures = self.failures.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(std::io::Error::other("disk full"));
+            }
+            self.inner.save(state)
+        }
+        /// Drops the held installation.
+        fn clear(&self) -> std::io::Result<()> {
+            self.inner.clear()
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_identity_that_cannot_be_stored_is_kept_and_saved_later() {
+        let store = FailingStore {
+            inner: MemoryStore::default(),
+            failures: Mutex::new(3),
+        };
+        let registrar = MockRegistrar::default();
+        let ready = ensure(&store, &registrar, FINGERPRINT, "laptop")
+            .await
+            .unwrap();
+        assert!(ready.unsaved.as_deref().unwrap().contains("disk full"));
+        assert!(store.load().is_none());
+        for _ in 0..2 {
+            assert!(matches!(
+                save(&store, &ready.identity),
+                Err(IdentityError::Store(_))
+            ));
+        }
+        save(&store, &ready.identity).unwrap();
+        assert_eq!(registrar.seen.lock().unwrap().len(), 1);
+        let stored = Identity::from_installation(&store.load().unwrap()).unwrap();
+        assert_eq!(stored.id, ready.identity.id);
+        assert_eq!(stored.key.public(), ready.identity.key.public());
+        let again = ensure(&store, &registrar, FINGERPRINT, "laptop")
+            .await
+            .unwrap();
+        assert!(again.unsaved.is_none());
+        assert_eq!(again.identity.id, ready.identity.id);
+        assert_eq!(registrar.seen.lock().unwrap().len(), 1);
     }
 
     #[test]

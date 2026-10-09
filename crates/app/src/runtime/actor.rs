@@ -37,10 +37,15 @@ const CLIPBOARD_POLL: Duration = Duration::from_millis(500);
 /// Banner shown when an account action needs a signed-in account.
 const SIGN_IN_FIRST_TEXT: &str = "Sign in to an account to keep contacts and devices.";
 
+/// Banner shown while this installation's identity is in use but not stored.
+const IDENTITY_NOT_SAVED_TEXT: &str = "This device's identity could not be saved.";
+
 /// Events from tasks the actor spawned.
 pub(super) enum Internal {
     /// Setting up the installation's identity of generation `.0` finished.
-    IdentityReady(u64, Result<Identity, IdentityError>),
+    IdentityReady(u64, Result<identity::Ready, IdentityError>),
+    /// Time to try again to store the identity with device ID `.0`.
+    SaveIdentity(DeviceId),
     /// A signaling connection of generation `.0` opened.
     Connected(u64, SignalingClient),
     /// A connection attempt of generation `.0` failed.
@@ -183,6 +188,10 @@ pub(super) struct Actor {
     attempts: u32,
     /// Whether the installation was renewed since the last successful connection.
     renewed: bool,
+    /// Whether the identity in use was registered but is not stored yet.
+    unsaved: bool,
+    /// Failed tries to store the identity in use, for the retry backoff.
+    save_attempts: u32,
     /// Hosting, when running.
     pub(super) host: Option<Hosting>,
     /// Whether hosting is being started.
@@ -263,6 +272,8 @@ impl Actor {
             generation: 0,
             attempts: 0,
             renewed: false,
+            unsaved: false,
+            save_attempts: 0,
             host: None,
             host_starting: false,
             host_generation: 0,
@@ -442,6 +453,7 @@ impl Actor {
                 remember,
             } => self.on_viewer_started(session, result, used_saved, remember),
             Internal::Viewer(session, event) => self.on_viewer_event(session, event).await,
+            Internal::SaveIdentity(id) => self.retry_identity_save(id),
             Internal::IdentityReady(..)
             | Internal::Connected(..)
             | Internal::ConnectFailed(..)
@@ -508,17 +520,33 @@ impl Actor {
 
     /// Takes a loaded or registered identity into use and connects, or
     /// handles why there is none.
-    fn on_identity(&mut self, result: Result<Identity, IdentityError>) {
+    ///
+    /// A registered identity that could not be stored is used all the same:
+    /// the banner says so and storing it is retried with backoff until it
+    /// succeeds, without registering again.
+    fn on_identity(&mut self, result: Result<identity::Ready, IdentityError>) {
         match result {
-            Ok(identity) => {
+            Ok(ready) => {
+                let identity = ready.identity;
                 tracing::info!(device_id = %identity.id, "installation identity ready");
+                let id = identity.id;
                 self.identity = Some(identity);
+                match ready.unsaved {
+                    Some(reason) => {
+                        tracing::warn!(device_id = %id, error = %reason, "identity in use but not stored");
+                        self.banner = Some(IDENTITY_NOT_SAVED_TEXT.into());
+                        self.save_attempts = 1;
+                        self.unsaved = true;
+                        self.schedule_identity_save(id);
+                    }
+                    None => self.identity_stored(),
+                }
                 self.connect_now();
             }
             Err(e) => {
                 tracing::warn!(error = %e, "installation identity not set up");
                 if let IdentityError::Store(_) = e {
-                    self.banner = Some("This device's identity could not be saved.".into());
+                    self.banner = Some(IDENTITY_NOT_SAVED_TEXT.into());
                 }
                 match identity_action(&e) {
                     ConnectAction::Stop(state) => self.stop_connecting(state),
@@ -529,6 +557,49 @@ impl Actor {
                     }
                 }
             }
+        }
+    }
+
+    /// Tries again after the current save backoff to store the identity with
+    /// device ID `id`.
+    fn schedule_identity_save(&mut self, id: DeviceId) {
+        let delay = backoff(self.save_attempts);
+        let tx = self.internal.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = tx.send(Internal::SaveIdentity(id));
+        });
+    }
+
+    /// Stores the identity in use when it is still the one with device ID
+    /// `id` and not yet stored; schedules another try when that fails.
+    fn retry_identity_save(&mut self, id: DeviceId) {
+        if !self.unsaved {
+            return;
+        }
+        let Some(identity) = self.identity.clone().filter(|i| i.id == id) else {
+            return;
+        };
+        match identity::save(&*self.installation, &identity) {
+            Ok(()) => {
+                tracing::info!(device_id = %id, "installation identity stored");
+                self.identity_stored();
+            }
+            Err(e) => {
+                tracing::warn!(device_id = %id, error = %e, "installation identity still not stored");
+                self.save_attempts = self.save_attempts.saturating_add(1);
+                self.schedule_identity_save(id);
+            }
+        }
+    }
+
+    /// Records that the identity in use is stored and removes the banner
+    /// saying it could not be.
+    fn identity_stored(&mut self) {
+        self.unsaved = false;
+        self.save_attempts = 0;
+        if self.banner.as_deref() == Some(IDENTITY_NOT_SAVED_TEXT) {
+            self.banner = None;
         }
     }
 
@@ -564,6 +635,7 @@ impl Actor {
         self.sign_out();
         self.stop_all().await;
         self.identity = None;
+        self.unsaved = false;
         *lock(&self.known) = KnownKeys::default();
         if let Err(e) = self.installation.clear() {
             tracing::error!(error = %e, "installation not cleared");
@@ -641,6 +713,7 @@ impl Actor {
             ConnectAction::Renew => {
                 tracing::warn!(error = %error, "installation refused, registering a new one");
                 self.identity = None;
+                self.unsaved = false;
                 self.renewed = true;
                 self.connection = Connection::Connecting;
                 self.attempts = self.attempts.saturating_add(1);
@@ -1150,5 +1223,132 @@ impl Actor {
         };
         *lock(&self.shared) = snapshot;
         (self.repaint)();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use surf_rac_session::IdentityKey;
+
+    use super::*;
+    use crate::store::InstallationState;
+
+    /// An installation store that counts reads and fails its first `failures` writes.
+    #[derive(Default)]
+    struct CountingStore {
+        /// The installation that was written last.
+        held: Mutex<Option<InstallationState>>,
+        /// Writes that still fail.
+        failures: Mutex<u32>,
+        /// Number of reads.
+        loads: AtomicU32,
+    }
+
+    impl InstallationStore for CountingStore {
+        /// Counts the read and returns the held installation.
+        fn load(&self) -> Option<InstallationState> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            self.held.lock().unwrap().clone()
+        }
+        /// Fails while failures remain, then replaces the held installation.
+        fn save(&self, state: &InstallationState) -> std::io::Result<()> {
+            let mut failures = self.failures.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(std::io::Error::other("disk full"));
+            }
+            *self.held.lock().unwrap() = Some(state.clone());
+            Ok(())
+        }
+        /// Drops the held installation.
+        fn clear(&self) -> std::io::Result<()> {
+            *self.held.lock().unwrap() = None;
+            Ok(())
+        }
+    }
+
+    /// Returns an actor on a fresh state directory named after `test`, with
+    /// an unreachable server and `installation` as its identity store.
+    fn actor(test: &str, installation: Arc<CountingStore>) -> Actor {
+        let dir =
+            std::env::temp_dir().join(format!("surf-rac-actor-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(dir);
+        store
+            .update(|s| s.server_url = Some("http://127.0.0.1:9".into()))
+            .unwrap();
+        Actor::new(
+            store,
+            installation,
+            Arc::new(Mutex::new(Snapshot::default())),
+            Arc::new(|| {}),
+        )
+    }
+
+    /// Returns a fresh identity with device ID 123456789.
+    fn test_identity() -> Identity {
+        Identity {
+            id: DeviceId::new(123_456_789).unwrap(),
+            key: Arc::new(IdentityKey::generate()),
+            name: "laptop".into(),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unsaved_identity_is_used_and_saved_without_registering_again() {
+        let installation = Arc::new(CountingStore::default());
+        *installation.failures.lock().unwrap() = 2;
+        let mut actor = actor("unsaved", Arc::clone(&installation));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        actor.internal = tx;
+        let identity = test_identity();
+
+        actor.on_identity(Ok(identity::Ready {
+            identity: identity.clone(),
+            unsaved: Some("disk full".into()),
+        }));
+        assert_eq!(actor.identity.as_ref().map(|i| i.id), Some(identity.id));
+        assert_eq!(actor.banner.as_deref(), Some(IDENTITY_NOT_SAVED_TEXT));
+
+        let mut retries = 0;
+        while installation.held.lock().unwrap().is_none() {
+            let event = tokio::time::timeout(Duration::from_secs(600), rx.recv())
+                .await
+                .expect("a save retry")
+                .expect("open channel");
+            match event {
+                Internal::SaveIdentity(id) => {
+                    retries += 1;
+                    actor.event(Internal::SaveIdentity(id)).await;
+                }
+                Internal::IdentityReady(..) => panic!("the identity was registered again"),
+                _ => {}
+            }
+            if installation.held.lock().unwrap().is_none() {
+                assert_eq!(actor.banner.as_deref(), Some(IDENTITY_NOT_SAVED_TEXT));
+            }
+        }
+
+        assert_eq!(retries, 3);
+        assert_eq!(actor.banner, None);
+        assert_eq!(installation.loads.load(Ordering::SeqCst), 0);
+        assert_eq!(actor.identity.as_ref().map(|i| i.id), Some(identity.id));
+        let stored = installation.held.lock().unwrap().clone().unwrap();
+        assert_eq!(stored.device_id, identity.id);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stored_identity_clears_the_not_saved_banner() {
+        let installation = Arc::new(CountingStore::default());
+        let mut actor = actor("stored", installation);
+        actor.banner = Some(IDENTITY_NOT_SAVED_TEXT.into());
+        actor.on_identity(Ok(identity::Ready {
+            identity: test_identity(),
+            unsaved: None,
+        }));
+        assert_eq!(actor.banner, None);
     }
 }

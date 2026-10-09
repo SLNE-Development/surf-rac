@@ -48,10 +48,12 @@ async fn installation_links_to_an_account_and_unlinks_on_sign_out_without_a_sock
     let store = MemoryStore::default();
     let me = identity::ensure(&store, &api, FINGERPRINT, "laptop")
         .await
-        .unwrap();
+        .unwrap()
+        .identity;
     let again = identity::ensure(&store, &api, FINGERPRINT, "laptop")
         .await
-        .unwrap();
+        .unwrap()
+        .identity;
     assert_eq!(again.id, me.id);
 
     let signaling = SignalingClient::connect(&api.ws_url(), me.id, &me.key, FINGERPRINT)
@@ -129,7 +131,8 @@ async fn unknown_device_is_renewed_with_a_fresh_registration(pool: PgPool) {
     let store = MemoryStore::default();
     let me = identity::ensure(&store, &api, FINGERPRINT, "laptop")
         .await
-        .unwrap();
+        .unwrap()
+        .identity;
     sqlx::query("delete from devices")
         .execute(&pool)
         .await
@@ -140,7 +143,8 @@ async fn unknown_device_is_renewed_with_a_fresh_registration(pool: PgPool) {
     ));
     let renewed = identity::renew(&store, &api, FINGERPRINT, "laptop")
         .await
-        .unwrap();
+        .unwrap()
+        .identity;
     assert_ne!(renewed.key.public(), me.key.public());
     SignalingClient::connect(&api.ws_url(), renewed.id, &renewed.key, FINGERPRINT)
         .await

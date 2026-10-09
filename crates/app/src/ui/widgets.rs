@@ -374,14 +374,15 @@ pub(super) fn two_lines(ui: &mut Ui, primary: &str, secondary: &str) {
     });
 }
 
-/// Shows a segmented control choosing `value` among `items`; returns whether it changed.
+/// Shows a segmented control choosing `value` among `items`; returns the
+/// item clicked this frame, including the one already selected.
 pub(super) fn segmented<T: PartialEq + Copy>(
     ui: &mut Ui,
     value: &mut T,
     items: &[(T, &str)],
-) -> bool {
+) -> Option<T> {
     let p = theme::palette(ui.ctx());
-    let mut changed = false;
+    let mut clicked = None;
     Frame::new()
         .fill(p.surface2)
         .stroke(Stroke::new(1.0, p.border))
@@ -403,14 +404,14 @@ pub(super) fn segmented<T: PartialEq + Copy>(
                             .stroke(Stroke::NONE)
                             .corner_radius(RADIUS_INNER)
                             .min_size(vec2(0.0, 28.0));
-                    if ui.add(button).clicked() && !selected {
+                    if ui.add(button).clicked() {
                         *value = *item;
-                        changed = true;
+                        clicked = Some(*item);
                     }
                 }
             });
         });
-    changed
+    clicked
 }
 
 /// Shows a chip-like toggle with an icon and label bound to `on`; the

@@ -99,7 +99,7 @@ fn app_bar(app: &mut ClientApp, ui: &mut egui::Ui) {
             (Tab::Devices, "My devices"),
             (Tab::Settings, "Settings"),
         ];
-        if widgets::segmented(ui, &mut tab, &items) {
+        if let Some(tab) = widgets::segmented(ui, &mut tab, &items) {
             app.tab = tab;
             match tab {
                 Tab::Devices => app.send(Command::RefreshLists),

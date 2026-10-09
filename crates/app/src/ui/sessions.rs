@@ -444,7 +444,7 @@ impl ClientApp {
                     (QualityMode::Balanced, quality_label(QualityMode::Balanced)),
                     (QualityMode::Speed, quality_label(QualityMode::Speed)),
                 ];
-                if widgets::segmented(ui, &mut mode, &items) {
+                if let Some(mode) = widgets::segmented(ui, &mut mode, &items) {
                     send(self, Control::SetQuality { mode });
                 }
             }

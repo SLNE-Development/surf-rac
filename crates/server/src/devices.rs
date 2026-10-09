@@ -229,12 +229,28 @@ pub async fn authenticate(
     Ok(())
 }
 
-/// Returns whether `device` exists and is not disabled.
-pub async fn is_active(db: &PgPool, device: DeviceId) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar("select exists(select 1 from devices where id = $1 and not disabled)")
+/// Whether a device may stay connected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standing {
+    /// The device exists and is not disabled.
+    Active,
+    /// The device exists but an administrator disabled it.
+    Disabled,
+    /// No device with this ID exists.
+    Missing,
+}
+
+/// Returns whether `device` is active, disabled or missing.
+pub async fn standing(db: &PgPool, device: DeviceId) -> Result<Standing, sqlx::Error> {
+    let disabled: Option<bool> = sqlx::query_scalar("select disabled from devices where id = $1")
         .bind(i64::from(device.get()))
-        .fetch_one(db)
-        .await
+        .fetch_optional(db)
+        .await?;
+    Ok(match disabled {
+        None => Standing::Missing,
+        Some(true) => Standing::Disabled,
+        Some(false) => Standing::Active,
+    })
 }
 
 /// Lists the devices linked to `user_id` ordered by ID.

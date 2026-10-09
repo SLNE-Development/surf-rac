@@ -21,7 +21,7 @@ use surf_rac_protocol::{
     ClientMessage, DeviceId, MAX_SEALED_PASSWORD_LEN, ServerMessage, WsErrorCode,
 };
 
-use crate::devices::{self, DeviceError, DeviceIdentity};
+use crate::devices::{self, DeviceError, DeviceIdentity, Standing};
 use crate::livekit::{self, Role};
 use crate::presence;
 use crate::sessions;
@@ -177,8 +177,8 @@ pub async fn run(state: AppState, socket: WebSocket, device: DeviceId, identity:
                 _ = revalidate.tick() => {
                     let verdict = check_active(&state, device).await;
                     if !revalidation.keep(verdict) {
-                        tracing::info!(device_id = %device, "device no longer active, closing");
-                        if verdict == Some(false) {
+                        tracing::info!(device_id = %device, ?verdict, "device no longer active, closing");
+                        if verdict == Some(Standing::Disabled) {
                             let reply = error(WsErrorCode::DeviceDisabled, "device is disabled");
                             let _ = sink.send(frame(&reply)).await;
                         }
@@ -627,15 +627,15 @@ struct Revalidation {
 impl Revalidation {
     /// Returns whether the connection may stay open after a check.
     ///
-    /// `verdict` is `Some(active)` when the check completed, or `None` when the
-    /// database could not be reached. An inactive device closes at once;
-    /// unreachable databases close after [`MAX_REVALIDATION_ERRORS`]
-    /// consecutive failures.
-    fn keep(&mut self, verdict: Option<bool>) -> bool {
+    /// `verdict` is the device's standing when the check completed, or `None`
+    /// when the database could not be reached. A disabled or missing device
+    /// closes at once; unreachable databases close after
+    /// [`MAX_REVALIDATION_ERRORS`] consecutive failures.
+    fn keep(&mut self, verdict: Option<Standing>) -> bool {
         match verdict {
-            Some(active) => {
+            Some(standing) => {
                 self.errors = 0;
-                active
+                standing == Standing::Active
             }
             None => {
                 self.errors += 1;
@@ -645,12 +645,12 @@ impl Revalidation {
     }
 }
 
-/// Checks that `device` still exists and is not disabled.
+/// Checks whether `device` still exists and is not disabled.
 ///
 /// Returns `None` when the database could not be reached.
-async fn check_active(state: &AppState, device: DeviceId) -> Option<bool> {
-    match devices::is_active(&state.db, device).await {
-        Ok(active) => Some(active),
+async fn check_active(state: &AppState, device: DeviceId) -> Option<Standing> {
+    match devices::standing(&state.db, device).await {
+        Ok(standing) => Some(standing),
         Err(err) => {
             tracing::warn!(error = %err, "re-validation failed, database unavailable");
             None
@@ -699,7 +699,7 @@ mod revalidation_tests {
         for _ in 0..(MAX_REVALIDATION_ERRORS - 1) {
             assert!(r.keep(None));
         }
-        assert!(r.keep(Some(true)));
+        assert!(r.keep(Some(Standing::Active)));
         for _ in 0..(MAX_REVALIDATION_ERRORS - 1) {
             assert!(r.keep(None));
         }
@@ -709,6 +709,7 @@ mod revalidation_tests {
     #[test]
     fn revalidation_closes_when_inactive() {
         let mut r = Revalidation::default();
-        assert!(!r.keep(Some(false)));
+        assert!(!r.keep(Some(Standing::Disabled)));
+        assert!(!r.keep(Some(Standing::Missing)));
     }
 }

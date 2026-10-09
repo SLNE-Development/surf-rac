@@ -8,9 +8,11 @@ use common::ws::{
     expect_closed, expect_closed_within, expect_silence, recv, recv_type, send, send_raw,
 };
 use common::{fingerprint, identity_key, sign_challenge};
+use futures_util::StreamExt;
 use serde_json::json;
 use sqlx::PgPool;
 use surf_rac_protocol::DeviceId;
+use tokio_tungstenite::tungstenite::Message;
 
 #[sqlx::test(migrations = "./migrations")]
 async fn valid_signature_gets_hello_and_device_is_online(pool: PgPool) {
@@ -371,6 +373,32 @@ async fn disabled_device_closes_socket(pool: PgPool) {
     expect_closed(&mut a.ws).await;
     send(&mut b.ws, json!({"type":"ping"})).await;
     assert_eq!(recv(&mut b.ws).await["type"], "pong");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn deleted_device_closes_socket_without_device_disabled(pool: PgPool) {
+    let app = common::spawn_with(pool, |s| {
+        s.ws_revalidate_interval = Duration::from_millis(200);
+    })
+    .await;
+    let mut a = app.online_device(1).await;
+    sqlx::query("delete from devices where id = $1")
+        .bind(a.id.parse::<i64>().unwrap())
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(deadline, a.ws.next()).await {
+            Err(_) => panic!("socket was not closed"),
+            Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(Message::Close(_)))) => break,
+            Ok(Some(Ok(Message::Text(text)))) => {
+                let msg: serde_json::Value = serde_json::from_str(text.as_str()).unwrap();
+                assert_ne!(msg["code"], "device_disabled", "{msg}");
+            }
+            Ok(Some(Ok(_))) => continue,
+        }
+    }
 }
 
 #[sqlx::test(migrations = "./migrations")]

@@ -161,8 +161,9 @@ fn incoming_card(app: &mut ClientApp, ui: &mut Ui) {
         },
     );
     if save {
-        app.send(Command::SaveSettings(draft));
-    } else if !discard {
+        app.send(Command::SaveSettings(draft.clone()));
+    }
+    if !discard {
         app.forms.settings = Some(draft);
     }
 }

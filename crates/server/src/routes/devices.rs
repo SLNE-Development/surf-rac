@@ -1,8 +1,11 @@
 //! Device registration, My devices, contact and presence routes.
 
 use axum::Json;
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use std::net::SocketAddr;
+use std::time::Instant;
+
+use axum::extract::{ConnectInfo, Path, State};
+use axum::http::{HeaderMap, StatusCode};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use surf_rac_protocol::{
@@ -10,10 +13,12 @@ use surf_rac_protocol::{
     RegisterDeviceRequest, RegisterDeviceResponse,
 };
 
+use crate::client_ip::client_ip;
 use crate::contacts;
 use crate::devices::{self, DeviceError, device_id};
 use crate::error::ApiError;
 use crate::extract::JsonBody;
+use crate::limits::rate_key;
 use crate::sessions::AuthUser;
 use crate::state::AppState;
 
@@ -30,8 +35,14 @@ fn parse_id(raw: &str) -> Result<DeviceId, ApiError> {
 /// with the same fingerprint returns its existing ID and takes the new name.
 /// A missing or invalid registration signature is a 401 `bad_signature` and
 /// nothing is written.
+///
+/// Every request with a well-formed body counts against the per-client-address
+/// registration limit, including repeated registrations of a known key; over
+/// the limit the response is a 429 `rate_limited`.
 pub async fn register(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     JsonBody(req): JsonBody<RegisterDeviceRequest>,
 ) -> Result<Json<RegisterDeviceResponse>, ApiError> {
     if req.protocol_version != PROTOCOL_VERSION {
@@ -52,6 +63,14 @@ pub async fn register(
     }
     if !devices::valid_name(&req.name) {
         return Err(ApiError::bad_request("name must be 1 to 64 characters"));
+    }
+    let ip = client_ip(&headers, peer, state.config.trust_forwarded_for);
+    if !state
+        .limits
+        .device_register_ip
+        .check(&rate_key(ip), Instant::now())
+    {
+        return Err(ApiError::rate_limited());
     }
     let signature: [u8; 64] = STANDARD
         .decode(&req.signature)

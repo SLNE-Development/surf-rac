@@ -29,10 +29,11 @@ pub struct AppState {
 impl AppState {
     /// Creates the state from a connected pool and the configuration.
     pub fn new(db: PgPool, config: Arc<Config>) -> Self {
+        let limits = Arc::new(Limits::from_config(&config));
         Self {
             db,
             config,
-            limits: Arc::new(Limits::default()),
+            limits,
             hub: Hub::default(),
             ws_revalidate_interval: Duration::from_secs(60),
             ws_auth_timeout: Duration::from_secs(10),

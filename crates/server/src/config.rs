@@ -31,6 +31,10 @@ pub struct Config {
     pub trust_forwarded_for: bool,
     /// Whether logs are JSON (`LOG_FORMAT=json`, the default) or human-readable (`pretty`).
     pub log_json: bool,
+    /// Device registrations allowed per client address block per hour (`REGISTER_PER_HOUR`, default 5).
+    pub register_per_hour: u32,
+    /// Session requests allowed per target device per minute (`SESSION_REQUESTS_PER_MINUTE`, default 10).
+    pub session_requests_per_minute: u32,
 }
 
 /// A configuration value is missing or invalid.
@@ -115,6 +119,9 @@ impl Config {
             Some(_) => return Err(invalid("LOG_FORMAT", "must be json or pretty")),
         };
 
+        let register_per_hour = positive_u32(&get, "REGISTER_PER_HOUR", 5)?;
+        let session_requests_per_minute = positive_u32(&get, "SESSION_REQUESTS_PER_MINUTE", 10)?;
+
         Ok(Config {
             database_url,
             bind_addr,
@@ -126,7 +133,24 @@ impl Config {
             livekit_api_secret,
             trust_forwarded_for,
             log_json,
+            register_per_hour,
+            session_requests_per_minute,
         })
+    }
+}
+
+/// Reads the positive integer variable `name` through `get`, or returns `default` when it is unset.
+fn positive_u32(
+    get: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    default: u32,
+) -> Result<u32, ConfigError> {
+    match get(name) {
+        Some(v) => match v.parse::<u32>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err(invalid(name, "must be a positive integer")),
+        },
+        None => Ok(default),
     }
 }
 
@@ -276,5 +300,30 @@ mod tests {
         let mut v = BASE.to_vec();
         v.push(("TURN_TTL_SECS", "0"));
         assert!(Config::from_vars(vars(&v)).is_err());
+    }
+
+    #[test]
+    fn config_defaults_and_parses_rate_limits() {
+        let c = Config::from_vars(vars(BASE)).unwrap();
+        assert_eq!(c.register_per_hour, 5);
+        assert_eq!(c.session_requests_per_minute, 10);
+        let mut v = BASE.to_vec();
+        v.push(("REGISTER_PER_HOUR", "20"));
+        v.push(("SESSION_REQUESTS_PER_MINUTE", "3"));
+        let c = Config::from_vars(vars(&v)).unwrap();
+        assert_eq!(c.register_per_hour, 20);
+        assert_eq!(c.session_requests_per_minute, 3);
+    }
+
+    #[test]
+    fn config_rejects_bad_rate_limits() {
+        for name in ["REGISTER_PER_HOUR", "SESSION_REQUESTS_PER_MINUTE"] {
+            for bad in ["0", "-1", "many"] {
+                let mut v = BASE.to_vec();
+                v.push((name, bad));
+                let err = Config::from_vars(vars(&v)).unwrap_err();
+                assert!(matches!(err, ConfigError::Invalid { name: n, .. } if n == name));
+            }
+        }
     }
 }

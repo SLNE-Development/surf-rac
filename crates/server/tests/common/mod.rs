@@ -49,6 +49,8 @@ pub fn test_config() -> Config {
         livekit_api_secret: TEST_LIVEKIT_SECRET.into(),
         trust_forwarded_for: true,
         log_json: false,
+        register_per_hour: 5,
+        session_requests_per_minute: 10,
     }
 }
 
@@ -284,6 +286,29 @@ impl TestApp {
             "protocol_version": surf_rac_protocol::PROTOCOL_VERSION,
         }))
         .await
+    }
+
+    /// Calls `POST /v1/devices` like [`TestApp::register_device`], as a client with address `ip`.
+    pub async fn register_device_from(
+        &self,
+        key: &SigningKey,
+        fingerprint_hash: &str,
+        name: &str,
+        ip: &str,
+    ) -> reqwest::Response {
+        self.client
+            .post(self.url("/v1/devices"))
+            .header("x-forwarded-for", ip)
+            .json(&json!({
+                "public_key": public_key_b64(key),
+                "fingerprint_hash": fingerprint_hash,
+                "name": name,
+                "signature": sign_registration(key, key, fingerprint_hash, name),
+                "protocol_version": surf_rac_protocol::PROTOCOL_VERSION,
+            }))
+            .send()
+            .await
+            .unwrap()
     }
 
     /// Registers a device with a fresh identity key and fingerprint `n` and returns it.

@@ -340,6 +340,13 @@ async fn handle_text(
             if !valid_signature(&signature) {
                 return Some(bad_signature_format());
             }
+            if !state
+                .limits
+                .session_request_target
+                .check(&to.to_string(), Instant::now())
+            {
+                return Some(error(WsErrorCode::RateLimited, "too many session requests"));
+            }
             tracing::info!(viewer = %device, host = %to, %session_id, "session requested");
             relay(
                 state,

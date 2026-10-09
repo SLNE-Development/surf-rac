@@ -30,8 +30,8 @@ fn claims(token: &str) -> Value {
 #[sqlx::test(migrations = "./migrations")]
 async fn session_request_is_relayed_with_sender(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let mut alice = app.online_device("alice", 1).await;
-    let mut bob = app.online_device("bob", 2).await;
+    let mut alice = app.online_device(1).await;
+    let mut bob = app.online_device(2).await;
     send(
         &mut bob.ws,
         json!({"type":"session_request","to":alice.id,"session_id":"s1","viewer_public_key":key_b64()}),
@@ -47,8 +47,8 @@ async fn session_request_is_relayed_with_sender(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn session_request_relays_sealed_password(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let mut alice = app.online_device("alice", 1).await;
-    let mut bob = app.online_device("bob", 2).await;
+    let mut alice = app.online_device(1).await;
+    let mut bob = app.online_device(2).await;
     send(
         &mut bob.ws,
         json!({"type":"session_request","to":alice.id,"session_id":"s1",
@@ -62,8 +62,8 @@ async fn session_request_relays_sealed_password(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn session_request_rejects_oversized_password(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let mut alice = app.online_device("alice", 1).await;
-    let mut bob = app.online_device("bob", 2).await;
+    let mut alice = app.online_device(1).await;
+    let mut bob = app.online_device(2).await;
     let long = "A".repeat(surf_rac_protocol::MAX_SEALED_PASSWORD_LEN + 1);
     send(
         &mut bob.ws,
@@ -78,14 +78,17 @@ async fn session_request_rejects_oversized_password(pool: PgPool) {
     )
     .await;
     let got = recv_type(&mut alice.ws, "session_request").await;
-    assert_eq!(got["session_id"], "s2", "the oversized request must not be relayed");
+    assert_eq!(
+        got["session_id"], "s2",
+        "the oversized request must not be relayed"
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
 async fn session_request_rejects_bad_key(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let alice = app.online_device("alice", 1).await;
-    let mut bob = app.online_device("bob", 2).await;
+    let alice = app.online_device(1).await;
+    let mut bob = app.online_device(2).await;
     for key in ["AAAA", "not base64!", ""] {
         send(
             &mut bob.ws,
@@ -100,8 +103,8 @@ async fn session_request_rejects_bad_key(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn session_request_rejects_bad_session_id(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let alice = app.online_device("alice", 1).await;
-    let mut bob = app.online_device("bob", 2).await;
+    let alice = app.online_device(1).await;
+    let mut bob = app.online_device(2).await;
     send(
         &mut bob.ws,
         json!({"type":"session_request","to":alice.id,"session_id":"","viewer_public_key":key_b64()}),
@@ -113,7 +116,7 @@ async fn session_request_rejects_bad_session_id(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn session_request_to_offline_host(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let mut bob = app.online_device("bob", 2).await;
+    let mut bob = app.online_device(2).await;
     send(
         &mut bob.ws,
         json!({"type":"session_request","to":"123456789","session_id":"s1","viewer_public_key":key_b64()}),
@@ -128,8 +131,8 @@ async fn session_request_to_offline_host(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn session_response_is_relayed(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let mut alice = app.online_device("alice", 1).await;
-    let mut bob = app.online_device("bob", 2).await;
+    let mut alice = app.online_device(1).await;
+    let mut bob = app.online_device(2).await;
     send(
         &mut alice.ws,
         json!({"type":"session_response","to":bob.id,"session_id":"s1","accepted":true,"host_public_key":key_b64(),"host_nonce":key_b64()}),
@@ -153,8 +156,8 @@ async fn session_response_is_relayed(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn session_response_rejects_bad_host_key(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let mut alice = app.online_device("alice", 1).await;
-    let bob = app.online_device("bob", 2).await;
+    let mut alice = app.online_device(1).await;
+    let bob = app.online_device(2).await;
     send(
         &mut alice.ws,
         json!({"type":"session_response","to":bob.id,"session_id":"s1","accepted":true,"host_public_key":"AAAA"}),
@@ -169,7 +172,7 @@ async fn session_response_rejects_bad_host_key(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn host_token_is_for_own_room(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let mut alice = app.online_device("alice", 1).await;
+    let mut alice = app.online_device(1).await;
     send(&mut alice.ws, json!({"type":"host_token_request"})).await;
     let got = recv_type(&mut alice.ws, "host_token").await;
     let room = format!("host-{}", alice.id);
@@ -185,8 +188,8 @@ async fn host_token_is_for_own_room(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn viewer_token_goes_to_viewer(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let mut alice = app.online_device("alice", 1).await;
-    let mut bob = app.online_device("bob", 2).await;
+    let mut alice = app.online_device(1).await;
+    let mut bob = app.online_device(2).await;
     send(
         &mut alice.ws,
         json!({"type":"viewer_token_request","session_id":"s1","viewer_device_id":bob.id}),
@@ -207,7 +210,7 @@ async fn viewer_token_goes_to_viewer(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn viewer_token_for_self_is_forbidden(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let mut alice = app.online_device("alice", 1).await;
+    let mut alice = app.online_device(1).await;
     send(
         &mut alice.ws,
         json!({"type":"viewer_token_request","session_id":"s1","viewer_device_id":alice.id}),
@@ -219,9 +222,9 @@ async fn viewer_token_for_self_is_forbidden(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn viewer_token_cannot_target_other_room(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let alice = app.online_device("alice", 1).await;
-    let mut bob = app.online_device("bob", 2).await;
-    let mut carol = app.online_device("carol", 3).await;
+    let alice = app.online_device(1).await;
+    let mut bob = app.online_device(2).await;
+    let mut carol = app.online_device(3).await;
     send(
         &mut bob.ws,
         json!({"type":"viewer_token_request","session_id":"s1","viewer_device_id":carol.id}),
@@ -236,7 +239,7 @@ async fn viewer_token_cannot_target_other_room(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn viewer_token_to_offline_viewer(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let mut alice = app.online_device("alice", 1).await;
+    let mut alice = app.online_device(1).await;
     send(
         &mut alice.ws,
         json!({"type":"viewer_token_request","session_id":"s1","viewer_device_id":"123456789"}),
@@ -251,8 +254,8 @@ async fn viewer_token_to_offline_viewer(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn session_response_rejects_bad_nonce(pool: PgPool) {
     let app = common::spawn(pool).await;
-    let mut alice = app.online_device("alice", 1).await;
-    let bob = app.online_device("bob", 2).await;
+    let mut alice = app.online_device(1).await;
+    let bob = app.online_device(2).await;
     send(
         &mut alice.ws,
         json!({"type":"session_response","to":bob.id,"session_id":"s1","accepted":true,
@@ -263,4 +266,49 @@ async fn session_response_rejects_bad_nonce(pool: PgPool) {
         recv_type(&mut alice.ws, "error").await["code"],
         "bad_message"
     );
+}
+
+/// Returns a well-formed session request to `to` with session ID `session_id`.
+fn session_request(to: &str, session_id: &str) -> Value {
+    json!({"type":"session_request","to":to,"session_id":session_id,
+           "session_key":key_b64(),"signature":STANDARD.encode([9u8; 64]),"unattended":false})
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn session_requests_are_limited_per_target(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let mut alice = app.online_device(1).await;
+    let mut bob = app.online_device(2).await;
+    for i in 0..10 {
+        send(&mut bob.ws, session_request(&alice.id, &format!("s{i}"))).await;
+        let got = recv_type(&mut alice.ws, "session_request").await;
+        assert_eq!(got["session_id"], format!("s{i}").as_str());
+    }
+    send(&mut bob.ws, session_request(&alice.id, "s10")).await;
+    assert_eq!(
+        recv_type(&mut bob.ws, "error").await["code"],
+        "rate_limited"
+    );
+    common::ws::expect_silence(&mut alice.ws, std::time::Duration::from_millis(300)).await;
+    send(&mut alice.ws, session_request(&bob.id, "to-bob")).await;
+    let got = recv_type(&mut bob.ws, "session_request").await;
+    assert_eq!(got["session_id"], "to-bob", "another target is not limited");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn password_messages_do_not_count_against_the_target_limit(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let mut alice = app.online_device(1).await;
+    let mut bob = app.online_device(2).await;
+    for i in 0..10 {
+        send(&mut bob.ws, session_request(&alice.id, &format!("s{i}"))).await;
+        recv_type(&mut alice.ws, "session_request").await;
+    }
+    send(
+        &mut bob.ws,
+        json!({"type":"session_password","to":alice.id,"session_id":"s0","password":"c2VhbGVk"}),
+    )
+    .await;
+    let got = recv_type(&mut alice.ws, "session_password").await;
+    assert_eq!(got["session_id"], "s0");
 }

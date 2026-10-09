@@ -10,6 +10,8 @@ use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::config::Config;
+
 /// Number of tracked keys above which stale entries are pruned.
 const PRUNE_THRESHOLD: usize = 10_000;
 
@@ -239,12 +241,18 @@ impl Lockout {
     }
 }
 
-/// All limiters of the server, configured with the fixed production values.
+/// All limiters of the server.
 pub struct Limits {
     /// Login attempts per client address: 10 per minute.
     pub login_ip: RateLimiter,
-    /// Registration attempts per client address: 5 per minute.
+    /// Account registration attempts per client address: 5 per minute.
     pub register_ip: RateLimiter,
+    /// Device registration attempts per client address block, per hour
+    /// (`Config::register_per_hour`); idempotent re-registrations count too.
+    pub device_register_ip: RateLimiter,
+    /// Session requests per target device, per minute
+    /// (`Config::session_requests_per_minute`).
+    pub session_request_target: RateLimiter,
     /// Lock of existing accounts: 15 minutes after 5 consecutive failed logins.
     ///
     /// Keyed only by usernames that exist, so its size is bounded by the
@@ -255,12 +263,20 @@ pub struct Limits {
     pub unknown_lockout: Lockout,
 }
 
-impl Default for Limits {
-    /// Creates the limiters with the production values.
-    fn default() -> Self {
+impl Limits {
+    /// Creates the limiters, taking the device registration and session request limits from `config`.
+    pub fn from_config(config: &Config) -> Self {
         Self {
             login_ip: RateLimiter::new(10, Duration::from_secs(60)),
             register_ip: RateLimiter::new(5, Duration::from_secs(60)),
+            device_register_ip: RateLimiter::new(
+                config.register_per_hour,
+                Duration::from_secs(60 * 60),
+            ),
+            session_request_target: RateLimiter::new(
+                config.session_requests_per_minute,
+                Duration::from_secs(60),
+            ),
             account_lockout: Lockout::new(5, Duration::from_secs(15 * 60)),
             unknown_lockout: Lockout::new(5, Duration::from_secs(15 * 60)),
         }
@@ -331,7 +347,20 @@ mod tests {
 
     #[test]
     fn unknown_name_flood_keeps_account_failures() {
-        let limits = Limits::default();
+        let config = Config::from_vars(|k| {
+            match k {
+                "DATABASE_URL" => Some("postgres://x"),
+                "TURN_SECRET" => Some("0123456789abcdef"),
+                "TURN_URLS" => Some("turn:a:3478"),
+                "LIVEKIT_URL" => Some("ws://lk"),
+                "LIVEKIT_API_KEY" => Some("key"),
+                "LIVEKIT_API_SECRET" => Some("0123456789abcdef0123456789abcdef"),
+                _ => None,
+            }
+            .map(str::to_owned)
+        })
+        .unwrap();
+        let limits = Limits::from_config(&config);
         let t0 = Instant::now();
         for _ in 0..4 {
             assert!(limits.account_lockout.try_attempt("victim", t0).is_ok());

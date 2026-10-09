@@ -210,8 +210,15 @@ async fn registration_with_wrong_signature_is_unauthorized_and_writes_nothing(po
     let over_other_name = sign_registration(&key, &key, &fp, "other");
     let over_other_fingerprint = sign_registration(&key, &key, &fingerprint(2), "pc");
     let malformed = STANDARD.encode([1u8; 10]);
-    for signature in [by_other_key, over_other_name, over_other_fingerprint, malformed] {
-        let res = app.register_device_signed(&key, &fp, "pc", &signature).await;
+    for signature in [
+        by_other_key,
+        over_other_name,
+        over_other_fingerprint,
+        malformed,
+    ] {
+        let res = app
+            .register_device_signed(&key, &fp, "pc", &signature)
+            .await;
         assert_eq!(res.status(), 401, "{signature}");
         let body: Value = res.json().await.unwrap();
         assert_eq!(body["error"], "bad_signature");
@@ -242,4 +249,62 @@ async fn renaming_needs_a_valid_signature(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(name, "new");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn registration_is_limited_per_ip_including_re_registration(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let key = identity_key();
+    for i in 0..5 {
+        let res = app
+            .register_device_from(&key, &fingerprint(1), &format!("pc{i}"), "10.9.0.1")
+            .await;
+        assert_eq!(res.status(), 200, "attempt {i}");
+    }
+    let res = app
+        .register_device_from(&key, &fingerprint(1), "pc", "10.9.0.1")
+        .await;
+    assert_eq!(res.status(), 429);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["error"], "rate_limited");
+    let other = app
+        .register_device_from(&identity_key(), &fingerprint(2), "pc", "10.9.0.2")
+        .await;
+    assert_eq!(other.status(), 200);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn registration_limit_shares_one_ipv6_64_prefix(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    for i in 0..5 {
+        let ip = format!("2001:db8:1:2::{}", i + 1);
+        let res = app
+            .register_device_from(&identity_key(), &fingerprint(i), "pc", &ip)
+            .await;
+        assert_eq!(res.status(), 200);
+    }
+    let res = app
+        .register_device_from(
+            &identity_key(),
+            &fingerprint(9),
+            "pc",
+            "2001:db8:1:2:ffff::9",
+        )
+        .await;
+    assert_eq!(res.status(), 429);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn invalid_registration_bodies_do_not_use_the_limit(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    for _ in 0..8 {
+        let res = app
+            .register_device_from(&identity_key(), "not-a-fingerprint", "pc", "10.9.0.3")
+            .await;
+        assert_eq!(res.status(), 400);
+    }
+    let res = app
+        .register_device_from(&identity_key(), &fingerprint(1), "pc", "10.9.0.3")
+        .await;
+    assert_eq!(res.status(), 200);
 }

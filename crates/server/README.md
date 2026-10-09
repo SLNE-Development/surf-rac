@@ -30,21 +30,39 @@ docker compose -f compose.test.yaml run --rm test
 | `BIND_ADDR` | no | `0.0.0.0:8080` | Listen address |
 | `TRUST_FORWARDED_FOR` | no | `false` | Use the right-most `X-Forwarded-For` entry as client IP. Set `true` only behind a proxy that appends it (Traefik) |
 | `LOG_FORMAT` | no | `json` | `json` or `pretty` |
+| `REGISTER_PER_HOUR` | no | `5` | Device registrations allowed per client address block (IPv4 address or IPv6 /64) per hour; a positive integer |
+| `SESSION_REQUESTS_PER_MINUTE` | no | `10` | Session requests allowed per target device per minute; a positive integer |
 | `RUST_LOG` | no | `info` | Log filter |
 
 The server refuses to start when a required value is missing or invalid.
 
 Accounts are open: anyone can register with a username of 3 to 32 characters
 of `a-z`, `0-9`, `.`, `_` or `-` and a password of 10 to 256 characters. There
-are no invites and no setting for this. These limits are built in and not
-configurable:
+are no invites and no setting for this. These account limits are built in and
+not configurable:
 
-- registration: 5 attempts per client address per minute
+- account registration: 5 attempts per client address per minute
 - login: 10 attempts per client address per minute
 - login lockout: 15 minutes after 5 consecutive failures for one username
   (also for usernames that do not exist); a failed password check on
   account deletion counts as a failure
 - account sessions expire 30 days after their last use
+
+Device registration and session requests use the limits configured above:
+
+- `POST /v1/devices` is limited per client address block to
+  `REGISTER_PER_HOUR` per hour. Every request with a well-formed body counts,
+  including repeated registrations of a key that is already known, so retries
+  cannot be used to get around the limit. Requests with a malformed body are
+  rejected before they are counted. Over the limit the response is
+  `429 rate_limited`.
+- Session requests are limited per target device to
+  `SESSION_REQUESTS_PER_MINUTE` per minute. Password challenges and session
+  passwords do not count. A request over the limit is not relayed and the
+  sender receives a WebSocket error `rate_limited`.
+
+All limits are kept in memory and reset when the server restarts.
+
 Migrations run automatically on start and are forward-only. Migration
 `0003_device_identity` drops every user, session, device and contact and
 creates the device-identity schema, so the image before it does not work

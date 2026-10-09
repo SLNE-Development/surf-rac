@@ -150,6 +150,7 @@ pub(super) fn sized_field(
             .hint_text(hint.to_string())
             .password(password)
             .margin(Margin::symmetric(10, 9))
+            .vertical_align(Align::Center)
             .desired_width(width)
             .min_size(vec2(width, 38.0)),
     )
@@ -169,6 +170,7 @@ pub(super) fn id_field(ui: &mut Ui, value: &mut String, hint: &str, width: f32) 
             .hint_text(hint.to_string())
             .font(theme::semibold(18.0))
             .margin(Margin::symmetric(12, 12))
+            .vertical_align(Align::Center)
             .desired_width(width)
             .min_size(vec2(width, 0.0)),
     )
@@ -330,7 +332,7 @@ pub(super) fn card_header(ui: &mut Ui, title_text: &str, right: impl FnOnce(&mut
         .inner_margin(Margin::symmetric(16, 12))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.set_min_height(34.0);
+                ui.set_min_height(40.0);
                 ui.label(title(title_text));
                 ui.with_layout(Layout::right_to_left(Align::Center), right);
             });
@@ -366,6 +368,7 @@ pub(super) fn row<R>(ui: &mut Ui, first: bool, add: impl FnOnce(&mut Ui) -> R) -
 pub(super) fn two_lines(ui: &mut Ui, primary: &str, secondary: &str) {
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 1.0;
+        ui.add_space(3.0);
         ui.add(Label::new(RichText::new(primary).font(theme::semibold(14.0))).truncate());
         ui.add(Label::new(muted(ui, secondary).size(12.0)).truncate());
     });

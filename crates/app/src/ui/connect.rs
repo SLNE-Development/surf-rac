@@ -179,6 +179,7 @@ fn contacts_card(app: &mut ClientApp, ui: &mut egui::Ui, online: bool) {
             .inner_margin(egui::Margin::symmetric(16, 12))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    ui.set_min_height(40.0);
                     ui.label(widgets::title("Contacts"));
                     widgets::chip(ui, Tone::Neutral, false, &contacts.len().to_string());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {

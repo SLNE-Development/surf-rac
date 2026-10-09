@@ -6,16 +6,16 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{TestEnv, host_event, request_with, start_host};
+use common::{TestEnv, host_event, request, request_with, start_host};
 use sqlx::PgPool;
 use surf_rac_app::access::{
-    Decision, HostLockout, LOCKOUT, PromptNote, check_password, decide, hash_password, open_prompt,
+    Decision, HostLockout, LOCKOUT, PromptNote, check_password, decide, decide_and_gate,
+    hash_password, password_access_available,
 };
-use surf_rac_app::runtime::PromptView;
 use surf_rac_protocol::DeviceId;
 use surf_rac_session::SessionConfig;
 use surf_rac_session::host::{HostEvent, Password};
-use surf_rac_session::viewer::RequestOptions;
+use surf_rac_session::viewer::{RequestError, RequestOptions};
 
 #[sqlx::test(migrations = "../server/migrations")]
 async fn correct_password_is_admitted_and_wrong_one_prompts(pool: PgPool) {
@@ -136,25 +136,108 @@ fn attended_accept_works_while_locked() {
     );
 }
 
-fn prompt(session: &str, viewer: DeviceId) -> PromptView {
-    PromptView {
-        session_id: session.into(),
-        viewer,
-        name: "Laptop".into(),
-        alias: None,
-        fingerprint: "ab".into(),
-        note: PromptNote::None,
-    }
+#[sqlx::test(migrations = "../server/migrations")]
+async fn second_request_from_one_viewer_leaves_one_prompt_and_is_denied(pool: PgPool) {
+    let env = TestEnv::start(pool).await;
+    let (h, v) = (env.device("host", 1).await, env.device("viewer", 2).await);
+    let (host, mut host_events) = start_host(&h, SessionConfig::default()).await;
+    let mut first = request(&v, h.id, SessionConfig::default());
+    let ev = host_event(&mut host_events, Duration::from_secs(10), |e| {
+        matches!(e, HostEvent::ViewerRequested { .. })
+    })
+    .await;
+    let HostEvent::ViewerRequested { session_id, .. } = ev else {
+        unreachable!()
+    };
+    let second = request(&v, h.id, SessionConfig::default());
+    let denied = tokio::time::timeout(Duration::from_secs(10), second)
+        .await
+        .expect("second request ends")
+        .unwrap();
+    assert!(matches!(denied, Err(RequestError::Denied)));
+    let extra = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            if let Some(HostEvent::ViewerRequested { .. }) = host_events.recv().await {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(extra.is_err(), "a second prompt was raised");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut first)
+            .await
+            .is_err(),
+        "the first request is still waiting"
+    );
+    host.deny(&session_id).await.unwrap();
 }
 
-#[test]
-fn duplicate_request_from_one_viewer_leaves_one_prompt() {
-    let mut prompts = Vec::new();
-    assert!(open_prompt(&mut prompts, prompt("s1", id(1))).is_empty());
-    assert!(open_prompt(&mut prompts, prompt("s3", id(2))).is_empty());
-    let replaced = open_prompt(&mut prompts, prompt("s2", id(1)));
-    assert_eq!(replaced, vec!["s1".to_string()]);
-    assert_eq!(prompts.len(), 2);
-    assert_eq!(prompts.iter().filter(|p| p.viewer == id(1)).count(), 1);
-    assert!(prompts.iter().any(|p| p.session_id == "s2"));
+#[sqlx::test(migrations = "../server/migrations")]
+async fn fifth_wrong_password_switches_password_access_off_until_the_lock_expires(pool: PgPool) {
+    let env = TestEnv::start(pool).await;
+    let (h, v) = (env.device("host", 1).await, env.device("viewer", 2).await);
+    let (host, mut host_events) = start_host(&h, SessionConfig::default()).await;
+    let hash = hash_password("hunter22").unwrap();
+    let mut lockout = HostLockout::default();
+    let start = Instant::now();
+    host.set_password_access(true);
+
+    for n in 0..5 {
+        let options = RequestOptions {
+            password: Some("wrongwrong".into()),
+        };
+        let _pending = request_with(&v, h.id, options, SessionConfig::default());
+        let ev = host_event(&mut host_events, Duration::from_secs(10), |e| {
+            matches!(e, HostEvent::PasswordReceived { .. })
+        })
+        .await;
+        let HostEvent::PasswordReceived {
+            session_id,
+            password,
+            ..
+        } = ev
+        else {
+            unreachable!()
+        };
+        let check = check_password(password.as_ref().map(Password::as_str), Some(&hash));
+        let (decision, available) = decide_and_gate(check, true, true, &mut lockout, start);
+        assert_eq!(decision, Decision::Prompt(PromptNote::WrongPassword));
+        assert_eq!(available, n < 4, "after failure {}", n + 1);
+        host.set_password_access(available);
+        host.reject_password(&session_id).await.unwrap();
+        host_event(&mut host_events, Duration::from_secs(10), |e| {
+            matches!(e, HostEvent::ViewerRequested { .. })
+        })
+        .await;
+        host.deny(&session_id).await.unwrap();
+    }
+
+    let options = RequestOptions {
+        password: Some("hunter22".into()),
+    };
+    let _pending = request_with(&v, h.id, options.clone(), SessionConfig::default());
+    let ev = host_event(&mut host_events, Duration::from_secs(10), |e| {
+        matches!(
+            e,
+            HostEvent::ViewerRequested { .. } | HostEvent::PasswordReceived { .. }
+        )
+    })
+    .await;
+    let HostEvent::ViewerRequested { session_id, .. } = ev else {
+        panic!("password access should be off while locked");
+    };
+    host.deny(&session_id).await.unwrap();
+
+    let later = start + LOCKOUT;
+    host.set_password_access(password_access_available(
+        true,
+        true,
+        lockout.is_locked(later),
+    ));
+    let _pending = request_with(&v, h.id, options, SessionConfig::default());
+    host_event(&mut host_events, Duration::from_secs(10), |e| {
+        matches!(e, HostEvent::PasswordReceived { .. })
+    })
+    .await;
 }

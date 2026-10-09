@@ -2,6 +2,7 @@
 
 use eframe::egui::{self, Align, Frame, Layout, Margin, RichText};
 use surf_rac_input::Grants;
+use surf_rac_protocol::DeviceId;
 use surf_rac_protocol::data::{Control, DataMessage, MouseButton, QualityMode};
 
 use super::main_window::format_id;
@@ -32,6 +33,13 @@ const WHEEL_PER_LINE: f32 = 120.0;
 
 /// Wheel units per point of smooth scrolling.
 const WHEEL_PER_POINT: f32 = 3.0;
+
+/// Returns the headline name of a request prompt: the local contact alias when
+/// the viewer is a contact, otherwise its formatted ID. The device name the
+/// viewer chose for itself is never the headline.
+fn prompt_headline(alias: Option<&str>, viewer: DeviceId) -> String {
+    alias.map_or_else(|| format_id(viewer), str::to_string)
+}
 
 /// Returns the callout tone, icon and text for a prompt's password note.
 fn note_callout(note: PromptNote) -> Option<(Tone, char, &'static str)> {
@@ -92,21 +100,27 @@ impl ClientApp {
                         ui.spacing_mut().item_spacing.y = 12.0;
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 14.0;
-                            widgets::avatar(ui, &prompt.name, 44.0);
+                            let headline = prompt_headline(prompt.alias.as_deref(), prompt.viewer);
+                            widgets::avatar(ui, &headline, 44.0);
                             ui.vertical(|ui| {
                                 ui.spacing_mut().item_spacing.y = 2.0;
                                 ui.add(
                                     egui::Label::new(
-                                        RichText::new(format!("{} wants to connect", prompt.name))
+                                        RichText::new(format!("{headline} wants to connect"))
                                             .font(theme::bold(17.0)),
                                     )
                                     .truncate(),
                                 );
-                                if let Some(alias) = &prompt.alias {
-                                    ui.label(
-                                        widgets::muted(ui, format!("Contact {alias}")).size(13.0),
-                                    );
-                                }
+                                ui.add(
+                                    egui::Label::new(
+                                        widgets::muted(
+                                            ui,
+                                            format!("Device name: {}", prompt.device_name),
+                                        )
+                                        .size(13.0),
+                                    )
+                                    .truncate(),
+                                );
                                 ui.horizontal(|ui| {
                                     ui.spacing_mut().item_spacing.x = 6.0;
                                     ui.label(widgets::muted(ui, "Device").size(13.0));
@@ -684,6 +698,13 @@ mod tests {
         let now = std::time::Instant::now();
         let shown = now + std::time::Duration::from_secs(1);
         assert_eq!(arm_progress(shown, now), 0.0);
+    }
+
+    #[test]
+    fn headline_is_the_contact_alias_or_the_formatted_id() {
+        let id = DeviceId::new(123_456_789).unwrap();
+        assert_eq!(prompt_headline(Some("Anna"), id), "Anna");
+        assert_eq!(prompt_headline(None, id), format_id(id));
     }
 
     #[test]

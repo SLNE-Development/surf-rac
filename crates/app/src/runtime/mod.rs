@@ -227,10 +227,11 @@ pub struct PromptView {
     pub session_id: String,
     /// The requesting device.
     pub viewer: DeviceId,
-    /// The device name the viewer registered with the server.
-    pub name: String,
     /// The alias of the viewer in the contact list, if it is a contact.
     pub alias: Option<String>,
+    /// The device name the viewer chose for itself, cleaned for display; the
+    /// viewer's ID when it gave none.
+    pub device_name: String,
     /// Fingerprint of its key.
     pub fingerprint: String,
     /// What the password check found.

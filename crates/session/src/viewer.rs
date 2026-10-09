@@ -36,8 +36,9 @@ const EVENT_CAPACITY: usize = 64;
 /// Optional inputs of a session request.
 #[derive(Clone, Default)]
 pub struct RequestOptions {
-    /// Unattended password the viewer intends to authenticate with; when set,
-    /// the request is marked unattended.
+    /// Unattended password the viewer authenticates with; when set, the
+    /// request is marked unattended and the password is sent once the host
+    /// offers its signed per-session key.
     pub password: Option<String>,
 }
 
@@ -155,6 +156,13 @@ impl ViewerSession {
     /// host's per-session key must carry a valid signature by the host's
     /// identity key, which is pinned on first contact and must match the pin
     /// afterwards.
+    ///
+    /// With a password in `options`, the host may answer with a password
+    /// challenge; the password is then sealed to the host's verified
+    /// per-session key and sent. A wrong password leaves the decision to the
+    /// host's user. A challenge with an invalid signature fails the request
+    /// with [`RequestError::Denied`], one from a host whose identity key
+    /// differs from the pin with [`RequestError::KeyChanged`].
     pub async fn request_with(
         signaling: SignalingClient,
         identity: Arc<IdentityKey>,
@@ -182,6 +190,7 @@ impl ViewerSession {
         let (channel_key, url, token) = tokio::time::timeout(config.request_timeout, async {
             let mut key = None;
             let mut token = None;
+            let mut password = options.password.as_deref();
             loop {
                 match sig_events.recv().await {
                     None => return Err(RequestError::Signaling(SignalingError::Closed)),
@@ -190,6 +199,38 @@ impl ViewerSession {
                         ..
                     }) if key.is_none() => {
                         return Err(RequestError::Offline);
+                    }
+                    Some(ServerMessage::PasswordChallenge {
+                        from,
+                        session_id: sid,
+                        session_key,
+                        signature,
+                        identity_key,
+                        ..
+                    }) if from == host && sid == session_id => {
+                        let Some(pw) = password.take() else {
+                            tracing::warn!(%host, %session_id, "unexpected password challenge ignored");
+                            continue;
+                        };
+                        let host_key = verified_host_key(
+                            Some(&identity_key),
+                            Some(&session_key),
+                            Some(&signature),
+                            &known,
+                            &session_id,
+                            host,
+                        )?;
+                        let sealed =
+                            crypto::seal_password(&ephemeral, &host_key, &session_id, viewer, host, pw)
+                                .map_err(|_| RequestError::Denied)?;
+                        signaling
+                            .send(ClientMessage::SessionPassword {
+                                to: host,
+                                session_id: session_id.clone(),
+                                password: sealed,
+                            })
+                            .await?;
+                        tracing::info!(%host, %session_id, "unattended password sent");
                     }
                     Some(ServerMessage::SessionResponse {
                         from,
@@ -478,16 +519,47 @@ struct AcceptedKeys<'a> {
     host_nonce: Option<&'a str>,
 }
 
+/// Verifies the host's signed per-session key and returns it.
+///
+/// `session_key` must be signed by `identity_key`, the host's identity key as
+/// attested by the server, as the host's key for `session_id`; the identity
+/// key is then checked against the pin in `known`, which pins it on first
+/// contact. Fails with [`RequestError::Denied`] when a field is missing or
+/// malformed or the signature does not verify, and with
+/// [`RequestError::KeyChanged`] when the identity key differs from the pinned
+/// one.
+fn verified_host_key(
+    identity_key: Option<&str>,
+    session_key: Option<&str>,
+    signature: Option<&str>,
+    known: &Mutex<KnownKeys>,
+    session_id: &str,
+    host: DeviceId,
+) -> Result<EphemeralPublic, RequestError> {
+    let identity_key = identity_key
+        .and_then(|k| IdentityPublic::from_base64(k).ok())
+        .ok_or(RequestError::Denied)?;
+    let host_key = session_key
+        .and_then(|k| EphemeralPublic::from_base64(k).ok())
+        .ok_or(RequestError::Denied)?;
+    let signature = signature
+        .and_then(|s| crypto::signature_from_base64(s).ok())
+        .ok_or(RequestError::Denied)?;
+    if let Err(err) = identity_key.verify_session(Role::Host, session_id, &host_key, &signature) {
+        tracing::warn!(%host, %session_id, error = %err, "host per-session key does not verify");
+        return Err(RequestError::Denied);
+    }
+    lock(known).check(host, &identity_key)?;
+    Ok(host_key)
+}
+
 impl AcceptedKeys<'_> {
     /// Verifies the host's signed per-session key and derives the session key.
     ///
-    /// The host's per-session key must be signed by its identity key for
-    /// `session_id`; the identity key is then checked against the pin in
-    /// `known`, which pins it on first contact. `ephemeral` is this viewer's
-    /// per-session key pair. Fails with [`RequestError::Denied`] when a field is
-    /// missing or malformed, the signature does not verify or the key agreement
-    /// fails, and with [`RequestError::KeyChanged`] when the identity key differs
-    /// from the pinned one.
+    /// The key is verified with [`verified_host_key`]. `ephemeral` is this
+    /// viewer's per-session key pair. Fails like [`verified_host_key`], and
+    /// with [`RequestError::Denied`] when the host nonce is missing or
+    /// malformed or the key agreement fails.
     fn derive(
         &self,
         ephemeral: &Ephemeral,
@@ -496,22 +568,14 @@ impl AcceptedKeys<'_> {
         host: DeviceId,
         viewer: DeviceId,
     ) -> Result<SessionKey, RequestError> {
-        let identity_key = self
-            .identity_key
-            .and_then(|k| IdentityPublic::from_base64(k).ok())
-            .ok_or(RequestError::Denied)?;
-        let host_key = self
-            .session_key
-            .and_then(|k| EphemeralPublic::from_base64(k).ok())
-            .ok_or(RequestError::Denied)?;
-        let signature = self
-            .signature
-            .and_then(|s| crypto::signature_from_base64(s).ok())
-            .ok_or(RequestError::Denied)?;
-        identity_key
-            .verify_session(Role::Host, session_id, &host_key, &signature)
-            .map_err(|_| RequestError::Denied)?;
-        lock(known).check(host, &identity_key)?;
+        let host_key = verified_host_key(
+            self.identity_key,
+            self.session_key,
+            self.signature,
+            known,
+            session_id,
+            host,
+        )?;
         let nonce: [u8; 32] = self
             .host_nonce
             .and_then(|n| STANDARD.decode(n).ok())

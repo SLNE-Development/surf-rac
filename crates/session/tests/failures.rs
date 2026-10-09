@@ -8,14 +8,15 @@ use base64::Engine;
 use common::{TestEnv, accept_next, collect_stamps, feed_frames, host_event, request, start_host};
 use sqlx::PgPool;
 use surf_rac_protocol::{ClientMessage, ServerMessage};
+use surf_rac_session::crypto::{self, Ephemeral, Role};
 use surf_rac_session::host::{HostEvent, HostSession, StartError};
 use surf_rac_session::viewer::RequestError;
-use surf_rac_session::{DeviceKeys, MAX_VIEWERS, SessionConfig};
+use surf_rac_session::{IdentityKey, MAX_VIEWERS, SessionConfig};
 
 #[sqlx::test(migrations = "../server/migrations")]
 async fn offline_host(pool: PgPool) {
     let env = TestEnv::start(pool).await;
-    let (_, host_id, _) = env.register("host", 1).await;
+    let host_id = env.register("host", 1).await.id;
     let v = env.device("viewer", 2).await;
     let result = request(&v, host_id, SessionConfig::default())
         .await
@@ -67,7 +68,7 @@ async fn changed_host_key_blocks_session(pool: PgPool) {
     v.known
         .lock()
         .unwrap()
-        .trust_key(h.id, DeviceKeys::generate().public_key());
+        .trust_key(h.id, IdentityKey::generate().public());
     let (host, mut host_events) = start_host(&h, SessionConfig::default()).await;
     let pending = request(&v, h.id, SessionConfig::default());
     let HostEvent::ViewerRequested { session_id, .. } =
@@ -82,12 +83,12 @@ async fn changed_host_key_blocks_session(pool: PgPool) {
     match pending.await.unwrap().err() {
         Some(RequestError::KeyChanged(k)) => {
             assert_eq!(k.device_id, h.id);
-            assert_eq!(k.new_fingerprint, h.keys.public_key().fingerprint());
+            assert_eq!(k.new_fingerprint, h.identity.public().fingerprint());
         }
         other => panic!("expected KeyChanged, got {other:?}"),
     }
 
-    v.known.lock().unwrap().trust_key(h.id, h.keys.public_key());
+    v.known.lock().unwrap().trust_key(h.id, h.identity.public());
     let pending = request(&v, h.id, SessionConfig::default());
     accept_next(&host, &mut host_events, pending).await;
 }
@@ -99,7 +100,7 @@ async fn changed_viewer_key_blocks_on_host(pool: PgPool) {
     h.known
         .lock()
         .unwrap()
-        .trust_key(v.id, DeviceKeys::generate().public_key());
+        .trust_key(v.id, IdentityKey::generate().public());
     let (_host, mut host_events) = start_host(&h, SessionConfig::default()).await;
     let pending = request(&v, h.id, SessionConfig::default());
     let ev = host_event(&mut host_events, Duration::from_secs(10), |e| {
@@ -201,7 +202,7 @@ async fn livekit_unreachable(pool: PgPool) {
     let (h, v) = (env.device("host", 1).await, env.device("viewer", 2).await);
     let started = HostSession::start(
         h.signaling.clone(),
-        h.keys.clone(),
+        h.identity.clone(),
         h.known.clone(),
         640,
         480,
@@ -225,13 +226,18 @@ async fn livekit_unreachable(pool: PgPool) {
     })
     .await
     .unwrap();
+    let ephemeral = Ephemeral::generate();
+    let signature = h
+        .identity
+        .sign_session(Role::Host, &session_id, &ephemeral.public());
     h.signaling
         .send(ClientMessage::SessionResponse {
             to: v.id,
             session_id: session_id.clone(),
             accepted: true,
             reason: None,
-            host_public_key: Some(h.keys.public_key().to_base64()),
+            session_key: Some(ephemeral.public().to_base64()),
+            signature: Some(crypto::signature_to_base64(&signature)),
             host_nonce: Some(base64::engine::general_purpose::STANDARD.encode([3u8; 32])),
         })
         .await
@@ -267,15 +273,21 @@ async fn request_flood_does_not_exhaust_host(pool: PgPool) {
     );
     let (host, mut host_events) = start_host(&h, SessionConfig::default()).await;
     let mut attacker_events = attacker.signaling.subscribe();
-    let key = attacker.keys.public_key().to_base64();
+    let ephemeral = Ephemeral::generate();
     for i in 0..150 {
+        let session_id = format!("flood-{i}");
+        let signature =
+            attacker
+                .identity
+                .sign_session(Role::Viewer, &session_id, &ephemeral.public());
         attacker
             .signaling
             .send(ClientMessage::SessionRequest {
                 to: h.id,
-                session_id: format!("flood-{i}"),
-                viewer_public_key: key.clone(),
-                password: None,
+                session_id,
+                session_key: ephemeral.public().to_base64(),
+                signature: crypto::signature_to_base64(&signature),
+                unattended: false,
             })
             .await
             .unwrap();
@@ -319,7 +331,7 @@ async fn unread_host_events_do_not_stall_requests(pool: PgPool) {
     h.known
         .lock()
         .unwrap()
-        .trust_key(other.id, DeviceKeys::generate().public_key());
+        .trust_key(other.id, IdentityKey::generate().public());
     let config = SessionConfig {
         request_timeout: Duration::from_secs(5),
         ..SessionConfig::default()
@@ -330,4 +342,87 @@ async fn unread_host_events_do_not_stall_requests(pool: PgPool) {
         Some(RequestError::Denied),
         "host refused the changed key without the app reading events"
     );
+}
+
+/// Sends a session request from `from` to `to` whose signature covers `signed_key`
+/// but which carries `sent_key` as its per-session key.
+async fn send_request(
+    from: &common::TestDevice,
+    to: surf_rac_protocol::DeviceId,
+    session_id: &str,
+    signed_key: &Ephemeral,
+    sent_key: &Ephemeral,
+) {
+    let signature = from
+        .identity
+        .sign_session(Role::Viewer, session_id, &signed_key.public());
+    from.signaling
+        .send(ClientMessage::SessionRequest {
+            to,
+            session_id: session_id.into(),
+            session_key: sent_key.public().to_base64(),
+            signature: crypto::signature_to_base64(&signature),
+            unattended: false,
+        })
+        .await
+        .unwrap();
+}
+
+#[sqlx::test(migrations = "../server/migrations")]
+async fn tampered_session_key_is_dropped(pool: PgPool) {
+    let env = TestEnv::start(pool).await;
+    let (h, attacker, v) = (
+        env.device("host", 1).await,
+        env.device("attacker", 2).await,
+        env.device("viewer", 3).await,
+    );
+    let (host, mut host_events) = start_host(&h, SessionConfig::default()).await;
+    let mut attacker_events = attacker.signaling.subscribe();
+    let (signed, swapped) = (Ephemeral::generate(), Ephemeral::generate());
+    send_request(&attacker, h.id, "tampered", &signed, &swapped).await;
+    let other_session = Ephemeral::generate();
+    let signature =
+        attacker
+            .identity
+            .sign_session(Role::Viewer, "signed-for-other", &other_session.public());
+    attacker
+        .signaling
+        .send(ClientMessage::SessionRequest {
+            to: h.id,
+            session_id: "replayed".into(),
+            session_key: other_session.public().to_base64(),
+            signature: crypto::signature_to_base64(&signature),
+            unattended: false,
+        })
+        .await
+        .unwrap();
+    let silence = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match attacker_events.recv().await {
+                Some(ServerMessage::SessionResponse { session_id, .. }) => return session_id,
+                Some(_) => {}
+                None => std::future::pending::<()>().await,
+            }
+        }
+    })
+    .await;
+    assert!(
+        silence.is_err(),
+        "host answered a tampered request: {silence:?}"
+    );
+    while let Ok(ev) = host_events.try_recv() {
+        assert!(
+            !matches!(
+                ev,
+                HostEvent::ViewerRequested { .. } | HostEvent::KeyChanged(_)
+            ),
+            "tampered request surfaced as {ev:?}"
+        );
+    }
+    assert!(
+        h.known.lock().unwrap().get(attacker.id).is_none(),
+        "a tampered request pins nothing"
+    );
+    let pending = request(&v, h.id, SessionConfig::default());
+    accept_next(&host, &mut host_events, pending).await;
 }

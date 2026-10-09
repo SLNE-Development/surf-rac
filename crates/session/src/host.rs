@@ -2,6 +2,8 @@
 //! [`MAX_VIEWERS`] accepted viewers in the host's own LiveKit room.
 
 use std::collections::HashMap;
+use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -52,6 +54,11 @@ const REFUSAL_INTERVAL: Duration = Duration::from_secs(2);
 /// How long an accepted viewer may take to join before its slot is freed.
 const JOIN_WINDOW: Duration = Duration::from_secs(70);
 
+/// How long the host waits for the unattended password after sending its
+/// password challenge; after that the request expires and the host's
+/// per-session secret is dropped.
+pub const CHALLENGE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Highest frame rate the video track is encoded at.
 const MAX_FRAMERATE: f64 = 30.0;
 
@@ -61,18 +68,41 @@ pub const MAX_BITRATE: u64 = 8_000_000;
 /// Something that happened in a host session.
 #[derive(Debug)]
 pub enum HostEvent {
-    /// A viewer asks for a session; answer with [`HostSession::accept`] or [`HostSession::deny`].
+    /// A viewer asks for a session and the user must decide; answer with
+    /// [`HostSession::accept`] or [`HostSession::deny`].
     ViewerRequested {
         /// Identifies the request.
         session_id: String,
         /// The requesting device.
         viewer: DeviceId,
+        /// The requesting device's name, as registered with the server.
+        name: String,
         /// Fingerprint of the viewer's identity key.
         fingerprint: String,
         /// The viewer's identity key.
         viewer_key: IdentityPublic,
-        /// Whether the viewer intends to authenticate with the unattended password.
+        /// Whether the viewer asked for unattended access: password access was
+        /// unavailable, or the password it sent was rejected.
         unattended: bool,
+    },
+    /// A viewer that asked for unattended access sent its password.
+    ///
+    /// Check the password and answer with [`HostSession::accept`] when it is
+    /// correct, [`HostSession::reject_password`] to ask the user instead, or
+    /// [`HostSession::deny`].
+    PasswordReceived {
+        /// Identifies the request.
+        session_id: String,
+        /// The requesting device.
+        viewer: DeviceId,
+        /// The requesting device's name, as registered with the server.
+        name: String,
+        /// Fingerprint of the viewer's identity key.
+        fingerprint: String,
+        /// The viewer's identity key.
+        viewer_key: IdentityPublic,
+        /// The password, or `None` when the sealed password could not be opened.
+        password: Option<Password>,
     },
     /// A viewer presented an identity key that differs from its pinned key; its request was refused.
     KeyChanged(KeyChanged),
@@ -125,10 +155,28 @@ pub enum StartError {
     MediaUnavailable(String),
 }
 
+/// An unattended password a viewer sent; its `Debug` output hides the text.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Password(String);
+
+impl Password {
+    /// Returns the password text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Password {
+    /// Writes a placeholder instead of the password.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Password(..)")
+    }
+}
+
 /// Why a host action failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum HostError {
-    /// No pending request has this session ID.
+    /// No pending request has this session ID, or it is not at a step the action applies to.
     #[error("unknown session request")]
     UnknownRequest,
     /// The signaling connection failed.
@@ -155,6 +203,8 @@ struct Inner {
     identity: Arc<IdentityKey>,
     /// Pinned viewer identity keys.
     known: Arc<Mutex<KnownKeys>>,
+    /// Whether unattended requests get a password challenge instead of a prompt.
+    password_access: AtomicBool,
     /// The published video track and its source.
     video: Mutex<Video>,
     /// Serializes switches of the video input.
@@ -205,10 +255,78 @@ struct State {
 struct Pending {
     /// The requesting device.
     viewer: DeviceId,
+    /// The requesting device's name.
+    name: String,
+    /// The viewer's identity key.
+    viewer_key: IdentityPublic,
     /// Its signed per-session key.
     session_key: EphemeralPublic,
     /// When the request arrived.
     requested_at: Instant,
+    /// How far the request has got.
+    stage: Stage,
+}
+
+/// The step an unanswered session request is at.
+enum Stage {
+    /// The user was asked to accept or deny it.
+    Prompt,
+    /// A password challenge was sent at `sent_at`; the host waits for the password.
+    AwaitingPassword {
+        /// The host's per-session key pair offered in the challenge.
+        ephemeral: Ephemeral,
+        /// The host nonce offered in the challenge.
+        nonce: [u8; 32],
+        /// When the challenge was sent.
+        sent_at: Instant,
+    },
+    /// The password arrived and was handed to the application for checking.
+    PasswordReceived {
+        /// The session keys agreed in the challenge.
+        agreed: Agreed,
+    },
+}
+
+/// The host side of an agreed session key.
+struct Agreed {
+    /// The host's per-session public key.
+    host_key: EphemeralPublic,
+    /// The host nonce.
+    nonce: [u8; 32],
+    /// The derived session key.
+    key: SessionKey,
+}
+
+impl Agreed {
+    /// Agrees on the session key for `session_id` between the host's
+    /// per-session key pair `ephemeral` with `nonce` and the viewer's
+    /// per-session key `viewer_key`.
+    ///
+    /// Fails with [`crypto::CryptoError::LowOrderPoint`] when `viewer_key`
+    /// yields no shared secret.
+    fn new(
+        ephemeral: &Ephemeral,
+        nonce: [u8; 32],
+        viewer_key: &EphemeralPublic,
+        session_id: &str,
+        host: DeviceId,
+        viewer: DeviceId,
+    ) -> Result<Self, crypto::CryptoError> {
+        let shared = ephemeral.agree(viewer_key)?;
+        Ok(Self {
+            host_key: ephemeral.public(),
+            nonce,
+            key: crypto::derive_session_key(
+                &shared,
+                viewer_key,
+                &ephemeral.public(),
+                session_id,
+                &nonce,
+                host,
+                viewer,
+            ),
+        })
+    }
 }
 
 /// An accepted viewer.
@@ -259,12 +377,17 @@ impl State {
             .retain(|_, v| v.keyed || now.duration_since(v.accepted_at) < JOIN_WINDOW);
     }
 
-    /// Removes and returns requests older than `timeout`, as `(session_id, viewer)`.
+    /// Removes and returns requests older than `timeout`, and requests whose
+    /// password challenge is older than [`CHALLENGE_TIMEOUT`], as `(session_id, viewer)`.
     fn expire_pending(&mut self, now: Instant, timeout: Duration) -> Vec<(String, DeviceId)> {
         let expired: Vec<String> = self
             .pending
             .iter()
-            .filter(|(_, p)| now.duration_since(p.requested_at) >= timeout)
+            .filter(|(_, p)| {
+                now.duration_since(p.requested_at) >= timeout
+                    || matches!(p.stage, Stage::AwaitingPassword { sent_at, .. }
+                        if now.duration_since(sent_at) >= CHALLENGE_TIMEOUT)
+            })
             .map(|(sid, _)| sid.clone())
             .collect();
         expired
@@ -373,9 +496,16 @@ impl HostSession {
                 JoinError::Rejected => StartError::MediaUnavailable("token rejected".into()),
                 JoinError::Unavailable(reason) => StartError::MediaUnavailable(reason),
             })?;
-        let video = publish_video(&lk_room, &room::identity(device), 0, VideoInput::Raw, width, height)
-            .await
-            .map_err(StartError::MediaUnavailable)?;
+        let video = publish_video(
+            &lk_room,
+            &room::identity(device),
+            0,
+            VideoInput::Raw,
+            width,
+            height,
+        )
+        .await
+        .map_err(StartError::MediaUnavailable)?;
         tracing::info!(device_id = %device, "hosting started");
 
         let (events, events_rx) = mpsc::channel(EVENT_CAPACITY);
@@ -385,6 +515,7 @@ impl HostSession {
             room: lk_room,
             identity,
             known,
+            password_access: AtomicBool::new(false),
             video: Mutex::new(video),
             video_switch: tokio::sync::Mutex::new(()),
             key_provider,
@@ -412,49 +543,68 @@ impl HostSession {
         Ok((HostSession { inner }, events_rx))
     }
 
+    /// Sets whether unattended requests get a password challenge.
+    ///
+    /// When `available` is true, a viewer that asks for unattended access is
+    /// sent the host's signed per-session key and may answer with its
+    /// password, which arrives as [`HostEvent::PasswordReceived`]. When false
+    /// (the default), such requests arrive as [`HostEvent::ViewerRequested`].
+    pub fn set_password_access(&self, available: bool) {
+        self.inner
+            .password_access
+            .store(available, Ordering::Relaxed);
+    }
+
     /// Accepts the pending request `session_id`.
     ///
-    /// The viewer gets a fresh per-session key of the host, signed with the
-    /// host's identity key, the host nonce and a join token for the room. When
-    /// the room already has [`MAX_VIEWERS`] viewers the request is refused as
-    /// room full instead.
+    /// The viewer gets the host's per-session key, signed with the host's
+    /// identity key, the host nonce and a join token for the room. After a
+    /// password challenge these are the key and nonce of the challenge;
+    /// otherwise they are fresh. When the room already has [`MAX_VIEWERS`]
+    /// viewers the request is refused as room full instead.
     pub async fn accept(&self, session_id: &str) -> Result<(), HostError> {
         let inner = &self.inner;
         inner.expire_requests().await;
-        let nonce = crypto::random_nonce();
-        let ephemeral = Ephemeral::generate();
         let (viewer, outcome) = {
             let mut st = lock(&inner.state);
             let pending = st
                 .pending
                 .remove(session_id)
                 .ok_or(HostError::UnknownRequest)?;
-            let outcome = ephemeral
-                .agree(&pending.session_key)
-                .map(|shared| {
-                    crypto::derive_session_key(
-                        &shared,
-                        &pending.session_key,
-                        &ephemeral.public(),
-                        session_id,
-                        &nonce,
-                        inner.device,
-                        pending.viewer,
-                    )
-                })
-                .map_err(|_| DenyReason::Denied)
-                .and_then(|key| {
-                    let channel = PeerChannel::new(session_id.to_owned(), key, Side::Host);
-                    st.admit(pending.viewer, session_id, channel, Instant::now())
-                });
+            let agreed = match pending.stage {
+                Stage::PasswordReceived { agreed } => Ok(agreed),
+                Stage::AwaitingPassword {
+                    ephemeral, nonce, ..
+                } => Agreed::new(
+                    &ephemeral,
+                    nonce,
+                    &pending.session_key,
+                    session_id,
+                    inner.device,
+                    pending.viewer,
+                ),
+                Stage::Prompt => Agreed::new(
+                    &Ephemeral::generate(),
+                    crypto::random_nonce(),
+                    &pending.session_key,
+                    session_id,
+                    inner.device,
+                    pending.viewer,
+                ),
+            };
+            let outcome = agreed.map_err(|_| DenyReason::Denied).and_then(|agreed| {
+                let channel = PeerChannel::new(session_id.to_owned(), agreed.key, Side::Host);
+                st.admit(pending.viewer, session_id, channel, Instant::now())
+                    .map(|()| (agreed.host_key, agreed.nonce))
+            });
             (pending.viewer, outcome)
         };
         match outcome {
             Err(reason) => inner.respond(viewer, session_id, Err(reason)).await,
-            Ok(()) => {
+            Ok((host_key, nonce)) => {
                 tracing::info!(viewer = %viewer, %session_id, "session accepted");
                 inner
-                    .respond(viewer, session_id, Ok((&ephemeral.public(), &nonce)))
+                    .respond(viewer, session_id, Ok((&host_key, &nonce)))
                     .await?;
                 inner
                     .signaling
@@ -466,6 +616,28 @@ impl HostSession {
                 Ok(())
             }
         }
+    }
+
+    /// Reports that the password of request `session_id` was wrong.
+    ///
+    /// The request falls back to asking the user: the host drops the
+    /// challenge's keys and emits [`HostEvent::ViewerRequested`] with
+    /// `unattended` set. Fails with [`HostError::UnknownRequest`] unless the
+    /// request's password was received and not yet answered.
+    pub async fn reject_password(&self, session_id: &str) -> Result<(), HostError> {
+        let event = {
+            let mut st = lock(&self.inner.state);
+            let pending = st
+                .pending
+                .get_mut(session_id)
+                .filter(|p| matches!(p.stage, Stage::PasswordReceived { .. }))
+                .ok_or(HostError::UnknownRequest)?;
+            pending.stage = Stage::Prompt;
+            prompt_event(session_id, pending, true)
+        };
+        tracing::info!(%session_id, "password rejected, asking the user");
+        let _ = self.inner.events.send(event).await;
+        Ok(())
     }
 
     /// Refuses the pending request `session_id`.
@@ -532,7 +704,13 @@ impl HostSession {
         self.inner.sync_key_index();
         let old = std::mem::replace(&mut *lock(&self.inner.video), video).sid;
         tracing::info!(device_id = %self.inner.device, ?input, "video input switched");
-        if let Err(e) = self.inner.room.local_participant().unpublish_track(&old).await {
+        if let Err(e) = self
+            .inner
+            .room
+            .local_participant()
+            .unpublish_track(&old)
+            .await
+        {
             tracing::warn!(device_id = %self.inner.device, error = %e, "removing the previous video track failed");
         }
         Ok(())
@@ -554,10 +732,13 @@ impl HostSession {
         if video.input != VideoInput::Encoded {
             return None;
         }
-        video.source.take_rate_control_request().map(|r| RateRequest {
-            bitrate_bps: r.target_bitrate_bps,
-            framerate: r.framerate_fps,
-        })
+        video
+            .source
+            .take_rate_control_request()
+            .map(|r| RateRequest {
+                bitrate_bps: r.target_bitrate_bps,
+                framerate: r.framerate_fps,
+            })
     }
 
     /// Returns the video source when the track takes `input`.
@@ -766,21 +947,28 @@ impl Inner {
         }
     }
 
-    /// Handles a session request from `viewer`.
+    /// Handles a session request from `viewer` named `name`.
     ///
     /// `session_key` is the viewer's per-session key, `signature` its signature
     /// by the viewer's identity key and `identity_key` that identity key as
-    /// attested by the server. Requests with a malformed key or signature, a
-    /// signature that does not verify, from a viewer already in the room, with a
-    /// session ID or viewer that is already pending, or beyond [`MAX_PENDING`]
-    /// are refused, as are viewers whose identity key differs from the pinned
-    /// one. Each viewer is told about a refusal at most once per
+    /// attested by the server. A request with a malformed key or signature, or
+    /// a signature that does not verify, is dropped without an answer and only
+    /// logged. Requests from a viewer already in the room, with a session ID
+    /// or viewer that is already pending, or beyond [`MAX_PENDING`] are
+    /// refused, as are viewers whose identity key differs from the pinned one.
+    /// Each viewer is told about a refusal at most once per
     /// [`REFUSAL_INTERVAL`]; further requests in that interval are dropped
     /// without an answer. A viewer that was accepted but never joined may
     /// request again; accepting that request replaces its old slot.
+    ///
+    /// An `unattended` request gets a password challenge while password access
+    /// is available; any other request is handed to the user as
+    /// [`HostEvent::ViewerRequested`].
+    #[allow(clippy::too_many_arguments)]
     async fn on_request(
         &self,
         viewer: DeviceId,
+        name: String,
         session_id: String,
         session_key: &str,
         signature: &str,
@@ -788,65 +976,175 @@ impl Inner {
         unattended: bool,
     ) {
         self.expire_requests().await;
-        let decision = match verify_request(&session_id, session_key, signature, identity_key) {
-            Err(_) => Err(DenyReason::Denied),
-            Ok((key, session_key)) => {
-                let mut st = lock(&self.state);
-                let duplicate = st.pending.contains_key(&session_id)
-                    || st.viewers.get(&viewer).is_some_and(|v| v.joined)
-                    || st.pending.values().any(|p| p.viewer == viewer);
-                if duplicate || st.pending.len() >= MAX_PENDING {
-                    Err(DenyReason::Denied)
-                } else {
-                    match lock(&self.known).check(viewer, &key) {
-                        Err(changed) => Ok(Err(changed)),
-                        Ok(()) => {
-                            st.pending.insert(
-                                session_id.clone(),
-                                Pending {
-                                    viewer,
-                                    session_key,
-                                    requested_at: Instant::now(),
-                                },
-                            );
-                            Ok(Ok(key))
-                        }
+        let (viewer_key, session_key) = match verify_request(
+            &session_id,
+            session_key,
+            signature,
+            identity_key,
+        ) {
+            Ok(verified) => verified,
+            Err(err) => {
+                tracing::warn!(viewer = %viewer, %session_id, error = %err, "session request does not verify, dropped");
+                return;
+            }
+        };
+        let challenge = unattended && self.password_access.load(Ordering::Relaxed);
+        let decision = {
+            let mut st = lock(&self.state);
+            let duplicate = st.pending.contains_key(&session_id)
+                || st.viewers.get(&viewer).is_some_and(|v| v.joined)
+                || st.pending.values().any(|p| p.viewer == viewer);
+            if duplicate || st.pending.len() >= MAX_PENDING {
+                Err(DenyReason::Denied)
+            } else {
+                match lock(&self.known).check(viewer, &viewer_key) {
+                    Err(changed) => Ok(Err(changed)),
+                    Ok(()) => {
+                        let now = Instant::now();
+                        let (stage, offer) = if challenge {
+                            let ephemeral = Ephemeral::generate();
+                            let nonce = crypto::random_nonce();
+                            let offer = (ephemeral.public(), nonce);
+                            let stage = Stage::AwaitingPassword {
+                                ephemeral,
+                                nonce,
+                                sent_at: now,
+                            };
+                            (stage, Some(offer))
+                        } else {
+                            (Stage::Prompt, None)
+                        };
+                        let pending = Pending {
+                            viewer,
+                            name,
+                            viewer_key,
+                            session_key,
+                            requested_at: now,
+                            stage,
+                        };
+                        let event = offer
+                            .is_none()
+                            .then(|| prompt_event(&session_id, &pending, unattended));
+                        st.pending.insert(session_id.clone(), pending);
+                        Ok(Ok((event, offer)))
                     }
                 }
             }
         };
-        if let Ok(Ok(viewer_key)) = decision {
-            tracing::info!(viewer = %viewer, %session_id, "session requested");
-            let _ = self
-                .events
-                .send(HostEvent::ViewerRequested {
-                    session_id,
-                    viewer,
-                    fingerprint: viewer_key.fingerprint(),
-                    viewer_key,
-                    unattended,
-                })
-                .await;
-            return;
-        }
+        let refusal = match decision {
+            Ok(Ok((Some(event), _))) => {
+                tracing::info!(viewer = %viewer, %session_id, unattended, "session requested");
+                let _ = self.events.send(event).await;
+                return;
+            }
+            Ok(Ok((None, Some((host_key, nonce))))) => {
+                tracing::info!(viewer = %viewer, %session_id, "unattended session requested, password challenge sent");
+                let signature = self
+                    .identity
+                    .sign_session(Role::Host, &session_id, &host_key);
+                let sent = self
+                    .signaling
+                    .send(ClientMessage::PasswordChallenge {
+                        to: viewer,
+                        session_id: session_id.clone(),
+                        session_key: host_key.to_base64(),
+                        signature: crypto::signature_to_base64(&signature),
+                        host_nonce: STANDARD.encode(nonce),
+                    })
+                    .await;
+                if let Err(err) = sent {
+                    tracing::warn!(viewer = %viewer, %session_id, error = %err, "sending password challenge failed");
+                }
+                return;
+            }
+            Ok(Ok((None, None))) => return,
+            Ok(Err(changed)) => Err(changed),
+            Err(reason) => Ok(reason),
+        };
         let may_refuse = lock(&self.state).may_refuse(viewer, Instant::now());
         if !may_refuse {
             return;
         }
-        match decision {
-            Ok(Err(changed)) => {
+        match refusal {
+            Err(changed) => {
                 tracing::warn!(viewer = %viewer, %session_id, "viewer key changed, request refused");
                 let _ = self.events.send(HostEvent::KeyChanged(changed)).await;
                 let _ = self
                     .respond(viewer, &session_id, Err(DenyReason::KeyChanged))
                     .await;
             }
-            Err(reason) => {
+            Ok(reason) => {
                 tracing::info!(viewer = %viewer, %session_id, "session request refused");
                 let _ = self.respond(viewer, &session_id, Err(reason)).await;
             }
-            Ok(Ok(_)) => {}
         }
+    }
+
+    /// Handles the sealed unattended password `sealed` that `viewer` sent for request `session_id`.
+    ///
+    /// The password is opened with the per-session key of the request's
+    /// challenge, which is then dropped, and handed to the application as
+    /// [`HostEvent::PasswordReceived`]. A password for a request that is not
+    /// waiting for one, or from another device, is ignored.
+    async fn on_password(&self, viewer: DeviceId, session_id: String, sealed: &str) {
+        let event = {
+            let mut st = lock(&self.state);
+            let Some(pending) = st
+                .pending
+                .get_mut(&session_id)
+                .filter(|p| p.viewer == viewer)
+            else {
+                tracing::warn!(viewer = %viewer, %session_id, "password for no pending request ignored");
+                return;
+            };
+            let Stage::AwaitingPassword {
+                ephemeral, nonce, ..
+            } = &pending.stage
+            else {
+                tracing::warn!(viewer = %viewer, %session_id, "password not asked for ignored");
+                return;
+            };
+            let password = crypto::open_password(
+                ephemeral,
+                &pending.session_key,
+                &session_id,
+                viewer,
+                self.device,
+                sealed,
+            )
+            .map(Password)
+            .inspect_err(|err| {
+                tracing::warn!(viewer = %viewer, %session_id, error = %err, "sealed password could not be opened");
+            })
+            .ok();
+            match Agreed::new(
+                ephemeral,
+                *nonce,
+                &pending.session_key,
+                &session_id,
+                self.device,
+                viewer,
+            ) {
+                Ok(agreed) => {
+                    pending.stage = Stage::PasswordReceived { agreed };
+                    HostEvent::PasswordReceived {
+                        session_id: session_id.clone(),
+                        viewer,
+                        name: pending.name.clone(),
+                        fingerprint: pending.viewer_key.fingerprint(),
+                        viewer_key: pending.viewer_key,
+                        password,
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(viewer = %viewer, %session_id, error = %err, "key agreement failed, request dropped");
+                    st.pending.remove(&session_id);
+                    return;
+                }
+            }
+        };
+        tracing::info!(viewer = %viewer, %session_id, "unattended password received");
+        let _ = self.events.send(event).await;
     }
 
     /// Hands the media key, and during a rotation also the next one, to `viewer` once it is in the room.
@@ -930,12 +1228,15 @@ async fn run(
                     session_key,
                     signature,
                     identity_key,
+                    name,
                     unattended,
-                    ..
                 }) => {
                     inner
-                        .on_request(from, session_id, &session_key, &signature, &identity_key, unattended)
+                        .on_request(from, name, session_id, &session_key, &signature, &identity_key, unattended)
                         .await;
+                }
+                Some(ServerMessage::SessionPassword { from, session_id, password }) => {
+                    inner.on_password(from, session_id, &password).await;
                 }
                 Some(_) => {}
                 None => {
@@ -1085,6 +1386,18 @@ fn verify_request(
     Ok((identity, key))
 }
 
+/// Returns the event that asks the user about request `session_id` described by `pending`.
+fn prompt_event(session_id: &str, pending: &Pending, unattended: bool) -> HostEvent {
+    HostEvent::ViewerRequested {
+        session_id: session_id.to_owned(),
+        viewer: pending.viewer,
+        name: pending.name.clone(),
+        fingerprint: pending.viewer_key.fingerprint(),
+        viewer_key: pending.viewer_key,
+        unattended,
+    }
+}
+
 /// Locks `m`, recovering from a poisoned lock.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -1135,14 +1448,96 @@ mod tests {
     }
 
     fn pending(st: &mut State, sid: &str, viewer: DeviceId, at: Instant) {
+        pending_at(st, sid, viewer, at, Stage::Prompt);
+    }
+
+    fn pending_at(st: &mut State, sid: &str, viewer: DeviceId, at: Instant, stage: Stage) {
         st.pending.insert(
             sid.into(),
             Pending {
                 viewer,
+                name: "pc".into(),
+                viewer_key: IdentityKey::generate().public(),
                 session_key: EphemeralPublic::from_bytes([5; 32]),
                 requested_at: at,
+                stage,
             },
         );
+    }
+
+    fn awaiting(sent_at: Instant) -> Stage {
+        Stage::AwaitingPassword {
+            ephemeral: Ephemeral::generate(),
+            nonce: [3; 32],
+            sent_at,
+        }
+    }
+
+    #[test]
+    fn unanswered_challenge_expires_after_challenge_timeout() {
+        let mut st = state(0, 0);
+        let t0 = Instant::now();
+        pending_at(&mut st, "challenged", id(1), t0, awaiting(t0));
+        pending_at(
+            &mut st,
+            "fresh",
+            id(2),
+            t0,
+            awaiting(t0 + Duration::from_secs(10)),
+        );
+        pending(&mut st, "prompt", id(3), t0);
+        let later = t0 + CHALLENGE_TIMEOUT;
+        let gone = st.expire_pending(later, Duration::from_secs(60));
+        assert_eq!(gone, vec![("challenged".to_owned(), id(1))]);
+        assert!(st.pending.contains_key("fresh"));
+        assert!(st.pending.contains_key("prompt"));
+        let gone = st.expire_pending(later + Duration::from_secs(10), Duration::from_secs(60));
+        assert_eq!(gone, vec![("fresh".to_owned(), id(2))]);
+        assert!(
+            st.pending.contains_key("prompt"),
+            "a prompt waits for the request timeout"
+        );
+    }
+
+    #[test]
+    fn host_and_viewer_derive_equal_keys_through_the_challenge() {
+        let (host, viewer) = (id(1), id(2));
+        let (host_eph, viewer_eph) = (Ephemeral::generate(), Ephemeral::generate());
+        let nonce = [4; 32];
+        let agreed =
+            Agreed::new(&host_eph, nonce, &viewer_eph.public(), "s1", host, viewer).unwrap();
+        assert_eq!(agreed.host_key, host_eph.public());
+        let shared = viewer_eph.agree(&agreed.host_key).unwrap();
+        let viewer_side = crypto::derive_session_key(
+            &shared,
+            &viewer_eph.public(),
+            &agreed.host_key,
+            "s1",
+            &nonce,
+            host,
+            viewer,
+        );
+        assert_eq!(agreed.key.as_bytes(), viewer_side.as_bytes());
+        let sealed = crypto::seal_password(
+            &viewer_eph,
+            &agreed.host_key,
+            "s1",
+            viewer,
+            host,
+            "hunter22",
+        )
+        .unwrap();
+        let opened =
+            crypto::open_password(&host_eph, &viewer_eph.public(), "s1", viewer, host, &sealed)
+                .unwrap();
+        assert_eq!(opened, "hunter22");
+    }
+
+    #[test]
+    fn password_debug_hides_text() {
+        let password = Password("hunter22".into());
+        assert_eq!(password.as_str(), "hunter22");
+        assert!(!format!("{password:?}").contains("hunter22"));
     }
 
     #[test]
@@ -1292,7 +1687,9 @@ mod tests {
             .await
             .unwrap();
         for input in [VideoInput::Raw, VideoInput::Encoded] {
-            publish_video(&lk_room, &own, 5, input, 64, 64).await.unwrap();
+            publish_video(&lk_room, &own, 5, input, 64, 64)
+                .await
+                .unwrap();
         }
         let indices: Vec<i32> = lk_room
             .e2ee_manager()

@@ -5,40 +5,80 @@ mod common;
 use std::time::Duration;
 
 use common::{
-    TestEnv, accept_next, collect_stamps, feed_frames, host_event, request, start_host,
-    viewer_event,
+    TestEnv, accept_next, collect_stamps, feed_frames, host_event, request, request_with,
+    start_host, viewer_event,
 };
 use sqlx::PgPool;
 use surf_rac_protocol::data::{ClipboardKind, DataMessage};
 use surf_rac_session::host::HostEvent;
-use surf_rac_session::viewer::ViewerEvent;
+use surf_rac_session::viewer::{RequestError, RequestOptions, ViewerEvent};
 use surf_rac_session::{EndReason, FrameError, SessionConfig, VideoInput};
 
-#[sqlx::test(migrations = "../server/migrations")]
-async fn password_reaches_host(pool: PgPool) {
-    use std::sync::Arc;
-    use surf_rac_session::crypto::open_password;
-    use surf_rac_session::viewer::{RequestOptions, ViewerSession};
+/// Returns request options that authenticate with `password`.
+fn with_password(password: &str) -> RequestOptions {
+    RequestOptions {
+        password: Some(password.into()),
+    }
+}
 
+#[sqlx::test(migrations = "../server/migrations")]
+async fn attended_request_reaches_host_as_prompt(pool: PgPool) {
     let env = TestEnv::start(pool).await;
     let (h, v) = (env.device("host", 1).await, env.device("viewer", 2).await);
-    let (_host, mut host_events) = start_host(&h, SessionConfig::default()).await;
-
-    let options = RequestOptions {
-        password: Some("hunter22".into()),
-        host_key: Some(h.keys.public_key()),
-    };
-    let (signaling, keys, known) = (v.signaling.clone(), Arc::clone(&v.keys), Arc::clone(&v.known));
-    let host_id = h.id;
-    let _pending = tokio::spawn(async move {
-        ViewerSession::request_with(signaling, keys, known, host_id, options, SessionConfig::default())
-            .await
-    });
+    let (host, mut host_events) = start_host(&h, SessionConfig::default()).await;
+    host.set_password_access(true);
+    let pending = request(&v, h.id, SessionConfig::default());
     let ev = host_event(&mut host_events, Duration::from_secs(10), |e| {
-        matches!(e, HostEvent::ViewerRequested { .. })
+        matches!(
+            e,
+            HostEvent::ViewerRequested { .. } | HostEvent::PasswordReceived { .. }
+        )
     })
     .await;
     let HostEvent::ViewerRequested {
+        session_id,
+        viewer,
+        name,
+        viewer_key,
+        fingerprint,
+        unattended,
+    } = ev
+    else {
+        panic!("attended request produced {ev:?}")
+    };
+    assert_eq!(viewer, v.id);
+    assert_eq!(name, "viewer");
+    assert_eq!(viewer_key, v.identity.public());
+    assert_eq!(fingerprint, v.identity.public().fingerprint());
+    assert!(!unattended);
+    host.accept(&session_id).await.unwrap();
+    let (_viewer, mut events) = pending.await.unwrap().expect("viewer request");
+    viewer_event(&mut events, Duration::from_secs(30), |e| {
+        matches!(e, ViewerEvent::Connected)
+    })
+    .await;
+}
+
+#[sqlx::test(migrations = "../server/migrations")]
+async fn unattended_password_is_accepted(pool: PgPool) {
+    let env = TestEnv::start(pool).await;
+    let (h, v) = (env.device("host", 1).await, env.device("viewer", 2).await);
+    let (host, mut host_events) = start_host(&h, SessionConfig::default()).await;
+    host.set_password_access(true);
+    let pending = request_with(
+        &v,
+        h.id,
+        with_password("hunter22"),
+        SessionConfig::default(),
+    );
+    let ev = host_event(&mut host_events, Duration::from_secs(10), |e| {
+        matches!(
+            e,
+            HostEvent::ViewerRequested { .. } | HostEvent::PasswordReceived { .. }
+        )
+    })
+    .await;
+    let HostEvent::PasswordReceived {
         session_id,
         viewer,
         viewer_key,
@@ -46,28 +86,109 @@ async fn password_reaches_host(pool: PgPool) {
         ..
     } = ev
     else {
-        unreachable!()
+        panic!("unattended request produced {ev:?}")
     };
-    let sealed = password.expect("sealed password relayed");
-    assert_eq!(viewer_key, v.keys.public_key());
-    let opened = open_password(&h.keys, &viewer_key, &session_id, viewer, h.id, &sealed).unwrap();
-    assert_eq!(opened, "hunter22");
+    assert_eq!(viewer, v.id);
+    assert_eq!(viewer_key, v.identity.public());
+    assert_eq!(
+        password.as_ref().map(|p| p.as_str()),
+        Some("hunter22"),
+        "host opens the sealed password"
+    );
+    assert!(
+        !format!("{password:?}").contains("hunter22"),
+        "debug output hides the password"
+    );
+    host.accept(&session_id).await.unwrap();
+    let (_viewer, mut events) = pending.await.unwrap().expect("viewer request");
+    viewer_event(&mut events, Duration::from_secs(30), |e| {
+        matches!(e, ViewerEvent::Connected)
+    })
+    .await;
+    assert_eq!(
+        v.known.lock().unwrap().get(h.id),
+        Some(&h.identity.public()),
+        "viewer pinned the host key from the challenge"
+    );
 }
 
 #[sqlx::test(migrations = "../server/migrations")]
-async fn request_without_options_carries_no_password(pool: PgPool) {
+async fn wrong_password_falls_back_to_prompt(pool: PgPool) {
     let env = TestEnv::start(pool).await;
     let (h, v) = (env.device("host", 1).await, env.device("viewer", 2).await);
-    let (_host, mut host_events) = start_host(&h, SessionConfig::default()).await;
-    let _pending = request(&v, h.id, SessionConfig::default());
-    let ev = host_event(&mut host_events, Duration::from_secs(10), |e| {
+    let (host, mut host_events) = start_host(&h, SessionConfig::default()).await;
+    host.set_password_access(true);
+    let pending = request_with(&v, h.id, with_password("wrong"), SessionConfig::default());
+    let HostEvent::PasswordReceived {
+        session_id,
+        password,
+        ..
+    } = host_event(&mut host_events, Duration::from_secs(10), |e| {
+        matches!(e, HostEvent::PasswordReceived { .. })
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(password.as_ref().map(|p| p.as_str()), Some("wrong"));
+    host.reject_password(&session_id).await.unwrap();
+    let ev = host_event(&mut host_events, Duration::from_secs(5), |e| {
         matches!(e, HostEvent::ViewerRequested { .. })
     })
     .await;
-    let HostEvent::ViewerRequested { password, .. } = ev else {
+    let HostEvent::ViewerRequested {
+        session_id: prompted,
+        viewer,
+        unattended,
+        ..
+    } = ev
+    else {
         unreachable!()
     };
-    assert!(password.is_none());
+    assert_eq!(prompted, session_id);
+    assert_eq!(viewer, v.id);
+    assert!(unattended);
+    assert!(
+        host.reject_password(&session_id).await.is_err(),
+        "a prompt has no password to reject"
+    );
+    host.accept(&session_id).await.unwrap();
+    let (_viewer, mut events) = pending.await.unwrap().expect("viewer request");
+    viewer_event(&mut events, Duration::from_secs(30), |e| {
+        matches!(e, ViewerEvent::Connected)
+    })
+    .await;
+}
+
+#[sqlx::test(migrations = "../server/migrations")]
+async fn unattended_request_prompts_without_password_access(pool: PgPool) {
+    let env = TestEnv::start(pool).await;
+    let (h, v) = (env.device("host", 1).await, env.device("viewer", 2).await);
+    let (host, mut host_events) = start_host(&h, SessionConfig::default()).await;
+    let pending = request_with(
+        &v,
+        h.id,
+        with_password("hunter22"),
+        SessionConfig::default(),
+    );
+    let ev = host_event(&mut host_events, Duration::from_secs(10), |e| {
+        matches!(
+            e,
+            HostEvent::ViewerRequested { .. } | HostEvent::PasswordReceived { .. }
+        )
+    })
+    .await;
+    let HostEvent::ViewerRequested {
+        session_id,
+        unattended,
+        ..
+    } = ev
+    else {
+        panic!("request without password access produced {ev:?}")
+    };
+    assert!(unattended);
+    host.deny(&session_id).await.unwrap();
+    assert_eq!(pending.await.unwrap().err(), Some(RequestError::Denied));
 }
 
 #[sqlx::test(migrations = "../server/migrations")]
@@ -341,7 +462,10 @@ async fn viewer_keeps_receiving_across_size_change(pool: PgPool) {
         .iter()
         .filter(|(w, h, s)| (*w, *h) == (800, 600) && s.is_some())
         .count();
-    assert!(after >= 10, "only {after} stamped 800x600 frames after the switch");
+    assert!(
+        after >= 10,
+        "only {after} stamped 800x600 frames after the switch"
+    );
 }
 
 #[sqlx::test(migrations = "../server/migrations")]
@@ -353,17 +477,29 @@ async fn encoded_input_rejects_raw_frames_and_switches_back(pool: PgPool) {
     let (_viewer, mut events) = accept_next(&host, &mut host_events, pending).await;
     assert_eq!(host.video_input(), VideoInput::Raw);
 
-    host.set_video_input(VideoInput::Encoded, 640, 480).await.unwrap();
+    host.set_video_input(VideoInput::Encoded, 640, 480)
+        .await
+        .unwrap();
     assert_eq!(host.video_input(), VideoInput::Encoded);
     assert_eq!(
-        host.publish_frame(&common::stamp::stamp_frame(640, 480, common::stamp::now_micros())),
+        host.publish_frame(&common::stamp::stamp_frame(
+            640,
+            480,
+            common::stamp::now_micros()
+        )),
         Err(FrameError::WrongInput)
     );
 
-    host.set_video_input(VideoInput::Raw, 640, 480).await.unwrap();
+    host.set_video_input(VideoInput::Raw, 640, 480)
+        .await
+        .unwrap();
     assert_eq!(host.video_input(), VideoInput::Raw);
     let feed = feed_frames(&host);
     let stamps = collect_stamps(&mut events, Duration::from_secs(15)).await;
     feed.abort();
-    assert!(stamps.len() >= 10, "only {} stamped frames after switching back", stamps.len());
+    assert!(
+        stamps.len() >= 10,
+        "only {} stamped frames after switching back",
+        stamps.len()
+    );
 }

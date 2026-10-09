@@ -35,7 +35,8 @@ pub async fn put(
     alias: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "insert into contacts (user_id, device_id, alias) values ($1, $2, $3)          on conflict (user_id, device_id) do update set alias = excluded.alias",
+        "insert into contacts (user_id, device_id, alias) values ($1, $2, $3) \
+         on conflict (user_id, device_id) do update set alias = excluded.alias",
     )
     .bind(user_id)
     .bind(i64::from(device.get()))
@@ -62,7 +63,10 @@ pub async fn delete(db: &PgPool, user_id: i64, device: DeviceId) -> Result<(), s
 /// `device` itself.
 pub async fn watcher_devices(db: &PgPool, device: DeviceId) -> Result<Vec<i64>, sqlx::Error> {
     sqlx::query_scalar(
-        "select distinct l.device_id from device_links l          where l.device_id <> $1 and l.user_id in (              select user_id from device_links where device_id = $1              union select user_id from contacts where device_id = $1)",
+        "select distinct l.device_id from device_links l \
+         where l.device_id <> $1 and l.user_id in ( \
+             select user_id from device_links where device_id = $1 \
+             union select user_id from contacts where device_id = $1)",
     )
     .bind(i64::from(device.get()))
     .fetch_all(db)

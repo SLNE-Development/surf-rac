@@ -5,7 +5,7 @@ use eframe::egui::{self, Align, Frame, Layout, Margin, RichText};
 use surf_rac_protocol::DeviceId;
 
 use super::widgets::{self, Kind, Tone};
-use super::{ClientApp, Tab, icons, login, theme};
+use super::{ClientApp, Tab, connect, icons, login, theme};
 use crate::access::MIN_PASSWORD_LEN;
 use crate::runtime::{Auth, Command};
 
@@ -78,7 +78,7 @@ fn signed_in(app: &mut ClientApp, ui: &mut egui::Ui) {
                     Frame::new()
                         .inner_margin(Margin::symmetric(24, 20))
                         .show(ui, |ui| match app.tab {
-                            Tab::Connect => connect_tab(app, ui),
+                            Tab::Connect => connect::show(app, ui),
                             Tab::Devices => devices_tab(app, ui),
                             Tab::Settings => settings_tab(app, ui),
                         });
@@ -223,111 +223,6 @@ fn server_dialog(app: &mut ClientApp, ctx: &egui::Context) {
         app.forms.server_dialog = false;
         app.forms.server_url = None;
     }
-}
-
-/// Draws the connect form and the contact list.
-fn connect_tab(app: &mut ClientApp, ui: &mut egui::Ui) {
-    ui.heading("Connect to a device");
-    let online = app.snap.auth == Auth::Online;
-    egui::Grid::new("connect").num_columns(2).show(ui, |ui| {
-        ui.label("Device ID");
-        ui.text_edit_singleline(&mut app.forms.connect_id);
-        ui.end_row();
-        ui.label("Password");
-        ui.add(
-            egui::TextEdit::singleline(&mut app.forms.connect_password)
-                .password(true)
-                .hint_text("Only for unattended access"),
-        );
-        ui.end_row();
-    });
-    ui.checkbox(&mut app.forms.connect_remember, "Remember this password");
-    ui.add_enabled_ui(online, |ui| {
-        if ui.button("Connect").clicked() {
-            match parse_id(&app.forms.connect_id) {
-                Some(host) => {
-                    let password = std::mem::take(&mut app.forms.connect_password);
-                    app.send(Command::Connect {
-                        host,
-                        password: (!password.is_empty()).then_some(password),
-                        remember: app.forms.connect_remember,
-                    });
-                    app.forms.notice = None;
-                }
-                None => app.forms.notice = Some("A device ID has 9 digits.".into()),
-            }
-        }
-    });
-    if let Some(notice) = &app.forms.notice {
-        ui.label(notice);
-    }
-
-    ui.add_space(12.0);
-    ui.heading("Contacts");
-    let contacts = app.snap.contacts.clone();
-    if contacts.is_empty() {
-        ui.label("No contacts yet.");
-    }
-    egui::Grid::new("contacts")
-        .num_columns(4)
-        .striped(true)
-        .show(ui, |ui| {
-            for c in contacts {
-                let dot = if c.online { "\u{25CF}" } else { "\u{25CB}" };
-                let color = if c.online {
-                    egui::Color32::from_rgb(40, 160, 70)
-                } else {
-                    egui::Color32::GRAY
-                };
-                ui.colored_label(color, dot);
-                ui.label(&c.alias);
-                ui.monospace(format_id(c.id));
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(online && c.online, egui::Button::new("Connect"))
-                        .clicked()
-                    {
-                        app.send(Command::Connect {
-                            host: c.id,
-                            password: None,
-                            remember: false,
-                        });
-                    }
-                    if ui.small_button("Rename").clicked() {
-                        app.forms.contact_id = c.id.to_string();
-                        app.forms.contact_alias = c.alias.clone();
-                    }
-                    if ui.small_button("Remove").clicked() {
-                        app.send(Command::DeleteContact(c.id));
-                    }
-                });
-                ui.end_row();
-            }
-        });
-    ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        ui.add(
-            egui::TextEdit::singleline(&mut app.forms.contact_id)
-                .hint_text("Device ID")
-                .desired_width(110.0),
-        );
-        ui.add(
-            egui::TextEdit::singleline(&mut app.forms.contact_alias)
-                .hint_text("Name")
-                .desired_width(160.0),
-        );
-        if ui.button("Save contact").clicked() {
-            let alias = app.forms.contact_alias.trim().to_string();
-            match parse_id(&app.forms.contact_id) {
-                Some(id) if !alias.is_empty() => {
-                    app.send(Command::PutContact { id, alias });
-                    app.forms.contact_id.clear();
-                    app.forms.contact_alias.clear();
-                }
-                _ => app.forms.notice = Some("Enter a 9-digit ID and a name.".into()),
-            }
-        }
-    });
 }
 
 /// Draws the account's devices.

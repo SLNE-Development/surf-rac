@@ -1,6 +1,7 @@
 //! The egui user interface: the main window plus one native window per
 //! prompt, the host's connections and each viewer session.
 
+mod connect;
 mod icons;
 mod login;
 mod main_window;
@@ -48,10 +49,10 @@ struct Forms {
     connect_password: String,
     /// Whether to save the typed password.
     connect_remember: bool,
-    /// ID of a contact to add or rename.
-    contact_id: String,
-    /// Alias of a contact to add or rename.
-    contact_alias: String,
+    /// Text filtering the contact list.
+    contact_search: String,
+    /// The open add or rename contact dialog.
+    contact_dialog: Option<ContactDialog>,
     /// Server URL being edited.
     server_url: Option<String>,
     /// Settings being edited.
@@ -62,6 +63,19 @@ struct Forms {
     new_password_again: String,
     /// A local message, such as a validation error.
     notice: Option<String>,
+}
+
+/// Fields of the add or rename contact dialog.
+#[derive(Debug, Default)]
+struct ContactDialog {
+    /// Whether an existing contact is renamed; its ID is then fixed.
+    rename: bool,
+    /// The contact's device ID as typed.
+    id: String,
+    /// The contact's name as typed.
+    alias: String,
+    /// Why the last save was refused.
+    error: Option<String>,
 }
 
 /// Drawing state of one viewer window.

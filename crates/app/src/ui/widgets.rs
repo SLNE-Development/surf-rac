@@ -113,6 +113,24 @@ pub(super) fn icon_button(ui: &mut Ui, icon: char, tooltip: &str) -> Response {
     .on_hover_text(tooltip)
 }
 
+/// Shows a square, frameless button holding `icon` that opens a dropdown
+/// menu filled by `add`.
+pub(super) fn icon_menu(ui: &mut Ui, icon: char, tooltip: &str, add: impl FnOnce(&mut Ui)) {
+    let p = theme::palette(ui.ctx());
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding = Vec2::splat(8.0);
+        let button = Button::new(icons::text(icon, 16.0).color(p.muted))
+            .frame_when_inactive(false)
+            .corner_radius(RADIUS_CONTROL)
+            .min_size(Vec2::splat(32.0));
+        let (response, _) = egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
+            ui.set_min_width(140.0);
+            add(ui);
+        });
+        response.on_hover_text(tooltip);
+    });
+}
+
 /// Shows a full-width single-line text field with a hint; `password` hides the text.
 pub(super) fn text_field(ui: &mut Ui, value: &mut String, hint: &str, password: bool) -> Response {
     let width = ui.available_width();
@@ -150,7 +168,8 @@ pub(super) fn id_field(ui: &mut Ui, value: &mut String, hint: &str, width: f32) 
             .hint_text(hint.to_string())
             .font(theme::semibold(18.0))
             .margin(Margin::symmetric(12, 11))
-            .desired_width(width),
+            .desired_width(width)
+            .min_size(vec2(width, 46.0)),
     )
 }
 

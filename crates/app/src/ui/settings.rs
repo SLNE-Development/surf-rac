@@ -55,6 +55,18 @@ fn section(ui: &mut Ui, title: &str, right: impl FnOnce(&mut Ui), add: impl FnOn
 
 /// Draws one setting: title and description on the left, `control` on the right.
 fn setting_row(ui: &mut Ui, first: bool, title: &str, desc: &str, control: impl FnOnce(&mut Ui)) {
+    let title = RichText::new(title).font(super::theme::semibold(14.0));
+    rich_setting_row(ui, first, title, desc, control);
+}
+
+/// Draws one setting row like [`setting_row`] with an already styled title.
+fn rich_setting_row(
+    ui: &mut Ui,
+    first: bool,
+    title: RichText,
+    desc: &str,
+    control: impl FnOnce(&mut Ui),
+) {
     if !first {
         widgets::hairline(ui);
     }
@@ -67,7 +79,7 @@ fn setting_row(ui: &mut Ui, first: bool, title: &str, desc: &str, control: impl 
                     ui.add_space(12.0);
                     ui.with_layout(Layout::top_down(Align::Min), |ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
-                        ui.label(RichText::new(title).font(super::theme::semibold(14.0)));
+                        ui.label(title);
                         if !desc.is_empty() {
                             ui.add(egui::Label::new(widgets::muted(ui, desc).size(13.0)).wrap());
                         }
@@ -266,7 +278,8 @@ fn saved_passwords_card(app: &mut ClientApp, ui: &mut Ui) {
                     .find(|c| c.id == id)
                     .map(|c| c.alias.clone())
                     .unwrap_or_default();
-                setting_row(ui, i == 0, &format_id(id), &alias, |ui| {
+                let title = RichText::new(format_id(id)).font(widgets::id_font(14.0));
+                rich_setting_row(ui, i == 0, title, &alias, |ui| {
                     if ui
                         .add(widgets::btn(ui, Kind::Ghost, None, "Forget"))
                         .clicked()

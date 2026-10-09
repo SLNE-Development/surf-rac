@@ -96,10 +96,10 @@ fn device_row(app: &mut ClientApp, ui: &mut egui::Ui, d: &DeviceInfo) {
         }
         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
             if this {
-                widgets::two_lines(ui, &d.name, &format_id(d.device_id));
+                widgets::name_and_id(ui, &d.name, &format_id(d.device_id));
                 widgets::chip(ui, Tone::Accent, false, "This device");
             } else {
-                widgets::two_lines(ui, &d.name, &format_id(d.device_id));
+                widgets::name_and_id(ui, &d.name, &format_id(d.device_id));
             }
         });
     });

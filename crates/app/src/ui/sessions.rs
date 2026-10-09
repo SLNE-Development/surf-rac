@@ -102,13 +102,14 @@ impl ClientApp {
                                     )
                                     .truncate(),
                                 );
-                                ui.label(
-                                    widgets::muted(
-                                        ui,
-                                        format!("Device {}", format_id(prompt.viewer)),
-                                    )
-                                    .size(13.0),
-                                );
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    ui.label(widgets::muted(ui, "Device").size(13.0));
+                                    ui.label(
+                                        widgets::muted(ui, format_id(prompt.viewer))
+                                            .font(widgets::id_font(13.0)),
+                                    );
+                                });
                             });
                         });
                         ui.horizontal(|ui| {
@@ -263,7 +264,7 @@ impl ClientApp {
                 });
             }
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                widgets::two_lines(ui, &v.name, &format_id(v.id));
+                widgets::name_and_id(ui, &v.name, &format_id(v.id));
             });
         });
     }

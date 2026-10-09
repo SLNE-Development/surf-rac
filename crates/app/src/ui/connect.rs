@@ -138,7 +138,9 @@ fn id_card(app: &mut ClientApp, ui: &mut egui::Ui) {
         ui.label(widgets::muted(ui, "YOUR ID").font(theme::bold(11.0)));
         ui.horizontal(|ui| {
             let id = app.snap.device_id.map(format_id);
-            ui.label(RichText::new(id.as_deref().unwrap_or("--- --- ---")).font(theme::bold(26.0)));
+            ui.label(
+                RichText::new(id.as_deref().unwrap_or("--- --- ---")).font(widgets::id_font(26.0)),
+            );
             if let Some(id) = app.snap.device_id {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if widgets::icon_button(ui, icons::COPY, "Copy ID").clicked() {
@@ -259,7 +261,7 @@ fn contact_row(app: &mut ClientApp, ui: &mut egui::Ui, c: &ContactView, online: 
             widgets::chip(ui, Tone::Neutral, true, "Offline");
         }
         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-            widgets::two_lines(ui, &c.alias, &format_id(c.id));
+            widgets::name_and_id(ui, &c.alias, &format_id(c.id));
         });
     });
 }

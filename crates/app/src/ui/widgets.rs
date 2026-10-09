@@ -163,12 +163,17 @@ pub(super) fn full_width(ui: &mut Ui, enabled: bool, button: Button<'static>) ->
         .inner
 }
 
+/// Returns the font device IDs are drawn in: egui's monospace font at `size` points.
+pub(super) fn id_font(size: f32) -> egui::FontId {
+    egui::FontId::monospace(size)
+}
+
 /// Shows a large text field for a device ID.
 pub(super) fn id_field(ui: &mut Ui, value: &mut String, hint: &str, width: f32) -> Response {
     ui.add(
         TextEdit::singleline(value)
             .hint_text(hint.to_string())
-            .font(theme::semibold(16.0))
+            .font(id_font(16.0))
             .margin(Margin::symmetric(12, 10))
             .vertical_align(Align::Center)
             .desired_width(width)
@@ -364,13 +369,14 @@ pub(super) fn row<R>(ui: &mut Ui, first: bool, add: impl FnOnce(&mut Ui) -> R) -
         .inner
 }
 
-/// Shows a primary and a secondary line of text that truncate to the space left.
-pub(super) fn two_lines(ui: &mut Ui, primary: &str, secondary: &str) {
+/// Shows a name above a device ID in the monospace ID font; both truncate
+/// to the space left.
+pub(super) fn name_and_id(ui: &mut Ui, primary: &str, secondary: &str) {
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 1.0;
         ui.add_space(3.0);
         ui.add(Label::new(RichText::new(primary).font(theme::semibold(14.0))).truncate());
-        ui.add(Label::new(muted(ui, secondary).size(12.0)).truncate());
+        ui.add(Label::new(muted(ui, secondary).font(id_font(12.0))).truncate());
     });
 }
 

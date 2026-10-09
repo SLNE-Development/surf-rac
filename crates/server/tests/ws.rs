@@ -169,13 +169,35 @@ async fn wrong_or_missing_protocol_version_is_update_required(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn missing_unknown_or_disabled_device_is_unauthorized(pool: PgPool) {
+async fn missing_or_malformed_device_id_is_unauthorized(pool: PgPool) {
     let app = common::spawn(pool).await;
     let version = surf_rac_protocol::PROTOCOL_VERSION.to_string();
-    for id in [None, Some("abc"), Some("123456789")] {
+    for id in [None, Some("abc")] {
         let refused = app.ws_open(id, Some(&version)).await.err().unwrap();
         assert_eq!(refused.status, 401, "{id:?}");
     }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn unknown_device_is_not_found(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let version = surf_rac_protocol::PROTOCOL_VERSION.to_string();
+    let refused = app
+        .ws_open(Some("123456789"), Some(&version))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(refused.status, 404);
+    assert_eq!(
+        refused.body.as_ref().map(|b| b["error"].clone()),
+        Some(json!("unknown_device"))
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn disabled_device_is_forbidden(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let version = surf_rac_protocol::PROTOCOL_VERSION.to_string();
     let dev = app.new_device(1).await;
     sqlx::query("update devices set disabled = true")
         .execute(&app.pool)
@@ -186,7 +208,11 @@ async fn missing_unknown_or_disabled_device_is_unauthorized(pool: PgPool) {
         .await
         .err()
         .unwrap();
-    assert_eq!(refused.status, 401);
+    assert_eq!(refused.status, 403);
+    assert_eq!(
+        refused.body.as_ref().map(|b| b["error"].clone()),
+        Some(json!("device_disabled"))
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -340,6 +366,8 @@ async fn disabled_device_closes_socket(pool: PgPool) {
         .execute(&app.pool)
         .await
         .unwrap();
+    let err = recv_type(&mut a.ws, "error").await;
+    assert_eq!(err["code"], "device_disabled");
     expect_closed(&mut a.ws).await;
     send(&mut b.ws, json!({"type":"ping"})).await;
     assert_eq!(recv(&mut b.ws).await["type"], "pong");

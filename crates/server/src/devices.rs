@@ -169,22 +169,27 @@ pub async fn identity_key(db: &PgPool, device: DeviceId) -> Result<Option<[u8; 3
     Ok(key.and_then(|k| k.try_into().ok()))
 }
 
-/// Returns the identity key and name of `device`, if the device exists and is not disabled.
-pub async fn active_identity(
+/// Returns the identity key and name of `device` for a new connection.
+///
+/// Fails with [`DeviceError::NotFound`] when the device does not exist and
+/// with [`DeviceError::Disabled`] when it is disabled.
+pub async fn connect_identity(
     db: &PgPool,
     device: DeviceId,
-) -> Result<Option<DeviceIdentity>, sqlx::Error> {
-    let row: Option<(Vec<u8>, String)> =
-        sqlx::query_as("select public_key, name from devices where id = $1 and not disabled")
+) -> Result<DeviceIdentity, DeviceError> {
+    let row: Option<(Vec<u8>, String, bool)> =
+        sqlx::query_as("select public_key, name, disabled from devices where id = $1")
             .bind(i64::from(device.get()))
             .fetch_optional(db)
             .await?;
-    Ok(row.and_then(|(key, name)| {
-        Some(DeviceIdentity {
-            public_key: key.try_into().ok()?,
-            name,
-        })
-    }))
+    let (key, name, disabled) = row.ok_or(DeviceError::NotFound)?;
+    if disabled {
+        return Err(DeviceError::Disabled);
+    }
+    Ok(DeviceIdentity {
+        public_key: key.try_into().map_err(|_| DeviceError::BadSignature)?,
+        name,
+    })
 }
 
 /// Checks a connect challenge answer of `device`.

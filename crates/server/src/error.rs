@@ -71,6 +71,24 @@ impl ApiError {
         Self::new(StatusCode::NOT_FOUND, ErrorCode::NotFound, "not found")
     }
 
+    /// 404: the device ID is not registered with the server.
+    pub fn unknown_device() -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            ErrorCode::UnknownDevice,
+            "unknown device",
+        )
+    }
+
+    /// 403: the device was disabled by an administrator.
+    pub fn device_disabled() -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            ErrorCode::DeviceDisabled,
+            "device is disabled",
+        )
+    }
+
     /// 409: the request conflicts with existing state.
     pub fn conflict(message: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, ErrorCode::Conflict, message)

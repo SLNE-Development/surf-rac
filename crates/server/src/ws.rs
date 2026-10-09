@@ -4,8 +4,9 @@
 //! must answer it with an `authenticate` signed by the device's identity key.
 //! Only then does it register in the hub and receive `hello`. It then relays
 //! signaling until the client leaves, the hub closes it (replacement) or a
-//! periodic re-validation finds the device disabled or cannot reach the
-//! database several times in a row.
+//! periodic re-validation finds the device disabled (it is sent a
+//! `device_disabled` error first) or cannot reach the database several times
+//! in a row.
 
 use std::time::{Duration, Instant};
 
@@ -175,6 +176,10 @@ pub async fn run(state: AppState, socket: WebSocket, device: DeviceId, identity:
                     let verdict = check_active(&state, device).await;
                     if !revalidation.keep(verdict) {
                         tracing::info!(device_id = %device, "device no longer active, closing");
+                        if verdict == Some(false) {
+                            let reply = error(WsErrorCode::DeviceDisabled, "device is disabled");
+                            let _ = sink.send(frame(&reply)).await;
+                        }
                         let _ = sink.send(Message::Close(None)).await;
                         break;
                     }
@@ -252,7 +257,7 @@ async fn handshake(
                 "identity key is registered for another installation",
             )
         }
-        Err(DeviceError::Disabled) => error(WsErrorCode::Forbidden, "device is disabled"),
+        Err(DeviceError::Disabled) => error(WsErrorCode::DeviceDisabled, "device is disabled"),
         Err(DeviceError::Db(err)) => {
             tracing::warn!(error = %err, "challenge check failed, database unavailable");
             return false;

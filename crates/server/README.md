@@ -102,7 +102,9 @@ All endpoints are under `/v1`. The wire types are defined in the
 - `GET /presence/{id}`: online state of a device
 - `GET /ws`: WebSocket. Send `X-Device-Id` and `X-Protocol-Version` on the
   upgrade request; another or a missing version is a 426 `update_required`,
-  an unknown or disabled device a 401. The server then sends `challenge` with
+  a missing or malformed device ID a 401, an unknown one a 404 `unknown_device`
+  and a disabled one a 403 `device_disabled`. A device disabled while
+  connected receives an `error` with code `device_disabled` and is closed. The server then sends `challenge` with
   a random 32-byte nonce, and the device must answer within 10 seconds with
   `authenticate`: an Ed25519 signature over `surf-rac/challenge/v1` followed
   by the nonce, and its fingerprint hash. A wrong signature closes the socket

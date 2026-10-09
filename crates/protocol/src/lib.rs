@@ -284,6 +284,10 @@ pub enum ErrorCode {
     Forbidden,
     /// The resource does not exist.
     NotFound,
+    /// The device ID is not registered with the server.
+    UnknownDevice,
+    /// The device was disabled by an administrator.
+    DeviceDisabled,
     /// The request conflicts with existing state.
     Conflict,
     /// Too many requests from this client.
@@ -609,6 +613,8 @@ pub enum WsErrorCode {
     CloneDetected,
     /// A signature did not verify against the claimed identity key.
     BadSignature,
+    /// The device was disabled by an administrator.
+    DeviceDisabled,
 }
 
 #[cfg(test)]
@@ -917,5 +923,8 @@ mod tests {
         assert_eq!(serde_json::to_value(WsErrorCode::UpdateRequired).unwrap(), json!("update_required"));
         assert_eq!(serde_json::to_value(WsErrorCode::CloneDetected).unwrap(), json!("clone_detected"));
         assert_eq!(serde_json::to_value(WsErrorCode::BadSignature).unwrap(), json!("bad_signature"));
+        assert_eq!(serde_json::to_value(ErrorCode::UnknownDevice).unwrap(), json!("unknown_device"));
+        assert_eq!(serde_json::to_value(ErrorCode::DeviceDisabled).unwrap(), json!("device_disabled"));
+        assert_eq!(serde_json::to_value(WsErrorCode::DeviceDisabled).unwrap(), json!("device_disabled"));
     }
 }

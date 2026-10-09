@@ -26,14 +26,10 @@ pub(super) const CHECK: char = '\u{e070}';
 pub(super) const X: char = '\u{e1b2}';
 /// A plus sign.
 pub(super) const PLUS: char = '\u{e141}';
-/// A magnifying glass.
-pub(super) const SEARCH: char = '\u{e155}';
 /// Three horizontal dots.
 pub(super) const ELLIPSIS: char = '\u{e0ba}';
 /// A downward chevron.
 pub(super) const CHEVRON_DOWN: char = '\u{e071}';
-/// An arrow pointing right.
-pub(super) const ARROW_RIGHT: char = '\u{e04d}';
 /// Two circular arrows.
 pub(super) const REFRESH: char = '\u{e149}';
 /// An open eye.

@@ -103,8 +103,11 @@ impl ClientApp {
                                     .truncate(),
                                 );
                                 ui.label(
-                                    widgets::muted(ui, format!("Device {}", format_id(prompt.viewer)))
-                                        .size(13.0),
+                                    widgets::muted(
+                                        ui,
+                                        format!("Device {}", format_id(prompt.viewer)),
+                                    )
+                                    .size(13.0),
                                 );
                             });
                         });
@@ -278,7 +281,10 @@ impl ClientApp {
                         self.send(Command::DisconnectAll);
                         self.confirm_disconnect_all = false;
                     }
-                    if ui.add(widgets::btn(ui, Kind::Ghost, None, "Cancel")).clicked() {
+                    if ui
+                        .add(widgets::btn(ui, Kind::Ghost, None, "Cancel"))
+                        .clicked()
+                    {
                         self.confirm_disconnect_all = false;
                     }
                 });
@@ -325,7 +331,14 @@ impl ClientApp {
             self.send(Command::ViewerHangup(session));
         }
         state.focused = ui.input(|i| i.viewport().focused.unwrap_or(false));
-        egui::Panel::top("toolbar").show(ui, |ui| self.viewer_toolbar(ui, view));
+        let p = theme::palette(ui.ctx());
+        egui::Panel::top("toolbar")
+            .frame(
+                Frame::new()
+                    .fill(p.surface)
+                    .inner_margin(Margin::symmetric(12, 8)),
+            )
+            .show(ui, |ui| self.viewer_toolbar(ui, view));
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
             .show(ui, |ui| {
@@ -334,7 +347,7 @@ impl ClientApp {
                 let Some(frame) = frame else {
                     state.picture = None;
                     ui.centered_and_justified(|ui| {
-                        ui.colored_label(egui::Color32::LIGHT_GRAY, status_text(&view.status));
+                        ui.label(RichText::new(status_text(&view.status)).color(p.muted));
                     });
                     return;
                 };
@@ -379,13 +392,18 @@ impl ClientApp {
                     );
                 }
                 if !matches!(view.status, ViewerStatus::Connected) {
-                    ui.colored_label(egui::Color32::YELLOW, status_text(&view.status));
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(12.0);
+                        widgets::chip(ui, Tone::Warn, true, &status_text(&view.status));
+                    });
                 }
             });
         self.forward_pointer(ui, view, state);
     }
 
-    /// Draws the viewer toolbar: status, monitor, quality, follow, clipboard, disconnect.
+    /// Draws the viewer toolbar: host name and control level, screen picker,
+    /// quality, follow and clipboard toggles, and Disconnect.
     fn viewer_toolbar(&mut self, ui: &mut egui::Ui, view: &ViewerView) {
         let session = view.session;
         let send = |app: &ClientApp, control: Control| {
@@ -395,13 +413,19 @@ impl ClientApp {
             })
         };
         ui.horizontal(|ui| {
+            ui.set_min_height(34.0);
+            ui.add_space(4.0);
+            ui.label(RichText::new(&view.name).font(theme::semibold(14.0)));
+            widgets::chip(ui, input_tone(view), true, input_text(view));
+            ui.separator();
             if let Some(screen) = &view.screen {
                 let selected = screen.monitors.iter().find(|m| m.index == screen.selected);
                 let label = selected
                     .map(|m| monitor_label(m.index, &m.name))
                     .unwrap_or_default();
                 egui::ComboBox::from_id_salt("monitor")
-                    .selected_text(label)
+                    .selected_text(RichText::new(label).font(theme::semibold(13.0)))
+                    .height(240.0)
                     .show_ui(ui, |ui| {
                         for m in &screen.monitors {
                             let text = monitor_label(m.index, &m.name);
@@ -413,42 +437,55 @@ impl ClientApp {
                             }
                         }
                     });
-                egui::ComboBox::from_id_salt("quality")
-                    .selected_text(quality_label(screen.mode))
-                    .show_ui(ui, |ui| {
-                        for mode in [
-                            QualityMode::Quality,
-                            QualityMode::Balanced,
-                            QualityMode::Speed,
-                        ] {
-                            if ui
-                                .selectable_label(screen.mode == mode, quality_label(mode))
-                                .clicked()
-                            {
-                                send(self, Control::SetQuality { mode });
-                            }
-                        }
-                    });
+                let mut mode = screen.mode;
+                let items = [
+                    (QualityMode::Quality, quality_label(QualityMode::Quality)),
+                    (QualityMode::Balanced, quality_label(QualityMode::Balanced)),
+                    (QualityMode::Speed, quality_label(QualityMode::Speed)),
+                ];
+                if widgets::segmented(ui, &mut mode, &items) {
+                    send(self, Control::SetQuality { mode });
+                }
             }
+            ui.separator();
             let mut follow = view.input.follow;
-            if ui.checkbox(&mut follow, "Follow").changed() {
+            if widgets::toggle_icon(
+                ui,
+                &mut follow,
+                icons::CROSSHAIR,
+                "Follow the host's active screen",
+            )
+            .changed()
+            {
                 send(self, Control::SetFollow { on: follow });
             }
             let mut clipboard = view.clipboard;
-            if ui.checkbox(&mut clipboard, "Clipboard").changed() {
+            if widgets::toggle_icon(ui, &mut clipboard, icons::CLIPBOARD, "Sync clipboard")
+                .changed()
+            {
                 self.send(Command::ViewerClipboard {
                     session,
                     on: clipboard,
                 });
             }
-            ui.separator();
-            ui.label(input_text(view));
-            if view.offer_forget && ui.button("Forget saved password").clicked() {
-                self.send(Command::ForgetPassword(view.host));
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Disconnect").clicked() {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add(widgets::btn(
+                        ui,
+                        Kind::Danger,
+                        Some(icons::POWER),
+                        "Disconnect",
+                    ))
+                    .clicked()
+                {
                     self.send(Command::ViewerHangup(session));
+                }
+                if view.offer_forget
+                    && ui
+                        .add(widgets::btn(ui, Kind::Ghost, None, "Forget saved password"))
+                        .clicked()
+                {
+                    self.send(Command::ForgetPassword(view.host));
                 }
             });
         });
@@ -584,6 +621,22 @@ fn input_text(view: &ViewerView) -> &'static str {
     }
 }
 
+/// Returns the chip tone for what the viewer may do: warning while the host
+/// is using the computer, positive for full control, accent for partial
+/// control and neutral for view only.
+fn input_tone(view: &ViewerView) -> Tone {
+    let input = view.input;
+    if input.locked {
+        Tone::Warn
+    } else if input.pointer && input.keyboard {
+        Tone::Ok
+    } else if input.pointer || input.keyboard {
+        Tone::Accent
+    } else {
+        Tone::Neutral
+    }
+}
+
 /// Returns the text shown for a session's status.
 fn status_text(status: &ViewerStatus) -> String {
     match status {
@@ -629,8 +682,14 @@ mod tests {
     #[test]
     fn every_password_note_but_none_gets_a_callout() {
         assert!(note_callout(PromptNote::None).is_none());
-        assert_eq!(note_callout(PromptNote::CorrectPassword).unwrap().0, Tone::Ok);
-        assert_eq!(note_callout(PromptNote::WrongPassword).unwrap().0, Tone::Warn);
+        assert_eq!(
+            note_callout(PromptNote::CorrectPassword).unwrap().0,
+            Tone::Ok
+        );
+        assert_eq!(
+            note_callout(PromptNote::WrongPassword).unwrap().0,
+            Tone::Warn
+        );
         assert_eq!(note_callout(PromptNote::LockedOut).unwrap().0, Tone::Warn);
     }
 
@@ -648,6 +707,34 @@ mod tests {
         assert!(!pointer_blocked(Some(egui::Order::Background)));
         assert!(pointer_blocked(Some(egui::Order::Foreground)));
         assert!(pointer_blocked(Some(egui::Order::Tooltip)));
+    }
+
+    #[test]
+    fn input_tone_follows_the_control_level() {
+        use std::sync::{Arc, Mutex};
+        use surf_rac_protocol::DeviceId;
+        use surf_rac_protocol::data::InputState;
+
+        let view = |pointer, keyboard, locked| ViewerView {
+            session: 1,
+            host: DeviceId::new(123_456_789).unwrap(),
+            name: "host".into(),
+            status: ViewerStatus::Connected,
+            frame: Arc::new(Mutex::new(None)),
+            screen: None,
+            input: InputState {
+                pointer,
+                keyboard,
+                locked,
+                follow: false,
+            },
+            clipboard: false,
+            offer_forget: false,
+        };
+        assert_eq!(input_tone(&view(true, true, true)), Tone::Warn);
+        assert_eq!(input_tone(&view(true, true, false)), Tone::Ok);
+        assert_eq!(input_tone(&view(true, false, false)), Tone::Accent);
+        assert_eq!(input_tone(&view(false, false, false)), Tone::Neutral);
     }
 
     #[test]

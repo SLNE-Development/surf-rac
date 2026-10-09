@@ -27,6 +27,18 @@ pub const MAX_WS_MESSAGE_BYTES: usize = 65_536;
 /// Longest sealed unattended password, in base64 characters, a session password message may carry.
 pub const MAX_SEALED_PASSWORD_LEN: usize = 1024;
 
+/// Domain tag prefixed to the nonce of a signed connect challenge.
+///
+/// A device answers the server's `challenge` with an Ed25519 signature over
+/// this tag followed by the 32 nonce bytes.
+pub const CHALLENGE_DOMAIN: &[u8] = b"surf-rac/challenge/v1";
+
+/// Domain tag prefixed to the role, session ID and key of a signed per-session key.
+///
+/// A peer signs this tag, its role tag (`viewer` or `host`), the session ID and
+/// the 32 bytes of its per-session X25519 public key with its identity key.
+pub const SESSION_DOMAIN: &[u8] = b"surf-rac/session/v1";
+
 /// Smallest valid device ID.
 const DEVICE_ID_MIN: u32 = 100_000_000;
 
@@ -691,6 +703,12 @@ mod tests {
     fn protocol_version_is_two() {
         assert_eq!(PROTOCOL_VERSION, 2);
         assert_eq!(HEADER_PROTOCOL_VERSION, "x-protocol-version");
+    }
+
+    #[test]
+    fn domain_tags_are_fixed() {
+        assert_eq!(CHALLENGE_DOMAIN, b"surf-rac/challenge/v1");
+        assert_eq!(SESSION_DOMAIN, b"surf-rac/session/v1");
     }
 
     #[test]

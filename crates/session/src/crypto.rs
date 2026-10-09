@@ -24,14 +24,8 @@ use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
-use surf_rac_protocol::DeviceId;
+use surf_rac_protocol::{CHALLENGE_DOMAIN, DeviceId, SESSION_DOMAIN};
 use x25519_dalek::StaticSecret;
-
-/// Domain tag prefixed to the nonce of a signed connect challenge.
-pub const CHALLENGE_DOMAIN: &[u8] = b"surf-rac/challenge/v1";
-
-/// Domain tag prefixed to the role, session ID and key of a signed per-session key.
-pub const SESSION_DOMAIN: &[u8] = b"surf-rac/session/v1";
 
 /// HKDF info prefix of session keys.
 const KDF_INFO: &[u8] = b"surf-rac session v1";

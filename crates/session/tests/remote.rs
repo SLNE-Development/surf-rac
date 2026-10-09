@@ -1,14 +1,14 @@
 //! Smoke test against a deployed signaling server and its LiveKit.
 //!
-//! Ignored by default. Run it with an existing account:
+//! Ignored by default. Run it with:
 //!
 //! ```sh
-//! SURF_RAC_SERVER=https://rac.slne.dev SURF_RAC_USERNAME=... SURF_RAC_PASSWORD=... \
+//! SURF_RAC_SERVER=https://rac.slne.dev \
 //!   cargo test -p surf-rac-session --test remote -- --ignored --nocapture
 //! ```
 //!
-//! It registers two throwaway devices on the account, runs a host and a viewer
-//! session between them through the deployed server, and deletes the devices.
+//! It registers two throwaway devices with fresh identity keys and runs a host
+//! and a viewer session between them through the deployed server.
 //!
 //! For a test between two machines, run `remote_host` on one machine; it prints
 //! its device ID. Then run `remote_viewer` on the other with
@@ -23,72 +23,42 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::{collect_stamps, feed_frames, host_event, stamp, viewer_event};
-use rand::Rng;
-use serde_json::{Value, json};
 use surf_rac_protocol::DeviceId;
 use surf_rac_protocol::data::DataMessage;
 use surf_rac_session::host::{HostEvent, HostSession};
 use surf_rac_session::signaling::SignalingClient;
 use surf_rac_session::viewer::{ViewerEvent, ViewerSession};
-use surf_rac_session::{DeviceKeys, KnownKeys, SessionConfig};
+use surf_rac_session::{IdentityKey, KnownKeys, SessionConfig};
 
 /// A device registered on the deployed server for this test.
 struct RemoteDevice {
     /// Device ID.
     id: DeviceId,
-    /// Device secret.
-    secret: String,
+    /// The device's identity key.
+    identity: Arc<IdentityKey>,
+    /// Lowercase hex SHA-256 of the device's hardware fingerprint.
+    fingerprint: String,
 }
 
-/// Registers a throwaway device named `name` for `token` on `server`.
-async fn register_device(
-    client: &reqwest::Client,
-    server: &str,
-    token: &str,
-    name: &str,
-) -> RemoteDevice {
-    let fingerprint: String = (0..64)
-        .map(|_| char::from_digit(rand::thread_rng().gen_range(0..16), 16).unwrap())
-        .collect();
-    let res = client
-        .post(format!("{server}/v1/devices"))
-        .bearer_auth(token)
-        .json(&json!({"fingerprint_hash": fingerprint, "name": name}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 200, "register {name}");
-    let body: Value = res.json().await.unwrap();
-    RemoteDevice {
-        id: body["device_id"].as_str().unwrap().parse().unwrap(),
-        secret: body["device_secret"].as_str().unwrap().to_owned(),
+impl RemoteDevice {
+    /// Registers a throwaway device named `name` with a fresh identity key on `server`.
+    async fn register(client: &reqwest::Client, server: &str, name: &str) -> Self {
+        let identity = Arc::new(IdentityKey::generate());
+        let fingerprint = common::random_fingerprint();
+        let id = common::register_device(client, server, None, &identity, &fingerprint, name).await;
+        Self {
+            id,
+            identity,
+            fingerprint,
+        }
     }
-}
 
-/// Deletes device `id` of `token` on `server`.
-async fn delete_device(client: &reqwest::Client, server: &str, token: &str, id: DeviceId) {
-    let res = client
-        .delete(format!("{server}/v1/devices/{id}"))
-        .bearer_auth(token)
-        .send()
-        .await
-        .unwrap();
-    println!("deleted device {id}: HTTP {}", res.status());
-}
-
-/// Logs in to `server` with the account from the environment and returns the session token.
-async fn login(client: &reqwest::Client, server: &str) -> String {
-    let res = client
-        .post(format!("{server}/v1/login"))
-        .json(&json!({"username": common::env("SURF_RAC_USERNAME"), "password": common::env("SURF_RAC_PASSWORD")}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 200, "login");
-    res.json::<Value>().await.unwrap()["token"]
-        .as_str()
-        .unwrap()
-        .to_owned()
+    /// Connects this device to the signaling server at `ws`.
+    async fn connect(&self, ws: &str) -> SignalingClient {
+        SignalingClient::connect(ws, self.id, &self.identity, &self.fingerprint)
+            .await
+            .expect("signaling connect")
+    }
 }
 
 /// Returns the WebSocket base URL of the HTTP base `server`.
@@ -99,7 +69,7 @@ fn ws_url(server: &str) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs a deployed server and an account; run on the first machine"]
+#[ignore = "needs a deployed server; run on the first machine"]
 async fn remote_host() {
     let server = common::env("SURF_RAC_SERVER");
     let duration = std::env::var("SURF_RAC_DURATION")
@@ -107,18 +77,15 @@ async fn remote_host() {
         .and_then(|d| d.parse().ok())
         .unwrap_or(300);
     let client = reqwest::Client::new();
-    let token = login(&client, &server).await;
-    let dev = register_device(&client, &server, &token, "two-machine-host").await;
+    let dev = RemoteDevice::register(&client, &server, "two-machine-host").await;
     println!(
         "HOST DEVICE ID: {}  (set SURF_RAC_HOST_ID to this on the viewer machine)",
         dev.id
     );
-    let signaling = SignalingClient::connect(&ws_url(&server), &token, dev.id, &dev.secret)
-        .await
-        .expect("host signaling");
+    let signaling = dev.connect(&ws_url(&server)).await;
     let (host, mut events) = HostSession::start(
         signaling,
-        Arc::new(DeviceKeys::generate()),
+        Arc::clone(&dev.identity),
         Arc::new(Mutex::new(KnownKeys::default())),
         1280,
         720,
@@ -162,7 +129,6 @@ async fn remote_host() {
     let _ = tokio::time::timeout(Duration::from_secs(duration), run).await;
     feed.abort();
     host.close().await;
-    delete_device(&client, &server, &token, dev.id).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -173,16 +139,13 @@ async fn remote_viewer() {
         .parse()
         .expect("SURF_RAC_HOST_ID");
     let client = reqwest::Client::new();
-    let token = login(&client, &server).await;
-    let dev = register_device(&client, &server, &token, "two-machine-viewer").await;
+    let dev = RemoteDevice::register(&client, &server, "two-machine-viewer").await;
     let outcome = async {
-        let signaling = SignalingClient::connect(&ws_url(&server), &token, dev.id, &dev.secret)
-            .await
-            .expect("viewer signaling");
+        let signaling = dev.connect(&ws_url(&server)).await;
         let started = std::time::Instant::now();
         let (viewer, mut events) = ViewerSession::request(
             signaling,
-            Arc::new(DeviceKeys::generate()),
+            Arc::clone(&dev.identity),
             Arc::new(Mutex::new(KnownKeys::default())),
             host,
             SessionConfig::default(),
@@ -214,31 +177,24 @@ async fn remote_viewer() {
         frames.len()
     }
     .await;
-    delete_device(&client, &server, &token, dev.id).await;
     assert!(outcome >= 100, "only {outcome} frames in 10 s");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs a deployed server and an account"]
+#[ignore = "needs a deployed server"]
 async fn session_through_deployed_server() {
     let server = common::env("SURF_RAC_SERVER");
     let client = reqwest::Client::new();
-    let token = login(&client, &server).await;
-
-    let host_dev = register_device(&client, &server, &token, "smoke-host").await;
-    let viewer_dev = register_device(&client, &server, &token, "smoke-viewer").await;
+    let host_dev = RemoteDevice::register(&client, &server, "smoke-host").await;
+    let viewer_dev = RemoteDevice::register(&client, &server, "smoke-viewer").await;
     let ws = ws_url(&server);
 
     let outcome = tokio::time::timeout(Duration::from_secs(120), async {
-        let host_sig = SignalingClient::connect(&ws, &token, host_dev.id, &host_dev.secret)
-            .await
-            .expect("host signaling");
-        let viewer_sig = SignalingClient::connect(&ws, &token, viewer_dev.id, &viewer_dev.secret)
-            .await
-            .expect("viewer signaling");
+        let host_sig = host_dev.connect(&ws).await;
+        let viewer_sig = viewer_dev.connect(&ws).await;
         let (host, mut host_events) = HostSession::start(
             host_sig,
-            Arc::new(DeviceKeys::generate()),
+            Arc::clone(&host_dev.identity),
             Arc::new(Mutex::new(KnownKeys::default())),
             640,
             480,
@@ -248,10 +204,11 @@ async fn session_through_deployed_server() {
         .expect("host start");
         let feed = feed_frames(&host);
         let host_id = host_dev.id;
+        let viewer_identity = Arc::clone(&viewer_dev.identity);
         let pending = tokio::spawn(async move {
             ViewerSession::request(
                 viewer_sig,
-                Arc::new(DeviceKeys::generate()),
+                viewer_identity,
                 Arc::new(Mutex::new(KnownKeys::default())),
                 host_id,
                 SessionConfig::default(),
@@ -311,9 +268,6 @@ async fn session_through_deployed_server() {
         (delays.len(), median, stamp::now_micros())
     })
     .await;
-
-    delete_device(&client, &server, &token, host_dev.id).await;
-    delete_device(&client, &server, &token, viewer_dev.id).await;
 
     let (frames, median, _) = outcome.expect("session did not complete within 120 s");
     let median = median.expect("no frames received");

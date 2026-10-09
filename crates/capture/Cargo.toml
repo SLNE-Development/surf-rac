@@ -25,6 +25,7 @@ test-source = []
 surf-rac-capture = { path = ".", features = ["test-source"] }
 surf-rac-server.workspace = true
 base64.workspace = true
+ed25519-dalek.workspace = true
 chrono.workspace = true
 hmac.workspace = true
 png = "0.17"

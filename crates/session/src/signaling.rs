@@ -12,7 +12,7 @@ use base64::engine::general_purpose::STANDARD;
 use futures_util::{SinkExt, StreamExt};
 use surf_rac_protocol::{
     ClientMessage, DeviceId, HEADER_DEVICE_ID, HEADER_PROTOCOL_VERSION, PROTOCOL_VERSION,
-    ServerMessage,
+    ServerMessage, WsErrorCode,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message;
@@ -32,18 +32,68 @@ const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// How long `connect` waits for the server's `hello`.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Why the signaling connection failed.
+/// Why the signaling connection failed or ended.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SignalingError {
     /// The connection could not be established.
     #[error("signaling connection failed: {0}")]
     Connect(String),
-    /// The server refused the upgrade with this HTTP status.
+    /// The server does not support this client's protocol version; the client must be updated.
+    #[error("the server requires a newer version of this client")]
+    UpdateRequired,
+    /// The server does not know this device ID.
+    #[error("the device is not registered with the server")]
+    UnknownDevice,
+    /// An administrator disabled this device, before the connect or while it was connected.
+    #[error("the device was disabled by an administrator")]
+    DeviceDisabled,
+    /// The identity key is registered for another installation with a different fingerprint.
+    #[error("the device identity is registered for another installation")]
+    CloneDetected,
+    /// The challenge signature did not verify against the device's registered identity key.
+    #[error("the server did not accept the identity key's signature")]
+    BadSignature,
+    /// The server refused the connection because of too many attempts.
+    #[error("too many connection attempts")]
+    RateLimited,
+    /// The server refused the upgrade with this HTTP status, which has no variant of its own.
     #[error("signaling server refused the connection with status {0}")]
     Rejected(u16),
     /// The connection is closed.
     #[error("signaling connection closed")]
     Closed,
+}
+
+impl SignalingError {
+    /// Returns the error for an upgrade the server refused with HTTP `status`.
+    ///
+    /// 426 is [`UpdateRequired`](Self::UpdateRequired), 404
+    /// [`UnknownDevice`](Self::UnknownDevice), 403
+    /// [`DeviceDisabled`](Self::DeviceDisabled) and 429
+    /// [`RateLimited`](Self::RateLimited); any other status is
+    /// [`Rejected`](Self::Rejected).
+    fn from_status(status: u16) -> Self {
+        match status {
+            426 => Self::UpdateRequired,
+            404 => Self::UnknownDevice,
+            403 => Self::DeviceDisabled,
+            429 => Self::RateLimited,
+            other => Self::Rejected(other),
+        }
+    }
+
+    /// Returns the error for a WebSocket error frame with `code`, if the code
+    /// refuses or ends the connection.
+    fn from_ws_code(code: WsErrorCode) -> Option<Self> {
+        match code {
+            WsErrorCode::UpdateRequired => Some(Self::UpdateRequired),
+            WsErrorCode::DeviceDisabled => Some(Self::DeviceDisabled),
+            WsErrorCode::CloneDetected => Some(Self::CloneDetected),
+            WsErrorCode::BadSignature => Some(Self::BadSignature),
+            WsErrorCode::RateLimited => Some(Self::RateLimited),
+            WsErrorCode::TargetOffline | WsErrorCode::BadMessage | WsErrorCode::Forbidden => None,
+        }
+    }
 }
 
 /// A device's connection to the signaling server; cheap to clone.
@@ -61,12 +111,19 @@ struct Inner {
     out: mpsc::Sender<ClientMessage>,
     /// Fan-out of incoming messages; `None` once the connection ended.
     events: Mutex<Option<broadcast::Sender<ServerMessage>>>,
+    /// Why the connection ended; `None` while it is open.
+    end: Mutex<Option<SignalingError>>,
 }
 
 impl Inner {
     /// Locks the event sender slot, recovering from a poisoned lock.
     fn events(&self) -> std::sync::MutexGuard<'_, Option<broadcast::Sender<ServerMessage>>> {
         self.events.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Locks the end reason slot, recovering from a poisoned lock.
+    fn end(&self) -> std::sync::MutexGuard<'_, Option<SignalingError>> {
+        self.end.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -76,8 +133,15 @@ impl SignalingClient {
     ///
     /// `url` is the server base as `ws://` or `wss://`, e.g. `wss://rac.slne.dev`.
     /// `fingerprint_hash` is the lowercase hex SHA-256 of the device's hardware
-    /// fingerprint. Fails with [`SignalingError::Connect`] when the server sends
-    /// an error or no `hello` arrives within the handshake timeout.
+    /// fingerprint.
+    ///
+    /// A refused upgrade fails with the variant of its HTTP status (see
+    /// [`SignalingError`]), and a refused challenge answer with
+    /// [`BadSignature`](SignalingError::BadSignature),
+    /// [`CloneDetected`](SignalingError::CloneDetected) or
+    /// [`DeviceDisabled`](SignalingError::DeviceDisabled). Fails with
+    /// [`SignalingError::Connect`] when the server cannot be reached, sends
+    /// another error or no `hello` arrives within the handshake timeout.
     pub async fn connect(
         url: &str,
         device_id: DeviceId,
@@ -100,7 +164,7 @@ impl SignalingClient {
         let (mut ws, _) = match tokio_tungstenite::connect_async(request).await {
             Ok(ok) => ok,
             Err(tokio_tungstenite::tungstenite::Error::Http(res)) => {
-                return Err(SignalingError::Rejected(res.status().as_u16()));
+                return Err(SignalingError::from_status(res.status().as_u16()));
             }
             Err(e) => return Err(SignalingError::Connect(e.to_string())),
         };
@@ -117,6 +181,7 @@ impl SignalingClient {
             device_id,
             out,
             events: Mutex::new(Some(events)),
+            end: Mutex::new(None),
         });
         tokio::spawn(run(ws, out_rx, Arc::clone(&inner)));
         tracing::info!(%device_id, "signaling connected");
@@ -129,12 +194,23 @@ impl SignalingClient {
     }
 
     /// Queues `msg` for the server.
+    ///
+    /// Fails with the reason the connection ended once it has ended (see
+    /// [`SignalingClient::end_reason`]).
     pub async fn send(&self, msg: ClientMessage) -> Result<(), SignalingError> {
-        self.inner
-            .out
-            .send(msg)
-            .await
-            .map_err(|_| SignalingError::Closed)
+        if self.inner.out.send(msg).await.is_err() {
+            return Err(self.end_reason().unwrap_or(SignalingError::Closed));
+        }
+        Ok(())
+    }
+
+    /// Returns why the connection ended, or `None` while it is open.
+    ///
+    /// A connection the server closed after disabling the device ended with
+    /// [`SignalingError::DeviceDisabled`]; any other end is
+    /// [`SignalingError::Closed`].
+    pub fn end_reason(&self) -> Option<SignalingError> {
+        self.inner.end().clone()
     }
 
     /// Returns a stream of the messages the server sends from now on.
@@ -173,9 +249,10 @@ type Ws =
 /// Answers the server's challenge on `ws` and waits for its `hello` for `device_id`.
 ///
 /// Signs the challenge nonce with `identity` and sends it with
-/// `fingerprint_hash`. Fails with [`SignalingError::Connect`] when the server
-/// sends an error, an invalid nonce or a `hello` for another device, or closes
-/// the connection.
+/// `fingerprint_hash`. An error frame that refuses the connection fails with
+/// its variant (see [`SignalingError::from_ws_code`]). Fails with
+/// [`SignalingError::Connect`] when the server sends another error, an invalid
+/// nonce or a `hello` for another device, or closes the connection.
 async fn handshake(
     ws: &mut Ws,
     device_id: DeviceId,
@@ -204,9 +281,11 @@ async fn handshake(
             }
             Ok(ServerMessage::Hello { device_id: id }) if id == device_id => return Ok(()),
             Ok(ServerMessage::Error { code, message }) => {
-                return Err(SignalingError::Connect(format!(
-                    "server refused the connection ({code:?}): {message}"
-                )));
+                return Err(SignalingError::from_ws_code(code).unwrap_or_else(|| {
+                    SignalingError::Connect(format!(
+                        "server refused the connection ({code:?}): {message}"
+                    ))
+                }));
             }
             _ => return Err(SignalingError::Connect("no hello from server".into())),
         }
@@ -214,11 +293,16 @@ async fn handshake(
     Err(SignalingError::Connect("no hello from server".into()))
 }
 
-/// Runs the connection until either side closes it, then marks it closed.
+/// Runs the connection until either side closes it, then records why it ended.
+///
+/// The end reason is [`SignalingError::DeviceDisabled`] when the server sent a
+/// `device_disabled` error before closing, and [`SignalingError::Closed`]
+/// otherwise.
 async fn run(ws: Ws, mut out_rx: mpsc::Receiver<ClientMessage>, inner: Arc<Inner>) {
     let (mut sink, mut stream) = ws.split();
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.tick().await;
+    let mut end = SignalingError::Closed;
     loop {
         tokio::select! {
             out = out_rx.recv() => {
@@ -231,6 +315,10 @@ async fn run(ws: Ws, mut out_rx: mpsc::Receiver<ClientMessage>, inner: Arc<Inner
             incoming = stream.next() => match incoming {
                 Some(Ok(Message::Text(text))) => match serde_json::from_str::<ServerMessage>(text.as_str()) {
                     Ok(msg) => {
+                        if let ServerMessage::Error { code: WsErrorCode::DeviceDisabled, .. } = msg {
+                            tracing::warn!(device_id = %inner.device_id, "device disabled by the server");
+                            end = SignalingError::DeviceDisabled;
+                        }
                         if let Some(tx) = inner.events().as_ref() {
                             let _ = tx.send(msg);
                         }
@@ -248,6 +336,7 @@ async fn run(ws: Ws, mut out_rx: mpsc::Receiver<ClientMessage>, inner: Arc<Inner
             }
         }
     }
+    *inner.end() = Some(end);
     inner.events().take();
     out_rx.close();
     tracing::info!(device_id = %inner.device_id, "signaling disconnected");
@@ -256,6 +345,48 @@ async fn run(ws: Ws, mut out_rx: mpsc::Receiver<ClientMessage>, inner: Arc<Inner
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refused_upgrades_map_to_typed_errors() {
+        assert_eq!(
+            SignalingError::from_status(426),
+            SignalingError::UpdateRequired
+        );
+        assert_eq!(
+            SignalingError::from_status(404),
+            SignalingError::UnknownDevice
+        );
+        assert_eq!(
+            SignalingError::from_status(403),
+            SignalingError::DeviceDisabled
+        );
+        assert_eq!(
+            SignalingError::from_status(429),
+            SignalingError::RateLimited
+        );
+        assert_eq!(
+            SignalingError::from_status(401),
+            SignalingError::Rejected(401)
+        );
+    }
+
+    #[test]
+    fn handshake_error_frames_map_to_typed_errors() {
+        use WsErrorCode as C;
+        let cases = [
+            (C::UpdateRequired, Some(SignalingError::UpdateRequired)),
+            (C::DeviceDisabled, Some(SignalingError::DeviceDisabled)),
+            (C::CloneDetected, Some(SignalingError::CloneDetected)),
+            (C::BadSignature, Some(SignalingError::BadSignature)),
+            (C::RateLimited, Some(SignalingError::RateLimited)),
+            (C::BadMessage, None),
+            (C::Forbidden, None),
+            (C::TargetOffline, None),
+        ];
+        for (code, expected) in cases {
+            assert_eq!(SignalingError::from_ws_code(code), expected, "{code:?}");
+        }
+    }
 
     #[tokio::test]
     async fn lagging_subscriber_keeps_receiving() {

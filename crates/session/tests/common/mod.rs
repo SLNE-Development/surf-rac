@@ -1,5 +1,5 @@
 //! Shared helpers for the session integration tests: an in-process signaling
-//! server, registered devices and LiveKit tokens.
+//! server, devices registered by identity key and LiveKit tokens.
 
 #![allow(dead_code)]
 
@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use ed25519_dalek::{Signer, SigningKey};
 use hmac::{Hmac, Mac};
 use serde_json::{Value, json};
 use sha2::Sha256;
@@ -18,9 +19,9 @@ use surf_rac_protocol::DeviceId;
 use surf_rac_server::config::Config;
 use surf_rac_server::state::AppState;
 use surf_rac_session::host::{HostEvent, HostSession};
-use surf_rac_session::signaling::SignalingClient;
-use surf_rac_session::viewer::{RequestError, ViewerEvent, ViewerSession};
-use surf_rac_session::{DeviceKeys, KnownKeys, SessionConfig};
+use surf_rac_session::signaling::{SignalingClient, SignalingError};
+use surf_rac_session::viewer::{RequestError, RequestOptions, ViewerEvent, ViewerSession};
+use surf_rac_session::{IdentityKey, KnownKeys, SessionConfig};
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 
@@ -64,7 +65,7 @@ pub async fn start_host(
 ) -> (HostSession, Receiver<HostEvent>) {
     HostSession::start(
         device.signaling.clone(),
-        Arc::clone(&device.keys),
+        Arc::clone(&device.identity),
         Arc::clone(&device.known),
         640,
         480,
@@ -80,12 +81,24 @@ pub fn request(
     host: DeviceId,
     config: SessionConfig,
 ) -> JoinHandle<Result<(ViewerSession, Receiver<ViewerEvent>), RequestError>> {
-    let (signaling, keys, known) = (
+    request_with(viewer, host, RequestOptions::default(), config)
+}
+
+/// Starts a viewer request from `viewer` to `host` with `options` in the background.
+pub fn request_with(
+    viewer: &TestDevice,
+    host: DeviceId,
+    options: RequestOptions,
+    config: SessionConfig,
+) -> JoinHandle<Result<(ViewerSession, Receiver<ViewerEvent>), RequestError>> {
+    let (signaling, identity, known) = (
         viewer.signaling.clone(),
-        Arc::clone(&viewer.keys),
+        Arc::clone(&viewer.identity),
         Arc::clone(&viewer.known),
     );
-    tokio::spawn(async move { ViewerSession::request(signaling, keys, known, host, config).await })
+    tokio::spawn(async move {
+        ViewerSession::request_with(signaling, identity, known, host, options, config).await
+    })
 }
 
 /// Waits up to `wait` for a host event matching `pred`, discarding others.
@@ -179,26 +192,100 @@ pub struct TestEnv {
     pub http: String,
     /// WebSocket base URL, e.g. `ws://127.0.0.1:1234`.
     pub ws: String,
-    /// HTTP client for account and device setup.
+    /// HTTP client for device setup.
     pub client: reqwest::Client,
     /// Pool of this test's database.
     pub pool: PgPool,
+}
+
+/// A registered device that is not connected.
+pub struct Registered {
+    /// Device ID.
+    pub id: DeviceId,
+    /// The device's identity key.
+    pub identity: Arc<IdentityKey>,
+    /// Lowercase hex SHA-256 of the device's hardware fingerprint.
+    pub fingerprint: String,
 }
 
 /// A registered, connected device.
 pub struct TestDevice {
     /// Device ID.
     pub id: DeviceId,
-    /// Session token of the owning account.
-    pub token: String,
-    /// Device secret.
-    pub secret: String,
+    /// The device's name.
+    pub name: String,
+    /// The device's identity key.
+    pub identity: Arc<IdentityKey>,
+    /// Lowercase hex SHA-256 of the device's hardware fingerprint.
+    pub fingerprint: String,
     /// Open signaling connection.
     pub signaling: SignalingClient,
-    /// The device's key pair.
-    pub keys: Arc<DeviceKeys>,
     /// The device's pinned peer keys.
     pub known: Arc<Mutex<KnownKeys>>,
+}
+
+/// Returns the configuration of a test server that hands out `livekit_url`.
+///
+/// The registration and per-target session request limits are high enough
+/// that no test hits them by accident.
+pub fn test_config(livekit_url: &str) -> Config {
+    Config {
+        database_url: String::new(),
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        turn_secret: "test-turn-secret-0123".into(),
+        turn_urls: vec!["turn:turn.example:3478".into()],
+        turn_ttl_secs: 3600,
+        livekit_url: livekit_url.into(),
+        livekit_api_key: env("LIVEKIT_API_KEY"),
+        livekit_api_secret: env("LIVEKIT_API_SECRET"),
+        trust_forwarded_for: true,
+        log_json: false,
+        register_per_hour: 1000,
+        session_requests_per_minute: 1000,
+    }
+}
+
+/// Registers a device for `identity` with fingerprint `fingerprint` and name
+/// `name` on the server at `http` and returns its ID.
+///
+/// The request is signed by `identity`; with `ip` set it claims that client
+/// address in `x-forwarded-for`.
+pub async fn register_device(
+    client: &reqwest::Client,
+    http: &str,
+    ip: Option<&str>,
+    identity: &IdentityKey,
+    fingerprint: &str,
+    name: &str,
+) -> DeviceId {
+    let public = identity.public().to_bytes();
+    let message = surf_rac_protocol::register_message(&public, fingerprint, name);
+    let signature = SigningKey::from_bytes(&identity.to_bytes()).sign(&message);
+    let mut req = client.post(format!("{http}/v1/devices"));
+    if let Some(ip) = ip {
+        req = req.header("x-forwarded-for", ip);
+    }
+    let res = req
+        .json(&json!({
+            "public_key": STANDARD.encode(public),
+            "fingerprint_hash": fingerprint,
+            "name": name,
+            "signature": STANDARD.encode(signature.to_bytes()),
+            "protocol_version": surf_rac_protocol::PROTOCOL_VERSION,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "register {name}");
+    let body: Value = res.json().await.unwrap();
+    body["device_id"].as_str().unwrap().parse().unwrap()
+}
+
+/// Returns a random 64-character lowercase hex fingerprint hash.
+pub fn random_fingerprint() -> String {
+    let mut bytes = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl TestEnv {
@@ -209,19 +296,17 @@ impl TestEnv {
 
     /// Starts a server that hands out `livekit_url` to clients.
     pub async fn start_with_livekit(pool: PgPool, livekit_url: &str) -> TestEnv {
-        let config = Config {
-            database_url: String::new(),
-            bind_addr: "127.0.0.1:0".parse().unwrap(),
-            turn_secret: "test-turn-secret-0123".into(),
-            turn_urls: vec!["turn:turn.example:3478".into()],
-            turn_ttl_secs: 3600,
-            livekit_url: livekit_url.into(),
-            livekit_api_key: env("LIVEKIT_API_KEY"),
-            livekit_api_secret: env("LIVEKIT_API_SECRET"),
-            trust_forwarded_for: true,
-            log_json: false,
-        };
-        let state = AppState::new(pool.clone(), Arc::new(config));
+        Self::start_with(pool, livekit_url, |_| {}).await
+    }
+
+    /// Starts a server that hands out `livekit_url`, letting `adjust` change its state first.
+    pub async fn start_with(
+        pool: PgPool,
+        livekit_url: &str,
+        adjust: impl FnOnce(&mut AppState),
+    ) -> TestEnv {
+        let mut state = AppState::new(pool.clone(), Arc::new(test_config(livekit_url)));
+        adjust(&mut state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -235,78 +320,54 @@ impl TestEnv {
         }
     }
 
-    /// Posts `body` to `path` with an optional bearer token; returns status and JSON body.
-    async fn post(&self, path: &str, token: Option<&str>, ip: &str, body: Value) -> (u16, Value) {
-        let mut req = self
-            .client
-            .post(format!("{}{path}", self.http))
-            .header("x-forwarded-for", ip)
-            .json(&body);
-        if let Some(t) = token {
-            req = req.bearer_auth(t);
-        }
-        let res = req.send().await.unwrap();
-        let status = res.status().as_u16();
-        (status, res.json().await.unwrap_or(Value::Null))
-    }
-
-    /// Registers account `username` with device number `n`; returns token, device ID and secret.
-    pub async fn register(&self, username: &str, n: u32) -> (String, DeviceId, String) {
-        let code = surf_rac_server::accounts::create_invite(
-            &self.pool,
-            "test",
-            chrono::Duration::hours(1),
-        )
-        .await
-        .unwrap();
+    /// Registers device number `n` named `name` with a fresh identity key, without connecting it.
+    pub async fn register(&self, name: &str, n: u32) -> Registered {
+        let identity = Arc::new(IdentityKey::generate());
+        let fingerprint = format!("{n:064x}");
         let ip = format!("172.16.{}.{}", n / 256, n % 256);
-        let password = "correct horse battery";
-        let (status, _) = self
-            .post(
-                "/v1/register",
-                None,
-                &ip,
-                json!({"invite_code": code, "username": username, "password": password}),
-            )
-            .await;
-        assert_eq!(status, 201, "register {username}");
-        let (status, body) = self
-            .post(
-                "/v1/login",
-                None,
-                &ip,
-                json!({"username": username, "password": password}),
-            )
-            .await;
-        assert_eq!(status, 200, "login {username}");
-        let token = body["token"].as_str().unwrap().to_owned();
-        let (status, body) = self
-            .post(
-                "/v1/devices",
-                Some(&token),
-                &ip,
-                json!({"fingerprint_hash": format!("{n:064x}"), "name": username}),
-            )
-            .await;
-        assert_eq!(status, 200, "device {username}");
-        let id: DeviceId = body["device_id"].as_str().unwrap().parse().unwrap();
-        let secret = body["device_secret"].as_str().unwrap().to_owned();
-        (token, id, secret)
+        let id = register_device(
+            &self.client,
+            &self.http,
+            Some(&ip),
+            &identity,
+            &fingerprint,
+            name,
+        )
+        .await;
+        Registered {
+            id,
+            identity,
+            fingerprint,
+        }
     }
 
-    /// Registers and connects device `n` of account `username`.
-    pub async fn device(&self, username: &str, n: u32) -> TestDevice {
-        let (token, id, secret) = self.register(username, n).await;
-        let signaling = SignalingClient::connect(&self.ws, &token, id, &secret)
-            .await
-            .expect("signaling connect");
+    /// Connects the registered device `device` to the signaling server.
+    pub async fn connect(&self, device: &Registered) -> Result<SignalingClient, SignalingError> {
+        SignalingClient::connect(&self.ws, device.id, &device.identity, &device.fingerprint).await
+    }
+
+    /// Registers and connects device number `n` named `name`.
+    pub async fn device(&self, name: &str, n: u32) -> TestDevice {
+        let registered = self.register(name, n).await;
+        let signaling = self.connect(&registered).await.expect("signaling connect");
         TestDevice {
-            id,
-            token,
-            secret,
+            id: registered.id,
+            name: name.to_owned(),
+            identity: registered.identity,
+            fingerprint: registered.fingerprint,
             signaling,
-            keys: Arc::new(DeviceKeys::generate()),
             known: Arc::new(Mutex::new(KnownKeys::default())),
+        }
+    }
+}
+
+impl TestDevice {
+    /// Returns this device's registration, for opening another connection.
+    pub fn registered(&self) -> Registered {
+        Registered {
+            id: self.id,
+            identity: Arc::clone(&self.identity),
+            fingerprint: self.fingerprint.clone(),
         }
     }
 }

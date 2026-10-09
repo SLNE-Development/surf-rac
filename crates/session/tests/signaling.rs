@@ -2,12 +2,15 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use common::TestEnv;
+use common::{Registered, TestEnv};
 use sqlx::PgPool;
 use surf_rac_protocol::{ClientMessage, ServerMessage};
+use surf_rac_session::crypto::{self, Ephemeral, Role};
 use surf_rac_session::signaling::{SignalingClient, SignalingError, SignalingEvents};
+use surf_rac_session::{IdentityKey, IdentityPublic};
 
 /// Waits up to 5 s for the first message matching `pred`.
 async fn next_matching(
@@ -36,27 +39,109 @@ async fn connect_and_ping(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../server/migrations")]
-async fn bad_secret_is_rejected(pool: PgPool) {
+async fn wrong_identity_key_is_bad_signature(pool: PgPool) {
     let env = TestEnv::start(pool).await;
-    let (token, id, _) = env.register("alice", 1).await;
-    let err = SignalingClient::connect(&env.ws, &token, id, "wrong")
-        .await
-        .err();
-    assert_eq!(err, Some(SignalingError::Rejected(401)));
+    let device = env.register("alice", 1).await;
+    let impostor = Registered {
+        identity: Arc::new(IdentityKey::generate()),
+        ..device
+    };
+    assert_eq!(
+        env.connect(&impostor).await.err(),
+        Some(SignalingError::BadSignature)
+    );
 }
 
 #[sqlx::test(migrations = "../server/migrations")]
-async fn relays_session_request(pool: PgPool) {
+async fn other_fingerprint_is_clone_detected(pool: PgPool) {
+    let env = TestEnv::start(pool).await;
+    let device = env.register("alice", 1).await;
+    let clone = Registered {
+        fingerprint: format!("{:064x}", 99),
+        ..device
+    };
+    assert_eq!(
+        env.connect(&clone).await.err(),
+        Some(SignalingError::CloneDetected)
+    );
+}
+
+#[sqlx::test(migrations = "../server/migrations")]
+async fn unregistered_device_is_unknown(pool: PgPool) {
+    let env = TestEnv::start(pool).await;
+    let device = env.register("alice", 1).await;
+    let unknown = Registered {
+        id: if device.id.get() == 123_456_789 {
+            "223456789".parse().unwrap()
+        } else {
+            "123456789".parse().unwrap()
+        },
+        ..device
+    };
+    assert_eq!(
+        env.connect(&unknown).await.err(),
+        Some(SignalingError::UnknownDevice)
+    );
+}
+
+#[sqlx::test(migrations = "../server/migrations")]
+async fn disabled_device_is_refused(pool: PgPool) {
+    let env = TestEnv::start(pool).await;
+    let device = env.register("alice", 1).await;
+    sqlx::query("update devices set disabled = true")
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        env.connect(&device).await.err(),
+        Some(SignalingError::DeviceDisabled)
+    );
+}
+
+#[sqlx::test(migrations = "../server/migrations")]
+async fn device_disabled_while_connected_reports_why(pool: PgPool) {
+    let env = TestEnv::start_with(pool, &common::env("LIVEKIT_URL"), |state| {
+        state.ws_revalidate_interval = Duration::from_millis(200);
+    })
+    .await;
+    let a = env.device("alice", 1).await;
+    let mut events = a.signaling.subscribe();
+    sqlx::query("update devices set disabled = true")
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while events.recv().await.is_some() {}
+    })
+    .await
+    .expect("connection did not end");
+    assert_eq!(
+        a.signaling.end_reason(),
+        Some(SignalingError::DeviceDisabled)
+    );
+    assert_eq!(
+        a.signaling.send(ClientMessage::Ping).await.err(),
+        Some(SignalingError::DeviceDisabled)
+    );
+}
+
+#[sqlx::test(migrations = "../server/migrations")]
+async fn relays_signed_session_request(pool: PgPool) {
     let env = TestEnv::start(pool).await;
     let a = env.device("alice", 1).await;
     let b = env.device("bob", 2).await;
     let mut events = b.signaling.subscribe();
+    let ephemeral = Ephemeral::generate();
+    let signature = a
+        .identity
+        .sign_session(Role::Viewer, "s1", &ephemeral.public());
     a.signaling
         .send(ClientMessage::SessionRequest {
             to: b.id,
             session_id: "s1".into(),
-            viewer_public_key: a.keys.public_key().to_base64(),
-            password: None,
+            session_key: ephemeral.public().to_base64(),
+            signature: crypto::signature_to_base64(&signature),
+            unattended: false,
         })
         .await
         .unwrap();
@@ -64,15 +149,23 @@ async fn relays_session_request(pool: PgPool) {
         matches!(m, ServerMessage::SessionRequest { .. })
     })
     .await;
-    match msg {
-        ServerMessage::SessionRequest {
-            from, session_id, ..
-        } => {
-            assert_eq!(from, a.id);
-            assert_eq!(session_id, "s1");
-        }
-        _ => unreachable!(),
-    }
+    let ServerMessage::SessionRequest {
+        from,
+        session_id,
+        identity_key,
+        name,
+        ..
+    } = msg
+    else {
+        unreachable!()
+    };
+    assert_eq!(from, a.id);
+    assert_eq!(session_id, "s1");
+    assert_eq!(name, "alice");
+    assert_eq!(
+        IdentityPublic::from_base64(&identity_key).unwrap(),
+        a.identity.public()
+    );
 }
 
 #[sqlx::test(migrations = "../server/migrations")]
@@ -80,9 +173,7 @@ async fn replaced_connection_ends_subscribers(pool: PgPool) {
     let env = TestEnv::start(pool).await;
     let a = env.device("alice", 1).await;
     let mut events = a.signaling.subscribe();
-    let _second = SignalingClient::connect(&env.ws, &a.token, a.id, &a.secret)
-        .await
-        .unwrap();
+    let _second: SignalingClient = env.connect(&a.registered()).await.unwrap();
     let ended = tokio::time::timeout(Duration::from_secs(5), async {
         while events.recv().await.is_some() {}
     })

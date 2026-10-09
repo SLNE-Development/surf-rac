@@ -21,7 +21,7 @@ use super::identity::{self, Identity, IdentityError};
 use super::{
     AccountTask, Command, ConnectAction, Connection, ContactView, DEFAULT_SERVER, FrameImage,
     Repaint, SERVER_ENV, Snapshot, ViewerStatus, ViewerView, backoff, connect_action, end_text,
-    lock, offer_forget, password_offer, password_to_send, registration_action, request_error_text,
+    identity_action, lock, offer_forget, password_offer, password_to_send, request_error_text,
 };
 use crate::access;
 use crate::api::{Api, ApiError};
@@ -530,9 +530,12 @@ impl Actor {
                 self.identity = Some(identity);
                 self.connect_now();
             }
-            Err(IdentityError::Api(e)) => {
-                tracing::warn!(error = %e, "installation registration failed");
-                match registration_action(&e) {
+            Err(e) => {
+                tracing::warn!(error = %e, "installation identity not set up");
+                if let IdentityError::Store(_) = e {
+                    self.banner = Some("This device's identity could not be saved.".into());
+                }
+                match identity_action(&e) {
                     ConnectAction::Stop(state) => self.stop_connecting(state),
                     ConnectAction::Retry | ConnectAction::Renew => {
                         self.connection = Connection::Offline;
@@ -540,11 +543,6 @@ impl Actor {
                         self.start_identity(false);
                     }
                 }
-            }
-            Err(IdentityError::Store(e)) => {
-                tracing::error!(error = %e, "installation not stored");
-                self.connection = Connection::Offline;
-                self.banner = Some("This device's identity could not be saved.".into());
             }
         }
     }
@@ -795,21 +793,21 @@ impl Actor {
                 tracing::info!(%username, "installation linked to the account");
                 self.refresh_lists();
             }
-            Err(LinkError::Rejected) => self.expire_account(),
             Err(e) => tracing::warn!(error = %e, "installation not linked, retrying on reconnect"),
         }
     }
 
     /// Signs out of the account: forgets it here at once, then unlinks this
-    /// installation and ends the session on the server in the background.
+    /// installation over HTTP and ends the session on the server in the
+    /// background, with or without a signaling connection.
     fn sign_out(&mut self) {
         if self.account().is_none() {
             return;
         }
         let api = self.api.clone();
-        let signaling = self.signaling.clone();
+        let device = self.identity.as_ref().map(|i| i.id);
         tokio::spawn(async move {
-            account::sign_out(signaling.as_ref(), &api).await;
+            account::sign_out(&api, device).await;
         });
         self.forget_account(AccountTask::Idle);
     }
@@ -836,7 +834,7 @@ impl Actor {
         }
     }
 
-    /// Forgets the account because the server no longer accepts its session,
+    /// Forgets the account because an account API call was refused with 401,
     /// and tells the user.
     fn expire_account(&mut self) {
         if self.account().is_none() {

@@ -16,7 +16,7 @@ use crate::dpapi;
 
 /// Version of the state file format this build writes.
 ///
-/// A file of any other version is not read; the client starts fresh.
+/// Of a file of any other version only the server URL and settings are kept.
 pub const STATE_VERSION: u32 = 2;
 
 /// Name of the state file inside the state directory.
@@ -278,8 +278,9 @@ impl Store {
     /// Loads the state from `dir`, starting empty when there is no file.
     ///
     /// A file that cannot be parsed is renamed to `state.json.bad` and an
-    /// empty state is used instead. A file of another format version is
-    /// ignored and an empty state is used; it is overwritten on the next save.
+    /// empty state is used instead. Of a file of another format version only
+    /// the server URL and the settings are kept; it is overwritten on the
+    /// next save.
     pub fn open(dir: PathBuf) -> Store {
         let path = dir.join(FILE_NAME);
         let state = match std::fs::read(&path) {
@@ -320,8 +321,9 @@ impl Store {
 
 /// Parses the contents of the state file at `path`.
 ///
-/// Returns an empty state for a file of another format version, and moves a
-/// file that is not a valid state aside to `state.json.bad`.
+/// Keeps only the server URL and settings of a file of another format
+/// version, and moves a file that is not a valid state aside to
+/// `state.json.bad`.
 fn parse(path: &Path, bytes: &[u8]) -> State {
     let version = serde_json::from_slice::<serde_json::Value>(bytes)
         .ok()
@@ -331,9 +333,9 @@ fn parse(path: &Path, bytes: &[u8]) -> State {
     {
         tracing::warn!(
             ?version,
-            "state file has another format version, starting fresh"
+            "state file has another format version, keeping only the server and settings"
         );
-        return State::default();
+        return carry_over(bytes);
     }
     match serde_json::from_slice::<State>(bytes) {
         Ok(state) => state,
@@ -342,6 +344,29 @@ fn parse(path: &Path, bytes: &[u8]) -> State {
             let _ = std::fs::rename(path, path.with_extension("json.bad"));
             State::default()
         }
+    }
+}
+
+/// Returns an empty state that keeps the server URL and the settings of a
+/// state file of another format version, as far as they still parse.
+///
+/// The installation, account, pinned keys and saved passwords are dropped.
+fn carry_over(bytes: &[u8]) -> State {
+    let Ok(old) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return State::default();
+    };
+    let server_url = old
+        .get("server_url")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let settings = old
+        .get("settings")
+        .and_then(|s| serde_json::from_value::<Settings>(s.clone()).ok())
+        .unwrap_or_default();
+    State {
+        server_url,
+        settings,
+        ..State::default()
     }
 }
 
@@ -447,26 +472,61 @@ mod tests {
     }
 
     #[test]
-    fn old_version_file_starts_fresh() {
+    fn old_version_file_keeps_server_and_settings_only() {
         let dir = temp_dir("old");
+        let hash = Secret::new("$argon2id$v=19$hash");
         let json = serde_json::json!({
             "version": 1,
-            "server_url": "https://old.example",
+            "server_url": "https://custom.example",
             "account": "alice",
             "session_token": STANDARD.encode(b"blob"),
             "device_id": "123456789",
             "device_secret": STANDARD.encode(b"blob"),
             "device_key": STANDARD.encode(b"blob"),
             "known_keys": { "223456789": "AAAA" },
-            "settings": { "unattended": true },
+            "saved_passwords": { "223456789": serde_json::to_value(&hash).unwrap() },
+            "settings": {
+                "allow_incoming": false,
+                "unattended": true,
+                "password_hash": serde_json::to_value(&hash).unwrap(),
+                "clipboard_default": false,
+            },
         });
         std::fs::write(dir.join(FILE_NAME), json.to_string()).unwrap();
         let store = Store::open(dir.clone());
-        assert_eq!(store.state(), State::default());
-        store.update(|s| s.settings.unattended = true).unwrap();
+        let state = store.state();
+        assert_eq!(state.version, STATE_VERSION);
+        assert_eq!(state.server_url.as_deref(), Some("https://custom.example"));
+        assert!(state.installation.is_none());
+        assert!(state.account.is_none());
+        assert!(state.known_keys.is_empty());
+        assert!(state.saved_passwords.is_empty());
+        assert!(!state.settings.allow_incoming);
+        assert!(state.settings.unattended);
+        assert!(!state.settings.clipboard_default);
+        #[cfg(windows)]
+        assert_eq!(state.settings.password_hash, Some(hash));
+        store.update(|s| s.settings.unattended = false).unwrap();
         let reloaded = Store::open(dir);
-        assert_eq!(reloaded.state().version, STATE_VERSION);
+        assert_eq!(
+            reloaded.state().server_url.as_deref(),
+            Some("https://custom.example")
+        );
         assert!(reloaded.state().installation.is_none());
+    }
+
+    #[test]
+    fn old_version_file_with_unreadable_settings_keeps_the_server() {
+        let dir = temp_dir("oldbad");
+        let json = serde_json::json!({
+            "version": 1,
+            "server_url": "https://custom.example",
+            "settings": "not settings",
+        });
+        std::fs::write(dir.join(FILE_NAME), json.to_string()).unwrap();
+        let state = Store::open(dir).state();
+        assert_eq!(state.server_url.as_deref(), Some("https://custom.example"));
+        assert_eq!(state.settings, Settings::default());
     }
 
     #[test]

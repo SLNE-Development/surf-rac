@@ -14,7 +14,7 @@ use surf_rac_app::installation::InstallationStore;
 use surf_rac_app::runtime::account;
 use surf_rac_app::runtime::identity;
 use surf_rac_app::store::InstallationState;
-use surf_rac_protocol::DeviceId;
+use surf_rac_protocol::{ClientMessage, DeviceId};
 use surf_rac_session::signaling::SignalingClient;
 
 /// An installation store held in memory.
@@ -41,7 +41,7 @@ impl InstallationStore for MemoryStore {
 const FINGERPRINT: &str = "00000000000000000000000000000000000000000000000000000000000000a7";
 
 #[sqlx::test(migrations = "../server/migrations")]
-async fn installation_links_to_an_account_and_unlinks_on_sign_out(pool: PgPool) {
+async fn installation_links_to_an_account_and_unlinks_on_sign_out_without_a_socket(pool: PgPool) {
     let env = TestEnv::start(pool).await;
     let api = Api::new(&env.http);
 
@@ -72,10 +72,12 @@ async fn installation_links_to_an_account_and_unlinks_on_sign_out(pool: PgPool) 
     let token = api.login("alice", "correct horse battery").await.unwrap();
     let alice = api.with_token(Some(token.clone()));
 
-    assert_eq!(
-        account::link(&signaling, "not-a-token").await,
-        Err(account::LinkError::Rejected)
-    );
+    signaling
+        .send(ClientMessage::LinkAccount {
+            token: "not-a-token".into(),
+        })
+        .await
+        .unwrap();
     assert_eq!(account::link(&signaling, &token).await, Ok("alice".into()));
     let devices = alice.my_devices().await.unwrap();
     assert_eq!(devices.len(), 1);
@@ -95,11 +97,19 @@ async fn installation_links_to_an_account_and_unlinks_on_sign_out(pool: PgPool) 
     let unknown = DeviceId::new(999_999_998).unwrap();
     assert!(alice.presence(unknown).await.is_err());
 
-    account::sign_out(Some(&signaling), &alice).await;
+    drop(signaling);
+    assert!(account::sign_out(&alice, Some(me.id)).await);
     assert_eq!(alice.my_devices().await, Err(ApiError::Unauthorized));
     let token = api.login("alice", "correct horse battery").await.unwrap();
     let alice = api.with_token(Some(token));
     assert!(alice.my_devices().await.unwrap().is_empty());
+    let again = api
+        .login("alice", "correct horse battery")
+        .await
+        .map(|t| api.with_token(Some(t)))
+        .unwrap();
+    assert!(account::sign_out(&again, Some(me.id)).await);
+    assert_eq!(again.my_devices().await, Err(ApiError::Unauthorized));
 
     assert!(matches!(
         alice.delete_account("wrong password!").await,

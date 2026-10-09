@@ -190,6 +190,16 @@ pub fn connect_action(error: &SignalingError, renewed: bool) -> ConnectAction {
     }
 }
 
+/// Returns how to react when no identity could be set up: a refused
+/// registration as [`registration_action`] says, and an installation that
+/// could not be stored by retrying with backoff.
+pub fn identity_action(error: &identity::IdentityError) -> ConnectAction {
+    match error {
+        identity::IdentityError::Api(e) => registration_action(e),
+        identity::IdentityError::Store(_) => ConnectAction::Retry,
+    }
+}
+
 /// Returns how to react to a failed installation registration.
 pub fn registration_action(error: &ApiError) -> ConnectAction {
     match error {
@@ -505,6 +515,7 @@ pub fn end_text(reason: EndReason) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::identity::IdentityError;
     use super::*;
 
     #[test]
@@ -545,6 +556,22 @@ mod tests {
         ] {
             assert_eq!(connect_action(&error, false), ConnectAction::Retry);
         }
+    }
+
+    #[test]
+    fn identity_store_failures_retry() {
+        assert_eq!(
+            identity_action(&IdentityError::Store("disk full".into())),
+            ConnectAction::Retry
+        );
+        assert_eq!(
+            identity_action(&IdentityError::Api(ApiError::UpdateRequired)),
+            ConnectAction::Stop(Connection::UpdateRequired)
+        );
+        assert_eq!(
+            identity_action(&IdentityError::Api(ApiError::RateLimited)),
+            ConnectAction::Retry
+        );
     }
 
     #[test]

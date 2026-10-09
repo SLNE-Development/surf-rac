@@ -1,12 +1,14 @@
 //! Session windows: request prompts, the host's connections window and viewer windows.
 
-use eframe::egui;
+use eframe::egui::{self, Align, Frame, Layout, Margin, RichText};
 use surf_rac_input::Grants;
 use surf_rac_protocol::data::{Control, DataMessage, MouseButton, QualityMode};
 
-use super::{ClientApp, ViewerUi};
+use super::main_window::format_id;
+use super::widgets::{self, Kind, Tone};
+use super::{ClientApp, ViewerUi, icons, theme};
 use crate::access::PromptNote;
-use crate::runtime::{Command, ViewerStatus, ViewerView};
+use crate::runtime::{Command, HostViewerView, ViewerStatus, ViewerView};
 use crate::viewmap::{self, Rect};
 
 /// How long a request prompt is visible before its Accept button works, so a
@@ -18,16 +20,46 @@ fn accept_armed(shown: std::time::Instant, now: std::time::Instant) -> bool {
     now.saturating_duration_since(shown) >= ACCEPT_DELAY
 }
 
+/// Returns how far the Accept button has armed, from 0 when the prompt
+/// appears to 1 once [`ACCEPT_DELAY`] has passed.
+pub(super) fn arm_progress(shown: std::time::Instant, now: std::time::Instant) -> f32 {
+    let elapsed = now.saturating_duration_since(shown).as_secs_f32();
+    (elapsed / ACCEPT_DELAY.as_secs_f32()).clamp(0.0, 1.0)
+}
+
 /// Wheel units per line of scrolling.
 const WHEEL_PER_LINE: f32 = 120.0;
 
 /// Wheel units per point of smooth scrolling.
 const WHEEL_PER_POINT: f32 = 3.0;
 
+/// Returns the callout tone, icon and text for a prompt's password note.
+fn note_callout(note: PromptNote) -> Option<(Tone, char, &'static str)> {
+    match note {
+        PromptNote::None => None,
+        PromptNote::CorrectPassword => Some((
+            Tone::Ok,
+            icons::CHECK,
+            "The correct unattended password was entered.",
+        )),
+        PromptNote::WrongPassword => Some((
+            Tone::Warn,
+            icons::TRIANGLE_ALERT,
+            "A wrong unattended password was entered.",
+        )),
+        PromptNote::LockedOut => Some((
+            Tone::Warn,
+            icons::LOCK,
+            "Too many wrong passwords: password access is locked.",
+        )),
+    }
+}
+
 impl ClientApp {
     /// Shows one always-on-top window per pending request.
     ///
-    /// Accept works only after the prompt has been visible for [`ACCEPT_DELAY`].
+    /// Accept works only after the prompt has been visible for [`ACCEPT_DELAY`];
+    /// until then the button fills up as a progress bar.
     pub(super) fn show_prompts(&mut self, ctx: &egui::Context) {
         let now = std::time::Instant::now();
         let prompts = self.snap.prompts.clone();
@@ -39,48 +71,83 @@ impl ClientApp {
                 .entry(prompt.session_id.clone())
                 .or_insert(now);
             let armed = accept_armed(shown, now);
-            if !armed {
-                ctx.request_repaint_after(ACCEPT_DELAY);
-            }
+            let progress = arm_progress(shown, now);
             let id = egui::ViewportId::from_hash_of(("prompt", &prompt.session_id));
             let builder = egui::ViewportBuilder::default()
                 .with_title("Connection request - surf-rac")
-                .with_inner_size([380.0, 190.0])
+                .with_inner_size([420.0, 270.0])
                 .with_always_on_top()
                 .with_resizable(false);
             ctx.show_viewport_immediate(id, builder, |ui, _| {
+                if !armed {
+                    ui.ctx().request_repaint();
+                }
                 if ui.input(|i| i.viewport().close_requested()) {
                     self.send(Command::Deny(prompt.session_id.clone()));
                 }
-                egui::CentralPanel::default().show(ui, |ui| {
-                    ui.heading(format!("{} wants to connect", prompt.name));
-                    ui.label(format!("Device {}", prompt.viewer));
-                    ui.small(format!("Key fingerprint {}", prompt.fingerprint));
-                    let note = match prompt.note {
-                        PromptNote::None => None,
-                        PromptNote::CorrectPassword => {
-                            Some("The correct unattended password was entered.")
+                let p = theme::palette(ui.ctx());
+                egui::CentralPanel::no_frame()
+                    .frame(Frame::new().fill(p.surface).inner_margin(Margin::same(20)))
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 12.0;
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 14.0;
+                            widgets::avatar(ui, &prompt.name, 44.0);
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(format!("{} wants to connect", prompt.name))
+                                            .font(theme::bold(17.0)),
+                                    )
+                                    .truncate(),
+                                );
+                                ui.label(
+                                    widgets::muted(ui, format!("Device {}", format_id(prompt.viewer)))
+                                        .size(13.0),
+                                );
+                            });
+                        });
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.label(icons::text(icons::LOCK, 13.0).color(p.muted));
+                            ui.add(
+                                egui::Label::new(
+                                    widgets::muted(
+                                        ui,
+                                        format!("Key fingerprint {}", prompt.fingerprint),
+                                    )
+                                    .size(12.0),
+                                )
+                                .truncate(),
+                            );
+                        });
+                        if let Some((tone, icon, text)) = note_callout(prompt.note) {
+                            widgets::callout(ui, tone, icon, text);
                         }
-                        PromptNote::WrongPassword => {
-                            Some("A wrong unattended password was entered.")
-                        }
-                        PromptNote::LockedOut => {
-                            Some("Too many wrong passwords: password access is locked.")
-                        }
-                    };
-                    if let Some(note) = note {
-                        ui.label(note);
-                    }
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(armed, egui::Button::new("Accept")).clicked() {
-                            self.send(Command::Accept(prompt.session_id.clone()));
-                        }
-                        if ui.button("Deny").clicked() {
-                            self.send(Command::Deny(prompt.session_id.clone()));
-                        }
+                        ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                            ui.columns(2, |cols| {
+                                let deny = widgets::btn_lg(&cols[0], Kind::Secondary, None, "Deny");
+                                if widgets::full_width(&mut cols[0], true, deny).clicked() {
+                                    self.send(Command::Deny(prompt.session_id.clone()));
+                                }
+                                let accept =
+                                    widgets::btn_lg(&cols[1], Kind::Primary, None, "Accept");
+                                let response = widgets::full_width(&mut cols[1], armed, accept);
+                                if !armed {
+                                    let bar = response.rect;
+                                    let fill = egui::Rect::from_min_size(
+                                        egui::pos2(bar.left(), bar.bottom() - 3.0),
+                                        egui::vec2(bar.width() * progress, 3.0),
+                                    );
+                                    cols[1].painter().rect_filled(fill, 1.5, p.accent);
+                                }
+                                if response.clicked() {
+                                    self.send(Command::Accept(prompt.session_id.clone()));
+                                }
+                            });
+                        });
                     });
-                });
             });
         }
     }
@@ -93,7 +160,7 @@ impl ClientApp {
         }
         let builder = egui::ViewportBuilder::default()
             .with_title("Active connections - surf-rac")
-            .with_inner_size([440.0, 220.0])
+            .with_inner_size([540.0, 340.0])
             .with_always_on_top();
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("connections"),
@@ -104,64 +171,133 @@ impl ClientApp {
                         .send_viewport_cmd(egui::ViewportCommand::CancelClose);
                     self.confirm_disconnect_all = true;
                 }
-                egui::CentralPanel::default().show(ui, |ui| {
-                    ui.heading("Connected to this computer");
-                    if self.snap.input_locked {
-                        ui.label("You are using this computer: remote input is paused.");
-                    }
-                    egui::Grid::new("viewers")
-                        .num_columns(5)
-                        .striped(true)
-                        .show(ui, |ui| {
-                            for v in self.snap.host_viewers.clone() {
-                                ui.label(&v.name);
-                                let mut grants = v.grants;
-                                let pointer = ui.checkbox(&mut grants.pointer, "Mouse").changed();
-                                let keyboard =
-                                    ui.checkbox(&mut grants.keyboard, "Keyboard").changed();
-                                if pointer || keyboard {
-                                    self.send(Command::SetGrants {
-                                        viewer: v.id,
-                                        grants: Grants { ..grants },
-                                    });
-                                }
-                                let mut clipboard = v.clipboard;
-                                if ui.checkbox(&mut clipboard, "Clipboard").changed() {
-                                    self.send(Command::HostClipboard {
-                                        viewer: v.id,
-                                        on: clipboard,
-                                    });
-                                }
-                                if ui.button("Disconnect").clicked() {
-                                    self.send(Command::Disconnect(v.id));
-                                }
-                                ui.end_row();
+                let p = theme::palette(ui.ctx());
+                egui::Panel::bottom("connections_footer")
+                    .frame(
+                        Frame::new()
+                            .fill(p.surface2)
+                            .inner_margin(Margin::symmetric(16, 10)),
+                    )
+                    .show(ui, |ui| self.connections_footer(ui));
+                egui::CentralPanel::no_frame()
+                    .frame(Frame::new().fill(p.surface))
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        let count = self.snap.host_viewers.len();
+                        Frame::new()
+                            .inner_margin(Margin::symmetric(16, 14))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::Vec2::splat(18.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().circle_filled(rect.center(), 8.0, p.ok_soft);
+                                    ui.painter().circle_filled(rect.center(), 4.5, p.ok);
+                                    let title = if count == 1 {
+                                        "1 person is connected to this computer".to_string()
+                                    } else {
+                                        format!("{count} people are connected to this computer")
+                                    };
+                                    ui.label(RichText::new(title).font(theme::semibold(15.0)));
+                                });
+                            });
+                        if self.snap.input_locked {
+                            widgets::banner(
+                                ui,
+                                Tone::Warn,
+                                icons::PAUSE,
+                                "You are using this computer, so remote input is paused.",
+                                |_| {},
+                            );
+                        } else {
+                            widgets::hairline(ui);
+                        }
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            for (i, v) in self.snap.host_viewers.clone().into_iter().enumerate() {
+                                widgets::row(ui, i == 0, |ui| self.viewer_row(ui, &v));
                             }
                         });
-                    let mut follow = self.snap.follow;
-                    if ui
-                        .checkbox(&mut follow, "Viewers follow my active screen")
-                        .changed()
-                    {
-                        self.send(Command::SetFollow(follow));
-                    }
-                    if self.confirm_disconnect_all {
-                        ui.horizontal(|ui| {
-                            ui.label("Disconnect everyone?");
-                            if ui.button("Yes").clicked() {
-                                self.send(Command::DisconnectAll);
-                                self.confirm_disconnect_all = false;
-                            }
-                            if ui.button("No").clicked() {
-                                self.confirm_disconnect_all = false;
-                            }
-                        });
-                    } else if ui.button("Disconnect all").clicked() {
-                        self.send(Command::DisconnectAll);
-                    }
-                });
+                    });
             },
         );
+    }
+
+    /// Draws one connected viewer: avatar, name and ID, control toggles and Disconnect.
+    fn viewer_row(&mut self, ui: &mut egui::Ui, v: &HostViewerView) {
+        let p = theme::palette(ui.ctx());
+        widgets::avatar(ui, &v.name, 36.0);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let disconnect = egui::Button::new(icons::text(icons::POWER, 16.0).color(p.danger))
+                .frame_when_inactive(false)
+                .corner_radius(theme::RADIUS_CONTROL)
+                .min_size(egui::Vec2::splat(32.0));
+            if ui
+                .add(disconnect)
+                .on_hover_text(format!("Disconnect {}", v.name))
+                .clicked()
+            {
+                self.send(Command::Disconnect(v.id));
+            }
+            let mut clipboard = v.clipboard;
+            if widgets::toggle_chip(ui, &mut clipboard, icons::CLIPBOARD, "Clip").changed() {
+                self.send(Command::HostClipboard {
+                    viewer: v.id,
+                    on: clipboard,
+                });
+            }
+            let mut grants = v.grants;
+            let keyboard =
+                widgets::toggle_chip(ui, &mut grants.keyboard, icons::KEYBOARD, "Keys").changed();
+            let pointer =
+                widgets::toggle_chip(ui, &mut grants.pointer, icons::MOUSE, "Mouse").changed();
+            if pointer || keyboard {
+                self.send(Command::SetGrants {
+                    viewer: v.id,
+                    grants: Grants { ..grants },
+                });
+            }
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                widgets::two_lines(ui, &v.name, &format_id(v.id));
+            });
+        });
+    }
+
+    /// Draws the footer of the connections window: follow switch and Disconnect all,
+    /// or the confirmation after the window's close button was pressed.
+    fn connections_footer(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if self.confirm_disconnect_all {
+                ui.label(RichText::new("Disconnect everyone?").font(theme::semibold(13.0)));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add(widgets::btn(ui, Kind::Danger, None, "Disconnect all"))
+                        .clicked()
+                    {
+                        self.send(Command::DisconnectAll);
+                        self.confirm_disconnect_all = false;
+                    }
+                    if ui.add(widgets::btn(ui, Kind::Ghost, None, "Cancel")).clicked() {
+                        self.confirm_disconnect_all = false;
+                    }
+                });
+                return;
+            }
+            let mut follow = self.snap.follow;
+            if widgets::switch(ui, &mut follow).changed() {
+                self.send(Command::SetFollow(follow));
+            }
+            ui.label(RichText::new("Viewers follow my active screen").size(13.0));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add(widgets::btn(ui, Kind::Danger, None, "Disconnect all"))
+                    .clicked()
+                {
+                    self.send(Command::DisconnectAll);
+                }
+            });
+        });
     }
 
     /// Shows one window per viewer session.
@@ -472,6 +608,30 @@ mod tests {
             mouse_button(egui::PointerButton::Extra2),
             Some(MouseButton::Forward)
         );
+    }
+
+    #[test]
+    fn arm_progress_runs_from_zero_to_one_over_the_delay() {
+        let shown = std::time::Instant::now();
+        assert_eq!(arm_progress(shown, shown), 0.0);
+        assert!((arm_progress(shown, shown + ACCEPT_DELAY / 2) - 0.5).abs() < 1e-3);
+        assert_eq!(arm_progress(shown, shown + ACCEPT_DELAY), 1.0);
+        assert_eq!(arm_progress(shown, shown + ACCEPT_DELAY * 3), 1.0);
+    }
+
+    #[test]
+    fn arm_progress_is_zero_when_the_clock_is_behind() {
+        let now = std::time::Instant::now();
+        let shown = now + std::time::Duration::from_secs(1);
+        assert_eq!(arm_progress(shown, now), 0.0);
+    }
+
+    #[test]
+    fn every_password_note_but_none_gets_a_callout() {
+        assert!(note_callout(PromptNote::None).is_none());
+        assert_eq!(note_callout(PromptNote::CorrectPassword).unwrap().0, Tone::Ok);
+        assert_eq!(note_callout(PromptNote::WrongPassword).unwrap().0, Tone::Warn);
+        assert_eq!(note_callout(PromptNote::LockedOut).unwrap().0, Tone::Warn);
     }
 
     #[test]

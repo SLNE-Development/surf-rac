@@ -1,4 +1,4 @@
-//! The sign-in and account registration screen.
+//! The optional account sign-in and registration screen.
 
 use eframe::egui::{self, RichText};
 
@@ -9,7 +9,8 @@ use crate::runtime::Command;
 /// Width of the sign-in card, in points.
 const CARD_WIDTH: f32 = 380.0;
 
-/// Draws the sign-in or registration card centred in the window.
+/// Draws the sign-in or registration card centred in the window, with a
+/// link back to the main window.
 ///
 /// `message` is the latest error or progress text; `busy` disables the
 /// submit button while a sign-in or registration is running.
@@ -31,9 +32,9 @@ pub(super) fn show(app: &mut ClientApp, ui: &mut egui::Ui, message: Option<&str>
         ui.label(widgets::muted(
             ui,
             if register {
-                "Use the invite code you were given."
+                "An account syncs your contacts and lists your devices."
             } else {
-                "Use your team account."
+                "Optional: sync your contacts and see your devices."
             },
         ));
         ui.add_space(12.0);
@@ -62,17 +63,19 @@ pub(super) fn show(app: &mut ClientApp, ui: &mut egui::Ui, message: Option<&str>
                 app.forms.server_dialog = true;
             }
         });
+        ui.add_space(8.0);
+        if ui
+            .link(RichText::new("Continue without an account").font(theme::semibold(13.0)))
+            .clicked()
+        {
+            app.forms.sign_in = false;
+        }
     });
 }
 
 /// Draws the fields, message, submit button and the register/sign-in switch.
 fn form(app: &mut ClientApp, ui: &mut egui::Ui, message: Option<&str>, busy: bool) {
     let forms = &mut app.forms;
-    if forms.register {
-        widgets::labeled(ui, "Invite code", |ui| {
-            widgets::text_field(ui, &mut forms.invite, "", false)
-        });
-    }
     widgets::labeled(ui, "Username", |ui| {
         widgets::text_field(ui, &mut forms.username, "", false)
     });
@@ -112,20 +115,16 @@ fn form(app: &mut ClientApp, ui: &mut egui::Ui, message: Option<&str>, busy: boo
         let (username, password) = (forms.username.trim().to_string(), forms.password.clone());
         forms.password.clear();
         let command = if forms.register {
-            Command::Register {
-                invite: forms.invite.trim().to_string(),
-                username,
-                password,
-            }
+            Command::CreateAccount { username, password }
         } else {
-            Command::Login { username, password }
+            Command::SignIn { username, password }
         };
         app.commands.send(command);
     }
     let (lead, link) = if app.forms.register {
         ("Already have an account?", "Sign in")
     } else {
-        ("Have an invite code?", "Create an account")
+        ("No account yet?", "Create an account")
     };
     let width = widgets::text_width(ui, lead, egui::FontId::proportional(13.0))
         + 8.0

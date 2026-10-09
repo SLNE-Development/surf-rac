@@ -1,7 +1,9 @@
-//! The client's background runtime: one actor task owns the signaling
-//! connection, hosting and viewing sessions and the state file, takes
-//! [`Command`]s from the UI and publishes a [`Snapshot`] for it to draw.
+//! The client's background runtime: one actor task owns the installation's
+//! identity, the signaling connection, the optional account, hosting and
+//! viewing sessions and the state file, takes [`Command`]s from the UI and
+//! publishes a [`Snapshot`] for it to draw.
 
+pub mod account;
 mod actor;
 mod hosting;
 pub mod identity;
@@ -11,12 +13,15 @@ use std::time::Duration;
 
 use surf_rac_input::Grants;
 use surf_rac_protocol::data::{DataMessage, InputState, ScreenState};
-use surf_rac_protocol::{DeviceId, DeviceInfo};
+use surf_rac_protocol::{DeviceId, MyDeviceInfo};
 use surf_rac_session::EndReason;
+use surf_rac_session::signaling::SignalingError;
 use surf_rac_session::viewer::RequestError;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::access::PromptNote;
+use crate::api::ApiError;
+use crate::installation::InstallationStore;
 use crate::store::{Settings, Store};
 
 /// Server used when neither the settings nor the environment name one.
@@ -31,27 +36,30 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// Something the UI asks the runtime to do.
 #[derive(Debug)]
 pub enum Command {
-    /// Log in to an existing account.
-    Login {
+    /// Sign in to an existing account and link this installation to it.
+    SignIn {
         /// Account username.
         username: String,
         /// Account password.
         password: String,
     },
-    /// Create an account with an invite code and log in.
-    Register {
-        /// Invite code from an admin.
-        invite: String,
+    /// Create an account, sign in to it and link this installation to it.
+    CreateAccount {
         /// Desired username.
         username: String,
         /// Desired password.
         password: String,
     },
-    /// Log out and stop all sessions.
-    Logout,
-    /// Switch to another server; logs out.
+    /// Unlink this installation from the account and sign out of it; sessions keep running.
+    SignOut,
+    /// Delete the signed-in account after checking its password.
+    DeleteAccount {
+        /// The account password.
+        password: String,
+    },
+    /// Switch to another server; signs out and registers a new installation there.
     SetServer(String),
-    /// Reload devices and contacts.
+    /// Reload My devices and contacts while signed in.
     RefreshLists,
     /// Add a contact or rename it.
     PutContact {
@@ -62,8 +70,8 @@ pub enum Command {
     },
     /// Remove a contact.
     DeleteContact(DeviceId),
-    /// Remove one of the account's other devices.
-    DeleteDevice(DeviceId),
+    /// Unlink another installation from the signed-in account.
+    UnlinkDevice(DeviceId),
     /// Connect to a host.
     Connect {
         /// The host device.
@@ -127,24 +135,68 @@ pub enum Command {
     Shutdown(oneshot::Sender<()>),
 }
 
-/// Whether and how the client is signed in and connected.
+/// The state of this installation's connection to the signaling server.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Auth {
-    /// No account is logged in; the message says why, if there is a reason to tell.
-    LoggedOut {
-        /// Why the user was logged out or what failed.
-        message: Option<String>,
-    },
-    /// Logging in, registering or registering the device.
-    Working(String),
-    /// Connecting to the signaling server.
+pub enum Connection {
+    /// Registering the installation or connecting to the server.
     Connecting,
     /// Connected; requests can arrive and sessions can start.
     Online,
-    /// The connection dropped; reconnecting with backoff.
+    /// Not connected; retrying with backoff.
     Offline,
-    /// Another connection signed in as this device.
+    /// The server does not support this client's version; no retries until restart.
+    UpdateRequired,
+    /// An administrator disabled this device; no retries until restart.
+    Disabled,
+    /// Another connection signed in as this device; reconnects only when asked.
     Replaced,
+}
+
+/// What the runtime is doing with the account, or why it failed last.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountTask {
+    /// Nothing is running and nothing failed.
+    Idle,
+    /// Signing in, creating or deleting the account; the text says which.
+    Working(String),
+    /// The last account action failed; the text says why.
+    Failed(String),
+}
+
+/// How the runtime reacts to a failed connection attempt or registration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectAction {
+    /// Discard the installation, register a new one and connect again.
+    Renew,
+    /// Try again after the backoff.
+    Retry,
+    /// Stop connecting and show this state.
+    Stop(Connection),
+}
+
+/// Returns how to react to a failed connection attempt.
+///
+/// A clone or an unknown ID renews the installation, unless the installation
+/// was already renewed since the last successful connection; then the client
+/// only retries with backoff. An outdated client and a disabled device stop.
+pub fn connect_action(error: &SignalingError, renewed: bool) -> ConnectAction {
+    match error {
+        SignalingError::UpdateRequired => ConnectAction::Stop(Connection::UpdateRequired),
+        SignalingError::DeviceDisabled => ConnectAction::Stop(Connection::Disabled),
+        SignalingError::CloneDetected | SignalingError::UnknownDevice if !renewed => {
+            ConnectAction::Renew
+        }
+        _ => ConnectAction::Retry,
+    }
+}
+
+/// Returns how to react to a failed installation registration.
+pub fn registration_action(error: &ApiError) -> ConnectAction {
+    match error {
+        ApiError::UpdateRequired => ConnectAction::Stop(Connection::UpdateRequired),
+        ApiError::DeviceDisabled => ConnectAction::Stop(Connection::Disabled),
+        _ => ConnectAction::Retry,
+    }
 }
 
 /// A contact with its presence.
@@ -238,17 +290,19 @@ pub struct ViewerView {
 /// Everything the UI draws, as of the runtime's last change.
 #[derive(Clone)]
 pub struct Snapshot {
-    /// Sign-in and connection state.
-    pub auth: Auth,
-    /// The logged-in username.
+    /// The connection to the signaling server.
+    pub connection: Connection,
+    /// The signed-in account's username, if any.
     pub account: Option<String>,
+    /// The running or last failed account action.
+    pub account_task: AccountTask,
     /// The server in use.
     pub server_url: String,
-    /// This device's ID once registered.
+    /// This installation's ID once registered.
     pub device_id: Option<DeviceId>,
-    /// The account's devices.
-    pub devices: Vec<DeviceInfo>,
-    /// The account's contacts.
+    /// The installations linked to the signed-in account.
+    pub my_devices: Vec<MyDeviceInfo>,
+    /// The signed-in account's contacts.
     pub contacts: Vec<ContactView>,
     /// Requests waiting for an answer.
     pub prompts: Vec<PromptView>,
@@ -273,14 +327,15 @@ pub struct Snapshot {
 }
 
 impl Default for Snapshot {
-    /// A logged-out client with nothing loaded.
+    /// A connecting client without an account and with nothing loaded.
     fn default() -> Self {
         Snapshot {
-            auth: Auth::LoggedOut { message: None },
+            connection: Connection::Connecting,
             account: None,
+            account_task: AccountTask::Idle,
             server_url: DEFAULT_SERVER.into(),
             device_id: None,
-            devices: Vec::new(),
+            my_devices: Vec::new(),
             contacts: Vec::new(),
             prompts: Vec::new(),
             host_viewers: Vec::new(),
@@ -321,8 +376,13 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    /// Starts the runtime with the loaded state; `repaint` is called after every change.
-    pub fn start(store: Store, repaint: Repaint) -> std::io::Result<Runtime> {
+    /// Starts the runtime with the loaded state and the store of this
+    /// installation's identity; `repaint` is called after every change.
+    pub fn start(
+        store: Store,
+        installation: Arc<dyn InstallationStore>,
+        repaint: Repaint,
+    ) -> std::io::Result<Runtime> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -332,7 +392,7 @@ impl Runtime {
         let snapshot = Arc::new(Mutex::new(Snapshot::default()));
         let shared = Arc::clone(&snapshot);
         rt.spawn(async move {
-            actor::Actor::new(store, shared, repaint)
+            actor::Actor::new(store, installation, shared, repaint)
                 .run(commands_rx)
                 .await;
         });
@@ -395,13 +455,16 @@ pub fn password_offer(saved: Option<&str>, typed: Option<&str>) -> Option<(Strin
     }
 }
 
-/// Returns whether the viewer may take the host's key from the server to seal
-/// a password: only for a typed password when no key is pinned yet.
+/// Returns the password a viewer sends to a host, given the offer from
+/// [`password_offer`] and whether the host's identity key is pinned.
 ///
-/// A saved password is only ever sealed for a pinned key, so the server
-/// cannot obtain it by presenting a key of its own.
-pub fn may_fetch_host_key(saved_password: bool, pinned: bool) -> bool {
-    !saved_password && !pinned
+/// A saved password is only sent to a host whose key is pinned, so a server
+/// that presents a key of its own for the host never receives it.
+pub fn password_to_send(offer: Option<(String, bool)>, pinned: bool) -> Option<String> {
+    match offer {
+        Some((password, saved)) if !saved || pinned => Some(password),
+        _ => None,
+    }
 }
 
 /// Returns whether a failed request should offer to forget the saved
@@ -422,6 +485,9 @@ pub fn request_error_text(error: &RequestError) -> String {
         RequestError::MediaUnavailable(_) => "The media server cannot be reached.".into(),
         RequestError::KeyChanged(_) => {
             "The host's security key changed. The connection was refused for safety.".into()
+        }
+        RequestError::ChallengeMismatch => {
+            "The host's answer did not match its security check. The connection was refused for safety.".into()
         }
         RequestError::Signaling(_) => "The connection to the server was lost.".into(),
     }
@@ -449,11 +515,66 @@ mod tests {
     }
 
     #[test]
-    fn host_key_is_fetched_only_for_a_typed_password_without_pin() {
-        assert!(may_fetch_host_key(false, false));
-        assert!(!may_fetch_host_key(true, false));
-        assert!(!may_fetch_host_key(false, true));
-        assert!(!may_fetch_host_key(true, true));
+    fn update_required_and_disabled_stop_reconnecting() {
+        assert_eq!(
+            connect_action(&SignalingError::UpdateRequired, false),
+            ConnectAction::Stop(Connection::UpdateRequired)
+        );
+        assert_eq!(
+            connect_action(&SignalingError::DeviceDisabled, false),
+            ConnectAction::Stop(Connection::Disabled)
+        );
+    }
+
+    #[test]
+    fn clone_and_unknown_device_renew_once_then_back_off() {
+        for error in [SignalingError::CloneDetected, SignalingError::UnknownDevice] {
+            assert_eq!(connect_action(&error, false), ConnectAction::Renew);
+            assert_eq!(connect_action(&error, true), ConnectAction::Retry);
+        }
+    }
+
+    #[test]
+    fn other_connect_errors_retry() {
+        for error in [
+            SignalingError::Connect("refused".into()),
+            SignalingError::Closed,
+            SignalingError::RateLimited,
+            SignalingError::BadSignature,
+            SignalingError::Rejected(401),
+        ] {
+            assert_eq!(connect_action(&error, false), ConnectAction::Retry);
+        }
+    }
+
+    #[test]
+    fn registration_errors_map_to_connection_states() {
+        assert_eq!(
+            registration_action(&ApiError::UpdateRequired),
+            ConnectAction::Stop(Connection::UpdateRequired)
+        );
+        assert_eq!(
+            registration_action(&ApiError::Network("down".into())),
+            ConnectAction::Retry
+        );
+        assert_eq!(
+            registration_action(&ApiError::RateLimited),
+            ConnectAction::Retry
+        );
+    }
+
+    #[test]
+    fn saved_password_is_only_sent_to_a_pinned_host() {
+        assert_eq!(
+            password_to_send(Some(("typed".into(), false)), false),
+            Some("typed".into())
+        );
+        assert_eq!(password_to_send(Some(("saved".into(), true)), false), None);
+        assert_eq!(
+            password_to_send(Some(("saved".into(), true)), true),
+            Some("saved".into())
+        );
+        assert_eq!(password_to_send(None, true), None);
     }
 
     #[test]
@@ -490,6 +611,7 @@ mod tests {
             RequestError::Timeout,
             RequestError::TokenRejected,
             RequestError::MediaUnavailable("x".into()),
+            RequestError::ChallengeMismatch,
         ] {
             assert!(request_error_text(&error).ends_with('.'));
         }

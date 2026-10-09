@@ -1,40 +1,43 @@
-//! The main window: the signed-out screen, or the app bar, banner and the
-//! open tab when signed in.
+//! The main window: the app bar, banners and the open tab, or the account
+//! sign-in screen while it is open.
 
 use eframe::egui::{self, Align, Frame, Layout, Margin, RichText};
 use surf_rac_protocol::DeviceId;
 
 use super::widgets::{self, Kind, Tone};
 use super::{ClientApp, Tab, connect, devices, icons, login, settings, theme};
-use crate::runtime::{Auth, Command};
+use crate::runtime::{AccountTask, Command, Connection};
 
 /// Draws the main window.
 pub(super) fn show(app: &mut ClientApp, ui: &mut egui::Ui) {
     let p = theme::palette(ui.ctx());
-    match app.snap.auth.clone() {
-        Auth::LoggedOut { message } => {
-            egui::CentralPanel::no_frame()
-                .frame(Frame::new().fill(p.bg))
-                .show(ui, |ui| login::show(app, ui, message.as_deref(), false));
-        }
-        Auth::Working(text) => {
-            egui::CentralPanel::no_frame()
-                .frame(Frame::new().fill(p.bg))
-                .show(ui, |ui| login::show(app, ui, Some(&text), true));
-        }
-        _ => signed_in(app, ui),
+    if app.snap.account.is_some() {
+        app.forms.sign_in = false;
+    }
+    if app.forms.sign_in {
+        let (message, busy) = match app.snap.account_task.clone() {
+            AccountTask::Idle => (None, false),
+            AccountTask::Working(text) => (Some(text), true),
+            AccountTask::Failed(text) => (Some(text), false),
+        };
+        egui::CentralPanel::no_frame()
+            .frame(Frame::new().fill(p.bg))
+            .show(ui, |ui| login::show(app, ui, message.as_deref(), busy));
+    } else {
+        main_layout(app, ui);
     }
     server_dialog(app, ui.ctx());
 }
 
-/// Returns the status chip text and tone for a sign-in state.
-pub(super) fn status(auth: &Auth) -> (&'static str, Tone) {
-    match auth {
-        Auth::Online => ("Online", Tone::Ok),
-        Auth::Connecting => ("Connecting...", Tone::Neutral),
-        Auth::Offline => ("Offline - reconnecting", Tone::Warn),
-        Auth::Replaced => ("Signed in elsewhere", Tone::Danger),
-        Auth::LoggedOut { .. } | Auth::Working(_) => ("Not signed in", Tone::Neutral),
+/// Returns the status chip text and tone for a connection state.
+pub(super) fn status(connection: &Connection) -> (&'static str, Tone) {
+    match connection {
+        Connection::Online => ("Online", Tone::Ok),
+        Connection::Connecting => ("Connecting...", Tone::Neutral),
+        Connection::Offline => ("Offline - reconnecting", Tone::Warn),
+        Connection::UpdateRequired => ("Update required", Tone::Danger),
+        Connection::Disabled => ("Device disabled", Tone::Danger),
+        Connection::Replaced => ("Signed in elsewhere", Tone::Danger),
     }
 }
 
@@ -53,8 +56,8 @@ pub(super) fn logo(ui: &mut egui::Ui, size: f32) {
     );
 }
 
-/// Draws the signed-in layout: app bar, banners and the open tab.
-fn signed_in(app: &mut ClientApp, ui: &mut egui::Ui) {
+/// Draws the main layout: app bar, banners and the open tab.
+fn main_layout(app: &mut ClientApp, ui: &mut egui::Ui) {
     let p = theme::palette(ui.ctx());
     egui::Panel::top("app_bar")
         .frame(
@@ -63,7 +66,7 @@ fn signed_in(app: &mut ClientApp, ui: &mut egui::Ui) {
                 .inner_margin(Margin::symmetric(20, 10)),
         )
         .show(ui, |ui| app_bar(app, ui));
-    if app.snap.auth == Auth::Replaced || app.snap.banner.is_some() {
+    if app.snap.connection == Connection::Replaced || app.snap.banner.is_some() {
         egui::Panel::top("banners")
             .frame(Frame::NONE)
             .show_separator_line(false)
@@ -86,7 +89,8 @@ fn signed_in(app: &mut ClientApp, ui: &mut egui::Ui) {
         });
 }
 
-/// Draws the app bar: mark, section switcher, status chip and account menu.
+/// Draws the app bar: mark, section switcher, status chip and the account
+/// menu or the sign-in button.
 fn app_bar(app: &mut ClientApp, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.set_min_height(36.0);
@@ -110,14 +114,19 @@ fn app_bar(app: &mut ClientApp, ui: &mut egui::Ui) {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if let Some(account) = app.snap.account.clone() {
                 account_menu(app, ui, &account);
+            } else if ui
+                .add(widgets::btn(ui, Kind::Secondary, None, "Sign in"))
+                .clicked()
+            {
+                app.forms.sign_in = true;
             }
-            let (text, tone) = status(&app.snap.auth);
+            let (text, tone) = status(&app.snap.connection);
             widgets::chip(ui, tone, true, text);
         });
     });
 }
 
-/// Draws the account button with its dropdown holding Log out.
+/// Draws the account button with its dropdown holding Sign out.
 fn account_menu(app: &mut ClientApp, ui: &mut egui::Ui, account: &str) {
     let p = theme::palette(ui.ctx());
     let button = egui::Button::new((
@@ -138,11 +147,11 @@ fn account_menu(app: &mut ClientApp, ui: &mut egui::Ui, account: &str) {
                 ui,
                 Kind::Ghost,
                 Some(icons::LOG_OUT),
-                "Log out",
+                "Sign out",
             ))
             .clicked()
         {
-            app.send(Command::Logout);
+            app.send(Command::SignOut);
         }
     });
     widgets::avatar(ui, account, 28.0);
@@ -150,7 +159,7 @@ fn account_menu(app: &mut ClientApp, ui: &mut egui::Ui, account: &str) {
 
 /// Draws the "signed in elsewhere" strip and the runtime's banner message.
 fn banners(app: &mut ClientApp, ui: &mut egui::Ui) {
-    if app.snap.auth == Auth::Replaced {
+    if app.snap.connection == Connection::Replaced {
         widgets::banner(
             ui,
             Tone::Danger,
@@ -237,22 +246,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn status_covers_every_auth() {
-        assert_eq!(status(&Auth::Online), ("Online", Tone::Ok));
-        assert_eq!(status(&Auth::Connecting), ("Connecting...", Tone::Neutral));
+    fn status_covers_every_connection_state() {
+        assert_eq!(status(&Connection::Online), ("Online", Tone::Ok));
         assert_eq!(
-            status(&Auth::Offline),
+            status(&Connection::Connecting),
+            ("Connecting...", Tone::Neutral)
+        );
+        assert_eq!(
+            status(&Connection::Offline),
             ("Offline - reconnecting", Tone::Warn)
         );
         assert_eq!(
-            status(&Auth::Replaced),
-            ("Signed in elsewhere", Tone::Danger)
+            status(&Connection::UpdateRequired),
+            ("Update required", Tone::Danger)
         );
-        let out = Auth::LoggedOut { message: None };
-        assert_eq!(status(&out), ("Not signed in", Tone::Neutral));
         assert_eq!(
-            status(&Auth::Working("Signing in".into())),
-            ("Not signed in", Tone::Neutral)
+            status(&Connection::Disabled),
+            ("Device disabled", Tone::Danger)
+        );
+        assert_eq!(
+            status(&Connection::Replaced),
+            ("Signed in elsewhere", Tone::Danger)
         );
     }
 

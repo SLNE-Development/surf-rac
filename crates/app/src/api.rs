@@ -1,14 +1,20 @@
-//! HTTP client for the signaling server's account, device, contact and presence routes.
+//! HTTP client for the signaling server's device registration, account,
+//! contact, My devices and presence routes.
 
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use surf_rac_protocol::{
-    ContactInfo, DeviceId, DeviceInfo, ErrorBody, ErrorCode, LoginRequest, LoginResponse,
-    PresenceInfo, PutContactRequest, PutPublicKeyRequest, RegisterDeviceRequest,
+    ContactInfo, DeleteAccountRequest, DeviceId, ErrorBody, ErrorCode, LoginRequest, LoginResponse,
+    MyDeviceInfo, PROTOCOL_VERSION, PresenceInfo, PutContactRequest, RegisterDeviceRequest,
     RegisterDeviceResponse, RegisterRequest,
 };
+use surf_rac_session::IdentityKey;
+
+use crate::runtime::identity::Registrar;
 
 /// How long one HTTP request may take.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -34,6 +40,21 @@ pub enum ApiError {
     /// The resource does not exist.
     #[error("not found")]
     NotFound,
+    /// The server does not support this client's protocol version.
+    #[error("this client must be updated")]
+    UpdateRequired,
+    /// The identity key is registered with another installation's fingerprint.
+    #[error("another installation uses this identity")]
+    CloneDetected,
+    /// A signature did not verify against the identity key.
+    #[error("signature rejected")]
+    BadSignature,
+    /// The server does not know this device ID.
+    #[error("unknown device")]
+    UnknownDevice,
+    /// This device was disabled by an administrator.
+    #[error("device disabled")]
+    DeviceDisabled,
     /// The server could not be reached or the connection broke.
     #[error("server unreachable: {0}")]
     Network(String),
@@ -50,6 +71,13 @@ impl ApiError {
             ApiError::Conflict(m) | ApiError::Locked(m) | ApiError::Invalid(m) => m.clone(),
             ApiError::RateLimited => "Too many attempts. Wait a moment and try again.".into(),
             ApiError::NotFound => "Not found.".into(),
+            ApiError::UpdateRequired => {
+                "This version of surf-rac is too old for the server. Please update.".into()
+            }
+            ApiError::CloneDetected => "Another installation uses this device's identity.".into(),
+            ApiError::BadSignature => "The server rejected this device's signature.".into(),
+            ApiError::UnknownDevice => "The server does not know this device.".into(),
+            ApiError::DeviceDisabled => "This device was disabled by an administrator.".into(),
             ApiError::Network(_) => "The server cannot be reached.".into(),
             ApiError::Server(_) => "The server reported an error.".into(),
         }
@@ -70,12 +98,18 @@ pub fn error_from(status: u16, body: &[u8]) -> ApiError {
         Some(ErrorCode::RateLimited) => ApiError::RateLimited,
         Some(ErrorCode::BadRequest | ErrorCode::Forbidden) => ApiError::Invalid(message),
         Some(ErrorCode::NotFound) => ApiError::NotFound,
+        Some(ErrorCode::UpdateRequired) => ApiError::UpdateRequired,
+        Some(ErrorCode::CloneDetected) => ApiError::CloneDetected,
+        Some(ErrorCode::BadSignature) => ApiError::BadSignature,
+        Some(ErrorCode::UnknownDevice) => ApiError::UnknownDevice,
+        Some(ErrorCode::DeviceDisabled) => ApiError::DeviceDisabled,
         Some(ErrorCode::Unavailable | ErrorCode::Internal) => ApiError::Server(message),
         None => match status {
             401 => ApiError::Unauthorized,
             404 => ApiError::NotFound,
             409 => ApiError::Conflict(message),
             423 => ApiError::Locked(message),
+            426 => ApiError::UpdateRequired,
             429 => ApiError::RateLimited,
             400..=499 => ApiError::Invalid(message),
             _ => ApiError::Server(message),
@@ -83,7 +117,7 @@ pub fn error_from(status: u16, body: &[u8]) -> ApiError {
     }
 }
 
-/// A client for one server, optionally authenticated with a session token.
+/// A client for one server, optionally authenticated with an account session token.
 #[derive(Clone)]
 pub struct Api {
     /// Base URL without a trailing slash, e.g. `https://rac.slne.dev`.
@@ -125,6 +159,11 @@ impl Api {
         }
     }
 
+    /// Returns the account session token this client sends, if any.
+    pub fn token(&self) -> Option<&str> {
+        self.token.as_deref()
+    }
+
     /// Returns the server's base URL.
     pub fn base(&self) -> &str {
         &self.base
@@ -141,15 +180,9 @@ impl Api {
         }
     }
 
-    /// Creates an account with an invite code.
-    pub async fn register(
-        &self,
-        invite: &str,
-        username: &str,
-        password: &str,
-    ) -> Result<(), ApiError> {
+    /// Creates an account.
+    pub async fn register(&self, username: &str, password: &str) -> Result<(), ApiError> {
         let body = RegisterRequest {
-            invite_code: invite.into(),
             username: username.into(),
             password: password.into(),
         };
@@ -176,41 +209,52 @@ impl Api {
         Ok(())
     }
 
-    /// Registers this machine as a device, or re-binds `device_id` to it.
-    pub async fn register_device(
-        &self,
-        fingerprint_hash: &str,
-        name: &str,
-        device_id: Option<DeviceId>,
-    ) -> Result<RegisterDeviceResponse, ApiError> {
-        let body = RegisterDeviceRequest {
-            fingerprint_hash: fingerprint_hash.into(),
-            name: name.into(),
-            device_id,
+    /// Deletes the account of this client's token after checking `password`.
+    ///
+    /// The server removes the account's contacts and device links with it.
+    pub async fn delete_account(&self, password: &str) -> Result<(), ApiError> {
+        let body = DeleteAccountRequest {
+            password: password.into(),
         };
-        self.json(self.http.post(self.url("/v1/devices")).json(&body))
-            .await
-    }
-
-    /// Lists the account's devices.
-    pub async fn devices(&self) -> Result<Vec<DeviceInfo>, ApiError> {
-        self.json(self.http.get(self.url("/v1/devices"))).await
-    }
-
-    /// Removes one of the account's devices.
-    pub async fn delete_device(&self, id: DeviceId) -> Result<(), ApiError> {
-        self.send(self.http.delete(self.url(&format!("/v1/devices/{id}"))))
+        self.send(self.http.delete(self.url("/v1/account")).json(&body))
             .await?;
         Ok(())
     }
 
-    /// Publishes the X25519 public key of one of the account's devices.
-    pub async fn put_public_key(&self, id: DeviceId, public_key: &str) -> Result<(), ApiError> {
-        let body = PutPublicKeyRequest {
-            public_key: public_key.into(),
+    /// Registers the installation holding `identity` and returns its device ID.
+    ///
+    /// The request is signed with `identity`. A key that is already
+    /// registered with the same fingerprint keeps its ID and takes `name`.
+    pub async fn register_device(
+        &self,
+        identity: &IdentityKey,
+        fingerprint_hash: &str,
+        name: &str,
+    ) -> Result<DeviceId, ApiError> {
+        let signature = identity.sign_registration(fingerprint_hash, name);
+        let body = RegisterDeviceRequest {
+            public_key: identity.public().to_base64(),
+            fingerprint_hash: fingerprint_hash.into(),
+            name: name.into(),
+            signature: STANDARD.encode(signature),
+            protocol_version: PROTOCOL_VERSION,
         };
-        self.put(&format!("/v1/devices/{id}/public-key"), &body)
-            .await
+        let res: RegisterDeviceResponse = self
+            .json(self.http.post(self.url("/v1/devices")).json(&body))
+            .await?;
+        Ok(res.device_id)
+    }
+
+    /// Lists the installations linked to the account.
+    pub async fn my_devices(&self) -> Result<Vec<MyDeviceInfo>, ApiError> {
+        self.json(self.http.get(self.url("/v1/my-devices"))).await
+    }
+
+    /// Unlinks one installation from the account; the device itself stays registered.
+    pub async fn unlink_device(&self, id: DeviceId) -> Result<(), ApiError> {
+        self.send(self.http.delete(self.url(&format!("/v1/my-devices/{id}"))))
+            .await?;
+        Ok(())
     }
 
     /// Lists the account's contacts with their presence.
@@ -233,7 +277,7 @@ impl Api {
         Ok(())
     }
 
-    /// Returns whether a device is online and its published public key.
+    /// Returns whether a device is online.
     pub async fn presence(&self, id: DeviceId) -> Result<PresenceInfo, ApiError> {
         self.json(self.http.get(self.url(&format!("/v1/presence/{id}"))))
             .await
@@ -274,6 +318,18 @@ impl Api {
         let status = res.status().as_u16();
         let body = res.bytes().await.unwrap_or_default();
         Err(error_from(status, &body))
+    }
+}
+
+impl Registrar for Api {
+    /// Registers the installation with the server through [`Api::register_device`].
+    fn register_device(
+        &self,
+        identity: &IdentityKey,
+        fingerprint_hash: &str,
+        name: &str,
+    ) -> impl Future<Output = Result<DeviceId, ApiError>> + Send {
+        Api::register_device(self, identity, fingerprint_hash, name)
     }
 }
 
@@ -327,6 +383,26 @@ mod tests {
         );
         assert_eq!(error_from(404, &body("not_found")), ApiError::NotFound);
         assert_eq!(
+            error_from(426, &body("update_required")),
+            ApiError::UpdateRequired
+        );
+        assert_eq!(
+            error_from(409, &body("clone_detected")),
+            ApiError::CloneDetected
+        );
+        assert_eq!(
+            error_from(401, &body("bad_signature")),
+            ApiError::BadSignature
+        );
+        assert_eq!(
+            error_from(404, &body("unknown_device")),
+            ApiError::UnknownDevice
+        );
+        assert_eq!(
+            error_from(403, &body("device_disabled")),
+            ApiError::DeviceDisabled
+        );
+        assert_eq!(
             error_from(500, &body("internal")),
             ApiError::Server("msg".into())
         );
@@ -337,6 +413,7 @@ mod tests {
         assert_eq!(error_from(401, b"<html>"), ApiError::Unauthorized);
         assert_eq!(error_from(404, b""), ApiError::NotFound);
         assert_eq!(error_from(429, b""), ApiError::RateLimited);
+        assert_eq!(error_from(426, b""), ApiError::UpdateRequired);
         assert_eq!(error_from(418, b""), ApiError::Invalid("HTTP 418".into()));
         assert_eq!(
             error_from(502, b"bad gateway"),

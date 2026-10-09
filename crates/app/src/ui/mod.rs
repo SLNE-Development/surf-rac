@@ -24,7 +24,7 @@ use crate::viewmap;
 enum Tab {
     /// Connect by ID and contacts.
     Connect,
-    /// The account's devices.
+    /// The signed-in account's devices.
     Devices,
     /// Settings.
     Settings,
@@ -33,13 +33,13 @@ enum Tab {
 /// Text fields and drafts of the main window.
 #[derive(Default)]
 struct Forms {
-    /// Login or registration username.
+    /// Whether the sign-in screen is open.
+    sign_in: bool,
+    /// Sign-in or registration username.
     username: String,
-    /// Login or registration password.
+    /// Sign-in or registration password.
     password: String,
-    /// Registration invite code.
-    invite: String,
-    /// Whether the login screen shows registration.
+    /// Whether the sign-in screen shows registration.
     register: bool,
     /// Whether the sign-in password is shown in clear text.
     show_password: bool,

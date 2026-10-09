@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use eframe::egui;
+use surf_rac_app::installation::{InstallationStore, PortableStore};
 use surf_rac_app::runtime::Runtime;
 use surf_rac_app::store::{Store, default_dir};
 use surf_rac_app::ui::ClientApp;
@@ -34,6 +35,7 @@ fn main() -> eframe::Result {
     set_dpi_awareness();
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "surf-rac starting");
     let store = Store::open(default_dir());
+    let installation: Arc<dyn InstallationStore> = Arc::new(PortableStore::new(store.clone()));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("surf-rac")
@@ -46,7 +48,8 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             let ctx = cc.egui_ctx.clone();
-            let runtime = Runtime::start(store, Arc::new(move || ctx.request_repaint()))?;
+            let runtime =
+                Runtime::start(store, installation, Arc::new(move || ctx.request_repaint()))?;
             Ok(Box::new(ClientApp::new(&cc.egui_ctx, runtime)))
         }),
     )

@@ -1,10 +1,11 @@
 //! The client's persistent state: one JSON file per Windows user whose secret
-//! fields are protected with the data protection API.
+//! fields are protected with the data protection API in user scope.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -14,7 +15,9 @@ use surf_rac_protocol::DeviceId;
 use crate::dpapi;
 
 /// Version of the state file format this build writes.
-pub const STATE_VERSION: u32 = 1;
+///
+/// A file of any other version is not read; the client starts fresh.
+pub const STATE_VERSION: u32 = 2;
 
 /// Name of the state file inside the state directory.
 const FILE_NAME: &str = "state.json";
@@ -94,6 +97,81 @@ fn lenient_secrets<'de, D: Deserializer<'de>>(
         .collect())
 }
 
+/// An installation as stored: its secret field still protected.
+#[derive(Deserialize)]
+struct RawInstallation {
+    /// The device ID.
+    device_id: DeviceId,
+    /// The protected identity key.
+    identity_key: String,
+    /// The registered device name.
+    name: String,
+}
+
+/// Reads an optional installation, treating one whose key cannot be decrypted as absent.
+fn lenient_installation<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<InstallationState>, D::Error> {
+    let raw = Option::<RawInstallation>::deserialize(deserializer)?;
+    Ok(raw.and_then(|raw| match reveal(&raw.identity_key) {
+        Some(identity_key) => Some(InstallationState {
+            device_id: raw.device_id,
+            identity_key,
+            name: raw.name,
+        }),
+        None => {
+            tracing::warn!("the stored identity key could not be decrypted and is ignored");
+            None
+        }
+    }))
+}
+
+/// An account session as stored: its token still protected.
+#[derive(Deserialize)]
+struct RawAccount {
+    /// The account username.
+    username: String,
+    /// The protected session token.
+    session_token: String,
+}
+
+/// Reads an optional account session, treating one whose token cannot be decrypted as absent.
+fn lenient_account<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<AccountState>, D::Error> {
+    let raw = Option::<RawAccount>::deserialize(deserializer)?;
+    Ok(raw.and_then(|raw| match reveal(&raw.session_token) {
+        Some(session_token) => Some(AccountState {
+            username: raw.username,
+            session_token,
+        }),
+        None => {
+            tracing::warn!("the stored session token could not be decrypted and is ignored");
+            None
+        }
+    }))
+}
+
+/// This installation's registration with the server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InstallationState {
+    /// The device ID the server assigned.
+    pub device_id: DeviceId,
+    /// The Ed25519 identity key, standard base64 of its 32 secret bytes.
+    pub identity_key: Secret,
+    /// The device name the installation registered with.
+    pub name: String,
+}
+
+/// The account a user signed in to on this installation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AccountState {
+    /// The account username.
+    pub username: String,
+    /// The account session token.
+    pub session_token: Secret,
+}
+
 /// Host-side and default session settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -132,30 +210,20 @@ pub struct State {
     pub version: u32,
     /// Server base URL chosen in the settings, if any.
     pub server_url: Option<String>,
-    /// Username of the logged-in account.
-    pub account: Option<String>,
-    /// Session token of the logged-in account.
+    /// This installation's registration, once registered.
     #[serde(
-        deserialize_with = "lenient_secret",
+        deserialize_with = "lenient_installation",
         skip_serializing_if = "Option::is_none"
     )]
-    pub session_token: Option<Secret>,
-    /// This device's ID once registered.
-    pub device_id: Option<DeviceId>,
-    /// This device's secret once registered.
-    #[serde(
-        deserialize_with = "lenient_secret",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub device_secret: Option<Secret>,
-    /// This device's X25519 private key, standard base64 of 32 bytes.
-    #[serde(
-        deserialize_with = "lenient_secret",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub device_key: Option<Secret>,
-    /// Public keys pinned per peer device, standard base64.
+    pub installation: Option<InstallationState>,
+    /// Identity keys pinned per peer device, standard base64.
     pub known_keys: BTreeMap<DeviceId, String>,
+    /// The signed-in account, if any.
+    #[serde(
+        deserialize_with = "lenient_account",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub account: Option<AccountState>,
     /// Unattended passwords remembered per host device.
     #[serde(deserialize_with = "lenient_secrets")]
     pub saved_passwords: BTreeMap<DeviceId, Secret>,
@@ -169,12 +237,9 @@ impl Default for State {
         Self {
             version: STATE_VERSION,
             server_url: None,
-            account: None,
-            session_token: None,
-            device_id: None,
-            device_secret: None,
-            device_key: None,
+            installation: None,
             known_keys: BTreeMap::new(),
+            account: None,
             saved_passwords: BTreeMap::new(),
             settings: Settings::default(),
         }
@@ -182,33 +247,39 @@ impl Default for State {
 }
 
 impl State {
-    /// Forgets everything that belongs to the current server: the account,
-    /// session token, device registration, pinned keys and saved host
-    /// passwords. The device key pair and the settings are kept.
+    /// Forgets everything that belongs to the current server: the
+    /// installation's registration and identity key, the account, pinned keys
+    /// and saved host passwords. The settings are kept.
     pub fn forget_server(&mut self) {
+        self.installation = None;
         self.account = None;
-        self.session_token = None;
-        self.device_id = None;
-        self.device_secret = None;
         self.known_keys.clear();
         self.saved_passwords.clear();
     }
 }
 
-/// The state file and its loaded contents.
+/// The loaded state and the file it belongs to.
 #[derive(Debug)]
-pub struct Store {
+struct Inner {
     /// Path of the state file.
     path: PathBuf,
     /// The current state.
     state: State,
 }
 
+/// The state file and its loaded contents; clones share one state.
+#[derive(Debug, Clone)]
+pub struct Store {
+    /// The shared file path and state.
+    inner: Arc<Mutex<Inner>>,
+}
+
 impl Store {
     /// Loads the state from `dir`, starting empty when there is no file.
     ///
-    /// A file that cannot be parsed is renamed to `state.json.bad` and an empty
-    /// state is used instead.
+    /// A file that cannot be parsed is renamed to `state.json.bad` and an
+    /// empty state is used instead. A file of another format version is
+    /// ignored and an empty state is used; it is overwritten on the next save.
     pub fn open(dir: PathBuf) -> Store {
         let path = dir.join(FILE_NAME);
         let state = match std::fs::read(&path) {
@@ -217,32 +288,60 @@ impl Store {
                 tracing::warn!(error = %e, "state file unreadable, starting empty");
                 State::default()
             }
-            Ok(bytes) => match serde_json::from_slice::<State>(&bytes) {
-                Ok(state) => state,
-                Err(e) => {
-                    tracing::warn!(error = %e, "state file corrupt, moved aside");
-                    let _ = std::fs::rename(&path, path.with_extension("json.bad"));
-                    State::default()
-                }
-            },
+            Ok(bytes) => parse(&path, &bytes),
         };
-        Store { path, state }
+        Store {
+            inner: Arc::new(Mutex::new(Inner { path, state })),
+        }
     }
 
-    /// Returns the current state.
-    pub fn state(&self) -> &State {
-        &self.state
+    /// Returns a copy of the current state.
+    pub fn state(&self) -> State {
+        self.lock().state.clone()
     }
 
     /// Applies `change` to the state and writes the file atomically.
     ///
     /// The in-memory state changes only when the write succeeds.
-    pub fn update(&mut self, change: impl FnOnce(&mut State)) -> io::Result<()> {
-        let mut next = self.state.clone();
+    pub fn update(&self, change: impl FnOnce(&mut State)) -> io::Result<()> {
+        let mut inner = self.lock();
+        let mut next = inner.state.clone();
         change(&mut next);
-        write_atomic(&self.path, &next)?;
-        self.state = next;
+        write_atomic(&inner.path, &next)?;
+        inner.state = next;
         Ok(())
+    }
+
+    /// Locks the shared state, recovering from a poisoned lock.
+    fn lock(&self) -> MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Parses the contents of the state file at `path`.
+///
+/// Returns an empty state for a file of another format version, and moves a
+/// file that is not a valid state aside to `state.json.bad`.
+fn parse(path: &Path, bytes: &[u8]) -> State {
+    let version = serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .map(|v| v.get("version").and_then(serde_json::Value::as_u64));
+    if let Some(version) = version
+        && version != Some(u64::from(STATE_VERSION))
+    {
+        tracing::warn!(
+            ?version,
+            "state file has another format version, starting fresh"
+        );
+        return State::default();
+    }
+    match serde_json::from_slice::<State>(bytes) {
+        Ok(state) => state,
+        Err(e) => {
+            tracing::warn!(error = %e, "state file corrupt, moved aside");
+            let _ = std::fs::rename(path, path.with_extension("json.bad"));
+            State::default()
+        }
     }
 }
 
@@ -288,22 +387,34 @@ mod tests {
         DeviceId::new(n).unwrap()
     }
 
+    /// Returns an installation with fixed test values.
+    fn installation() -> InstallationState {
+        InstallationState {
+            device_id: id(123_456_789),
+            identity_key: Secret::new("identity-key-bytes"),
+            name: "laptop".into(),
+        }
+    }
+
     #[test]
     fn missing_file_gives_default_state() {
         let store = Store::open(temp_dir("missing"));
-        assert_eq!(store.state(), &State::default());
+        assert_eq!(store.state(), State::default());
+        assert!(store.state().installation.is_none());
+        assert!(store.state().account.is_none());
     }
 
     #[test]
     fn state_round_trips_and_secrets_are_not_stored_in_plain_text() {
         let dir = temp_dir("round");
-        let mut store = Store::open(dir.clone());
+        let store = Store::open(dir.clone());
         store
             .update(|s| {
-                s.account = Some("alice".into());
-                s.session_token = Some(Secret::new("token-123"));
-                s.device_id = Some(id(123_456_789));
-                s.device_secret = Some(Secret::new("device-secret"));
+                s.installation = Some(installation());
+                s.account = Some(AccountState {
+                    username: "alice".into(),
+                    session_token: Secret::new("token-123"),
+                });
                 s.known_keys.insert(id(223_456_789), "AAAA".into());
                 s.saved_passwords
                     .insert(id(223_456_789), Secret::new("hunter22"));
@@ -311,11 +422,62 @@ mod tests {
             })
             .unwrap();
         let raw = std::fs::read_to_string(dir.join(FILE_NAME)).unwrap();
-        for secret in ["token-123", "device-secret", "hunter22"] {
+        for secret in ["token-123", "identity-key-bytes", "hunter22"] {
             assert!(!raw.contains(secret), "{secret} stored in plain text");
         }
+        assert!(raw.contains("\"version\": 2"));
         let reloaded = Store::open(dir);
         assert_eq!(reloaded.state(), store.state());
+        assert_eq!(reloaded.state().installation, Some(installation()));
+        assert_eq!(
+            reloaded.state().account.map(|a| a.username).as_deref(),
+            Some("alice")
+        );
+    }
+
+    #[test]
+    fn clones_share_one_state() {
+        let dir = temp_dir("shared");
+        let store = Store::open(dir);
+        let other = store.clone();
+        other
+            .update(|s| s.installation = Some(installation()))
+            .unwrap();
+        assert_eq!(store.state().installation, Some(installation()));
+    }
+
+    #[test]
+    fn old_version_file_starts_fresh() {
+        let dir = temp_dir("old");
+        let json = serde_json::json!({
+            "version": 1,
+            "server_url": "https://old.example",
+            "account": "alice",
+            "session_token": STANDARD.encode(b"blob"),
+            "device_id": "123456789",
+            "device_secret": STANDARD.encode(b"blob"),
+            "device_key": STANDARD.encode(b"blob"),
+            "known_keys": { "223456789": "AAAA" },
+            "settings": { "unattended": true },
+        });
+        std::fs::write(dir.join(FILE_NAME), json.to_string()).unwrap();
+        let store = Store::open(dir.clone());
+        assert_eq!(store.state(), State::default());
+        store.update(|s| s.settings.unattended = true).unwrap();
+        let reloaded = Store::open(dir);
+        assert_eq!(reloaded.state().version, STATE_VERSION);
+        assert!(reloaded.state().installation.is_none());
+    }
+
+    #[test]
+    fn file_without_version_starts_fresh() {
+        let dir = temp_dir("noversion");
+        std::fs::write(
+            dir.join(FILE_NAME),
+            br#"{"known_keys":{"223456789":"AAAA"}}"#,
+        )
+        .unwrap();
+        assert_eq!(Store::open(dir).state(), State::default());
     }
 
     #[test]
@@ -323,7 +485,7 @@ mod tests {
         let dir = temp_dir("corrupt");
         std::fs::write(dir.join(FILE_NAME), b"{not json").unwrap();
         let store = Store::open(dir.clone());
-        assert_eq!(store.state(), &State::default());
+        assert_eq!(store.state(), State::default());
         assert!(dir.join("state.json.bad").exists());
     }
 
@@ -331,28 +493,39 @@ mod tests {
     fn undecryptable_secrets_are_dropped() {
         let dir = temp_dir("foreign");
         let json = serde_json::json!({
-            "version": 1,
-            "account": "alice",
-            "session_token": STANDARD.encode(b"not a protected blob"),
+            "version": STATE_VERSION,
+            "installation": {
+                "device_id": "123456789",
+                "identity_key": STANDARD.encode(b"not a protected blob"),
+                "name": "laptop",
+            },
+            "account": {
+                "username": "alice",
+                "session_token": STANDARD.encode(b"not a protected blob"),
+            },
             "saved_passwords": { "223456789": "!!" },
+            "settings": { "unattended": true },
         });
         std::fs::write(dir.join(FILE_NAME), json.to_string()).unwrap();
         let store = Store::open(dir);
-        assert_eq!(store.state().account.as_deref(), Some("alice"));
         #[cfg(windows)]
-        assert!(store.state().session_token.is_none());
+        {
+            assert!(store.state().installation.is_none());
+            assert!(store.state().account.is_none());
+        }
         assert!(store.state().saved_passwords.is_empty());
+        assert!(store.state().settings.unattended);
     }
 
     #[test]
     fn forgetting_the_server_drops_everything_bound_to_it() {
         let mut state = State {
             server_url: Some("https://old.example".into()),
-            account: Some("alice".into()),
-            session_token: Some(Secret::new("token")),
-            device_id: Some(id(123_456_789)),
-            device_secret: Some(Secret::new("secret")),
-            device_key: Some(Secret::new("key")),
+            installation: Some(installation()),
+            account: Some(AccountState {
+                username: "alice".into(),
+                session_token: Secret::new("token"),
+            }),
             ..State::default()
         };
         state.known_keys.insert(id(223_456_789), "AAAA".into());
@@ -361,13 +534,10 @@ mod tests {
             .insert(id(223_456_789), Secret::new("pw"));
         state.settings.unattended = true;
         state.forget_server();
+        assert!(state.installation.is_none());
         assert!(state.account.is_none());
-        assert!(state.session_token.is_none());
-        assert!(state.device_id.is_none());
-        assert!(state.device_secret.is_none());
         assert!(state.known_keys.is_empty());
         assert!(state.saved_passwords.is_empty());
-        assert!(state.device_key.is_some());
         assert!(state.settings.unattended);
     }
 
@@ -375,9 +545,15 @@ mod tests {
     fn secret_debug_is_redacted() {
         assert_eq!(format!("{:?}", Secret::new("hunter22")), "Secret(..)");
         let state = State {
-            session_token: Some(Secret::new("token-123")),
+            account: Some(AccountState {
+                username: "alice".into(),
+                session_token: Secret::new("token-123"),
+            }),
+            installation: Some(installation()),
             ..State::default()
         };
-        assert!(!format!("{state:?}").contains("token-123"));
+        let debug = format!("{state:?}");
+        assert!(!debug.contains("token-123"));
+        assert!(!debug.contains("identity-key-bytes"));
     }
 }

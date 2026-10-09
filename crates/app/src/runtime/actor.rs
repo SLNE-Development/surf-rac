@@ -7,48 +7,63 @@ use std::time::Duration;
 
 use surf_rac_protocol::data::{Control, DataMessage, InputState, ScreenState};
 use surf_rac_protocol::{
-    ClientMessage, ContactInfo, DenyReason, DeviceId, DeviceInfo, ServerMessage,
+    ClientMessage, ContactInfo, DenyReason, DeviceId, MyDeviceInfo, ServerMessage,
 };
 use surf_rac_session::host::{HostEvent, HostSession};
 use surf_rac_session::signaling::{SignalingClient, SignalingError};
 use surf_rac_session::viewer::{RequestError, RequestOptions, ViewerEvent, ViewerSession};
-use surf_rac_session::{KnownKeys, PublicKey, SessionConfig};
+use surf_rac_session::{IdentityPublic, KnownKeys, SessionConfig};
 use tokio::sync::mpsc;
 
+use super::account::{self, LinkError};
 use super::hosting::Hosting;
-use super::identity::{self, Identity};
+use super::identity::{self, Identity, IdentityError};
 use super::{
-    Auth, Command, ContactView, DEFAULT_SERVER, FrameImage, Repaint, SERVER_ENV, Snapshot,
-    ViewerStatus, ViewerView, backoff, end_text, lock, may_fetch_host_key, offer_forget,
-    password_offer, request_error_text,
+    AccountTask, Command, ConnectAction, Connection, ContactView, DEFAULT_SERVER, FrameImage,
+    Repaint, SERVER_ENV, Snapshot, ViewerStatus, ViewerView, backoff, connect_action, end_text,
+    lock, offer_forget, password_offer, password_to_send, registration_action, request_error_text,
 };
 use crate::access;
 use crate::api::{Api, ApiError};
 use crate::clipboard::{self, ClipboardSync};
-use crate::store::{Secret, Settings, Store};
+use crate::fingerprint;
+use crate::installation::InstallationStore;
+use crate::store::{AccountState, Secret, Settings, Store};
 use crate::yuv;
 
 /// How often the clipboard is checked while a session syncs it.
 const CLIPBOARD_POLL: Duration = Duration::from_millis(500);
 
+/// Banner shown when the server needs a newer client.
+const UPDATE_REQUIRED_TEXT: &str =
+    "This version of surf-rac is too old for the server. Please update to connect.";
+
+/// Banner shown when an administrator disabled this device.
+const DISABLED_TEXT: &str = "This device was disabled by the server's administrator.";
+
+/// Banner shown when an account action needs a signed-in account.
+const SIGN_IN_FIRST_TEXT: &str = "Sign in to an account to keep contacts and devices.";
+
 /// Events from tasks the actor spawned.
 pub(super) enum Internal {
-    /// Login or registration finished.
-    LoggedIn(Result<(String, Secret), String>),
-    /// Device registration finished.
-    DeviceReady(Result<Identity, String>),
+    /// Setting up the installation's identity of generation `.0` finished.
+    IdentityReady(u64, Result<Identity, IdentityError>),
     /// A signaling connection of generation `.0` opened.
     Connected(u64, SignalingClient),
     /// A connection attempt of generation `.0` failed.
     ConnectFailed(u64, SignalingError),
-    /// The server rejected the connection; `.1` tells whether the session token is still valid.
-    Rejected(u64, bool),
     /// A message arrived on the connection of generation `.0`.
     Signal(u64, ServerMessage),
     /// The connection of generation `.0` closed.
     SignalingClosed(u64),
-    /// Devices and contacts loaded.
-    Lists(Result<(Vec<DeviceInfo>, Vec<ContactInfo>), ApiError>),
+    /// Signing in or creating an account finished: the username and session token.
+    SignedIn(Result<(String, Secret), String>),
+    /// Linking this installation over the connection of generation `.0` finished.
+    Linked(u64, Result<String, LinkError>),
+    /// Deleting the account finished.
+    AccountDeleted(Result<(), ApiError>),
+    /// My devices and contacts loaded.
+    Lists(Result<(Vec<MyDeviceInfo>, Vec<ContactInfo>), ApiError>),
     /// An API call failed.
     ApiFailed(ApiError),
     /// Hosting of generation `.0` started or failed.
@@ -68,7 +83,7 @@ pub(super) enum Internal {
         session: u64,
         /// The outcome.
         result: Result<(ViewerSession, mpsc::Receiver<ViewerEvent>), RequestError>,
-        /// Whether the saved password was sealed into the request.
+        /// Whether the saved password was sent with the request.
         used_saved: bool,
         /// A typed password to save once the session started.
         remember: Option<String>,
@@ -147,26 +162,34 @@ fn open_clipboard() -> Clipboard {
 pub(super) struct Actor {
     /// The state file.
     pub(super) store: Store,
+    /// Where this installation's identity is kept.
+    installation: Arc<dyn InstallationStore>,
+    /// This machine's fingerprint hash, or why it could not be read.
+    fingerprint: Result<String, String>,
     /// The published snapshot.
     shared: Arc<Mutex<Snapshot>>,
     /// Asks the UI to redraw.
     pub(super) repaint: Repaint,
     /// Sender for task events.
     pub(super) internal: mpsc::UnboundedSender<Internal>,
-    /// Sign-in and connection state.
-    pub(super) auth: Auth,
-    /// API client with the current token.
+    /// The connection to the signaling server.
+    pub(super) connection: Connection,
+    /// The running or last failed account action.
+    account_task: AccountTask,
+    /// API client, with the account's session token while signed in.
     pub(super) api: Api,
-    /// This device, once registered.
+    /// This installation, once registered.
     pub(super) identity: Option<Identity>,
-    /// Pinned peer keys.
+    /// Pinned peer identity keys.
     pub(super) known: Arc<Mutex<KnownKeys>>,
     /// The open signaling connection.
     pub(super) signaling: Option<SignalingClient>,
-    /// Generation of the current connection; events of older ones are ignored.
+    /// Generation of the current registration or connection; events of older ones are ignored.
     pub(super) generation: u64,
-    /// Failed connection attempts in a row.
+    /// Failed registration or connection attempts in a row.
     attempts: u32,
+    /// Whether the installation was renewed since the last successful connection.
+    renewed: bool,
     /// Hosting, when running.
     pub(super) host: Option<Hosting>,
     /// Whether hosting is being started.
@@ -177,9 +200,9 @@ pub(super) struct Actor {
     viewers: BTreeMap<u64, Viewing>,
     /// Next viewer session number.
     next_session: u64,
-    /// The account's devices.
-    devices: Vec<DeviceInfo>,
-    /// The account's contacts.
+    /// The installations linked to the signed-in account.
+    my_devices: Vec<MyDeviceInfo>,
+    /// The signed-in account's contacts.
     pub(super) contacts: Vec<ContactView>,
     /// A message for the user.
     pub(super) banner: Option<String>,
@@ -196,51 +219,72 @@ fn server_url(store: &Store) -> String {
     std::env::var(SERVER_ENV)
         .ok()
         .filter(|s| !s.is_empty())
-        .or_else(|| store.state().server_url.clone())
+        .or_else(|| store.state().server_url)
         .unwrap_or_else(|| DEFAULT_SERVER.into())
 }
 
-/// Loads pinned keys from the state.
+/// Loads pinned identity keys from the state.
 fn load_known(store: &Store) -> KnownKeys {
     let mut known = KnownKeys::default();
     for (id, key) in &store.state().known_keys {
-        if let Ok(key) = PublicKey::from_base64(key) {
+        if let Ok(key) = IdentityPublic::from_base64(key) {
             known.trust_key(*id, key);
         }
     }
     known
 }
 
+/// Returns the API client for the server of `store`, with the account's token when signed in.
+fn api_for(store: &Store) -> Api {
+    Api::new(&server_url(store)).with_token(
+        store
+            .state()
+            .account
+            .map(|a| a.session_token.expose().to_string()),
+    )
+}
+
+/// Returns the banner text for a connection state the client stopped in.
+fn stop_text(connection: &Connection) -> Option<&'static str> {
+    match connection {
+        Connection::UpdateRequired => Some(UPDATE_REQUIRED_TEXT),
+        Connection::Disabled => Some(DISABLED_TEXT),
+        _ => None,
+    }
+}
+
 impl Actor {
-    /// Creates the actor from the loaded state.
-    pub(super) fn new(store: Store, shared: Arc<Mutex<Snapshot>>, repaint: Repaint) -> Actor {
+    /// Creates the actor from the loaded state and the installation store.
+    pub(super) fn new(
+        store: Store,
+        installation: Arc<dyn InstallationStore>,
+        shared: Arc<Mutex<Snapshot>>,
+        repaint: Repaint,
+    ) -> Actor {
         let (internal, _) = mpsc::unbounded_channel();
-        let api = Api::new(&server_url(&store)).with_token(
-            store
-                .state()
-                .session_token
-                .as_ref()
-                .map(|t| t.expose().to_string()),
-        );
         let known = Arc::new(Mutex::new(load_known(&store)));
         Actor {
-            identity: Identity::from_state(store.state()),
+            api: api_for(&store),
             store,
+            installation,
+            fingerprint: fingerprint::fingerprint_hash().map_err(|e| e.to_string()),
             shared,
             repaint,
             internal,
-            auth: Auth::LoggedOut { message: None },
-            api,
+            connection: Connection::Connecting,
+            account_task: AccountTask::Idle,
+            identity: None,
             known,
             signaling: None,
             generation: 0,
             attempts: 0,
+            renewed: false,
             host: None,
             host_starting: false,
             host_generation: 0,
             viewers: BTreeMap::new(),
             next_session: 1,
-            devices: Vec::new(),
+            my_devices: Vec::new(),
             contacts: Vec::new(),
             banner: None,
             clipboard: open_clipboard(),
@@ -253,7 +297,7 @@ impl Actor {
     pub(super) async fn run(mut self, mut commands: mpsc::UnboundedReceiver<Command>) {
         let (internal, mut internal_rx) = mpsc::unbounded_channel();
         self.internal = internal;
-        self.resume();
+        self.start_identity(false);
         self.publish();
         let mut tick = tokio::time::interval(CLIPBOARD_POLL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -281,57 +325,27 @@ impl Actor {
         }
     }
 
-    /// Picks up where the last run ended: connects when logged in.
-    fn resume(&mut self) {
-        if self.store.state().session_token.is_none() {
-            return;
-        }
-        if self.identity.is_some() {
-            self.auth = Auth::Connecting;
-            self.connect_now();
-        } else {
-            self.register_device();
-        }
-    }
-
     /// Handles one command from the UI.
     async fn command(&mut self, command: Command) {
         match command {
-            Command::Login { username, password } => self.login(None, username, password),
-            Command::Register {
-                invite,
-                username,
-                password,
-            } => self.login(Some(invite), username, password),
-            Command::Logout => self.logout(None).await,
-            Command::SetServer(url) => {
-                let url = url.trim().trim_end_matches('/').to_string();
-                let saved = (!url.is_empty()).then_some(url);
-                if saved == self.store.state().server_url {
-                    return;
-                }
-                self.logout(None).await;
-                self.identity = None;
-                *lock(&self.known) = KnownKeys::default();
-                self.save(|s| {
-                    s.forget_server();
-                    s.server_url = saved;
-                });
-                self.api = Api::new(&server_url(&self.store));
-            }
+            Command::SignIn { username, password } => self.sign_in(username, password, false),
+            Command::CreateAccount { username, password } => self.sign_in(username, password, true),
+            Command::SignOut => self.sign_out(),
+            Command::DeleteAccount { password } => self.delete_account(password),
+            Command::SetServer(url) => self.set_server(url).await,
             Command::RefreshLists => self.refresh_lists(),
             Command::PutContact { id, alias } => {
                 let api = self.api.clone();
-                self.spawn_api(async move { api.put_contact(id, &alias).await });
+                self.spawn_account_api(async move { api.put_contact(id, &alias).await });
             }
             Command::DeleteContact(id) => {
                 let api = self.api.clone();
-                self.spawn_api(async move { api.delete_contact(id).await });
+                self.spawn_account_api(async move { api.delete_contact(id).await });
             }
-            Command::DeleteDevice(id) => {
+            Command::UnlinkDevice(id) => {
                 if Some(id) != self.identity.as_ref().map(|i| i.id) {
                     let api = self.api.clone();
-                    self.spawn_api(async move { api.delete_device(id).await });
+                    self.spawn_account_api(async move { api.unlink_device(id).await });
                 }
             }
             Command::Connect {
@@ -376,8 +390,8 @@ impl Actor {
                 }
             }
             Command::Reconnect => {
-                if self.auth == Auth::Replaced {
-                    self.auth = Auth::Connecting;
+                if self.connection == Connection::Replaced {
+                    self.connection = Connection::Connecting;
                     self.connect_now();
                 }
             }
@@ -389,52 +403,14 @@ impl Actor {
     /// Handles one event from a spawned task.
     async fn event(&mut self, event: Internal) {
         match event {
-            Internal::LoggedIn(Ok((account, token))) => {
-                self.save(|s| {
-                    s.account = Some(account);
-                    s.session_token = Some(token.clone());
-                });
-                self.api = self.api.with_token(Some(token.expose().to_string()));
-                if self.identity.is_some() {
-                    self.auth = Auth::Connecting;
-                    self.connect_now();
-                } else {
-                    self.register_device();
-                }
-            }
-            Internal::LoggedIn(Err(message)) => {
-                self.auth = Auth::LoggedOut {
-                    message: Some(message),
-                }
-            }
-            Internal::DeviceReady(Ok(identity)) => {
-                self.save(|s| identity.store(s));
-                self.identity = Some(identity);
-                self.auth = Auth::Connecting;
-                self.connect_now();
-            }
-            Internal::DeviceReady(Err(message)) => {
-                self.auth = Auth::LoggedOut {
-                    message: Some(format!("This device could not be registered: {message}")),
-                }
+            Internal::IdentityReady(generation, result) if generation == self.generation => {
+                self.on_identity(result)
             }
             Internal::Connected(generation, client) if generation == self.generation => {
                 self.on_connected(generation, client)
             }
             Internal::ConnectFailed(generation, error) if generation == self.generation => {
-                self.on_connect_failed(generation, error)
-            }
-            Internal::Rejected(generation, token_valid) if generation == self.generation => {
-                if token_valid {
-                    tracing::warn!("device credentials rejected, registering again");
-                    self.identity = None;
-                    self.save(|s| {
-                        s.device_secret = None;
-                    });
-                    self.register_device();
-                } else {
-                    self.expire_session().await;
-                }
+                self.on_connect_failed(error)
             }
             Internal::Signal(generation, message) if generation == self.generation => {
                 self.on_signal(message).await
@@ -442,8 +418,16 @@ impl Actor {
             Internal::SignalingClosed(generation) if generation == self.generation => {
                 self.on_signaling_closed().await
             }
+            Internal::Linked(generation, result) if generation == self.generation => {
+                self.on_linked(result)
+            }
+            Internal::SignedIn(result) => self.on_signed_in(result),
+            Internal::AccountDeleted(result) => self.on_account_deleted(result),
             Internal::Lists(Ok((devices, contacts))) => {
-                self.devices = devices;
+                if self.account().is_none() {
+                    return;
+                }
+                self.my_devices = devices;
                 self.contacts = contacts
                     .into_iter()
                     .map(|c| ContactView {
@@ -455,7 +439,7 @@ impl Actor {
             }
             Internal::Lists(Err(e)) | Internal::ApiFailed(e) => {
                 if e == ApiError::Unauthorized {
-                    self.expire_session().await;
+                    self.expire_account();
                 } else {
                     self.banner = Some(e.user_message());
                 }
@@ -473,11 +457,12 @@ impl Actor {
                 remember,
             } => self.on_viewer_started(session, result, used_saved, remember),
             Internal::Viewer(session, event) => self.on_viewer_event(session, event).await,
-            Internal::Connected(..)
+            Internal::IdentityReady(..)
+            | Internal::Connected(..)
             | Internal::ConnectFailed(..)
-            | Internal::Rejected(..)
             | Internal::Signal(..)
-            | Internal::SignalingClosed(..) => {}
+            | Internal::SignalingClosed(..)
+            | Internal::Linked(..) => {}
         }
     }
 
@@ -500,62 +485,75 @@ impl Actor {
         }
     }
 
-    /// Logs in, or registers and then logs in when `invite` is set.
-    fn login(&mut self, invite: Option<String>, username: String, password: String) {
-        self.auth = Auth::Working(if invite.is_some() {
-            "Creating account...".into()
-        } else {
-            "Logging in...".into()
-        });
+    /// Returns the signed-in account, if any.
+    fn account(&self) -> Option<AccountState> {
+        self.store.state().account
+    }
+
+    /// Loads or registers this installation's identity in the background,
+    /// after the current backoff; with `renew` the stored one is discarded
+    /// and a new one registered.
+    fn start_identity(&mut self, renew: bool) {
+        let fingerprint = match &self.fingerprint {
+            Ok(fingerprint) => fingerprint.clone(),
+            Err(e) => {
+                tracing::error!(error = %e, "no device fingerprint, cannot register");
+                self.connection = Connection::Offline;
+                self.banner = Some(format!("This device cannot be registered: {e}"));
+                return;
+            }
+        };
+        self.generation += 1;
+        let generation = self.generation;
+        let delay = backoff(self.attempts);
+        let store = Arc::clone(&self.installation);
         let api = self.api.with_token(None);
         let tx = self.internal.clone();
         tokio::spawn(async move {
-            let result = async {
-                if let Some(invite) = invite {
-                    api.register(&invite, &username, &password).await?;
-                }
-                api.login(&username, &password).await
+            tokio::time::sleep(delay).await;
+            let name = identity::device_name();
+            let result = if renew {
+                identity::renew(&*store, &api, &fingerprint, &name).await
+            } else {
+                identity::ensure(&*store, &api, &fingerprint, &name).await
+            };
+            let _ = tx.send(Internal::IdentityReady(generation, result));
+        });
+    }
+
+    /// Takes a loaded or registered identity into use and connects, or
+    /// handles why there is none.
+    fn on_identity(&mut self, result: Result<Identity, IdentityError>) {
+        match result {
+            Ok(identity) => {
+                tracing::info!(device_id = %identity.id, "installation identity ready");
+                self.identity = Some(identity);
+                self.connect_now();
             }
-            .await
-            .map(|token| (username, Secret::new(token)))
-            .map_err(|e| e.user_message());
-            let _ = tx.send(Internal::LoggedIn(result));
-        });
-    }
-
-    /// Registers this device in the background.
-    fn register_device(&mut self) {
-        self.auth = Auth::Working("Registering this device...".into());
-        let api = self.api.clone();
-        let state = self.store.state().clone();
-        let tx = self.internal.clone();
-        tokio::spawn(async move {
-            let _ = tx.send(Internal::DeviceReady(
-                identity::register(&api, &state).await,
-            ));
-        });
-    }
-
-    /// Stops all sessions and forgets the session token.
-    async fn logout(&mut self, message: Option<String>) {
-        if self.store.state().session_token.is_some() {
-            let api = self.api.clone();
-            tokio::spawn(async move {
-                let _ = api.logout().await;
-            });
+            Err(IdentityError::Api(e)) => {
+                tracing::warn!(error = %e, "installation registration failed");
+                match registration_action(&e) {
+                    ConnectAction::Stop(state) => self.stop_connecting(state),
+                    ConnectAction::Retry | ConnectAction::Renew => {
+                        self.connection = Connection::Offline;
+                        self.attempts = self.attempts.saturating_add(1);
+                        self.start_identity(false);
+                    }
+                }
+            }
+            Err(IdentityError::Store(e)) => {
+                tracing::error!(error = %e, "installation not stored");
+                self.connection = Connection::Offline;
+                self.banner = Some("This device's identity could not be saved.".into());
+            }
         }
-        self.stop_all().await;
-        self.save(|s| s.session_token = None);
-        self.api = self.api.with_token(None);
-        self.devices.clear();
-        self.contacts.clear();
-        self.auth = Auth::LoggedOut { message };
     }
 
-    /// Logs out because the server no longer accepts the session token.
-    async fn expire_session(&mut self) {
-        self.logout(Some("Your session expired. Please log in again.".into()))
-            .await;
+    /// Stops connecting in `state` and tells the user why.
+    fn stop_connecting(&mut self, state: Connection) {
+        tracing::warn!(?state, "no further connection attempts");
+        self.banner = stop_text(&state).map(str::to_string);
+        self.connection = state;
     }
 
     /// Ends every session and the signaling connection.
@@ -571,12 +569,36 @@ impl Actor {
         self.stop_hosting().await;
     }
 
+    /// Switches to the server at `url`: signs out, forgets everything bound
+    /// to the old server and registers this installation with the new one.
+    async fn set_server(&mut self, url: String) {
+        let url = url.trim().trim_end_matches('/').to_string();
+        let saved = (!url.is_empty()).then_some(url);
+        if saved == self.store.state().server_url {
+            return;
+        }
+        self.sign_out();
+        self.stop_all().await;
+        self.identity = None;
+        *lock(&self.known) = KnownKeys::default();
+        if let Err(e) = self.installation.clear() {
+            tracing::error!(error = %e, "installation not cleared");
+        }
+        self.save(|s| {
+            s.forget_server();
+            s.server_url = saved;
+        });
+        self.api = api_for(&self.store);
+        self.renewed = false;
+        self.banner = None;
+        self.connection = Connection::Connecting;
+        self.start_identity(false);
+    }
+
     /// Starts a connection attempt after the current backoff.
     fn connect_now(&mut self) {
-        let (Some(identity), Some(token)) = (
-            self.identity.clone(),
-            self.store.state().session_token.clone(),
-        ) else {
+        let (Some(identity), Ok(fingerprint)) = (self.identity.clone(), self.fingerprint.clone())
+        else {
             return;
         };
         self.generation += 1;
@@ -588,9 +610,9 @@ impl Actor {
             tokio::time::sleep(delay).await;
             let event = match SignalingClient::connect(
                 &url,
-                token.expose(),
                 identity.id,
-                identity.secret.expose(),
+                &identity.key,
+                &fingerprint,
             )
             .await
             {
@@ -601,10 +623,12 @@ impl Actor {
         });
     }
 
-    /// Takes a new connection into use and starts listening on it.
+    /// Takes a new connection into use, starts listening on it, links the
+    /// signed-in account and starts hosting.
     fn on_connected(&mut self, generation: u64, client: SignalingClient) {
         self.attempts = 0;
-        self.auth = Auth::Online;
+        self.renewed = false;
+        self.connection = Connection::Online;
         let mut events = client.subscribe();
         self.signaling = Some(client);
         let tx = self.internal.clone();
@@ -616,27 +640,34 @@ impl Actor {
             }
             let _ = tx.send(Internal::SignalingClosed(generation));
         });
+        self.link_account();
         self.refresh_lists();
         if self.host.is_none() {
             self.start_hosting();
         }
     }
 
-    /// Handles a failed connection attempt: checks credentials on rejection, else retries.
-    fn on_connect_failed(&mut self, generation: u64, error: SignalingError) {
-        if let SignalingError::Rejected(401 | 403) = error {
-            let api = self.api.clone();
-            let tx = self.internal.clone();
-            tokio::spawn(async move {
-                let token_valid = !matches!(api.devices().await, Err(ApiError::Unauthorized));
-                let _ = tx.send(Internal::Rejected(generation, token_valid));
-            });
-            return;
-        }
+    /// Handles a failed connection attempt: renews a cloned or unknown
+    /// installation once, stops for an outdated client or a disabled device,
+    /// and otherwise retries with backoff.
+    fn on_connect_failed(&mut self, error: SignalingError) {
         tracing::info!(error = %error, "signaling connection failed");
-        self.auth = Auth::Offline;
-        self.attempts = self.attempts.saturating_add(1);
-        self.connect_now();
+        match connect_action(&error, self.renewed) {
+            ConnectAction::Stop(state) => self.stop_connecting(state),
+            ConnectAction::Renew => {
+                tracing::warn!(error = %error, "installation refused, registering a new one");
+                self.identity = None;
+                self.renewed = true;
+                self.connection = Connection::Connecting;
+                self.attempts = self.attempts.saturating_add(1);
+                self.start_identity(true);
+            }
+            ConnectAction::Retry => {
+                self.connection = Connection::Offline;
+                self.attempts = self.attempts.saturating_add(1);
+                self.connect_now();
+            }
+        }
     }
 
     /// Handles a message from the signaling server.
@@ -646,7 +677,11 @@ impl Actor {
                 for c in self.contacts.iter_mut().filter(|c| c.id == device_id) {
                     c.online = online;
                 }
-                for d in self.devices.iter_mut().filter(|d| d.device_id == device_id) {
+                for d in self
+                    .my_devices
+                    .iter_mut()
+                    .filter(|d| d.device_id == device_id)
+                {
                     d.online = online;
                 }
             }
@@ -654,7 +689,7 @@ impl Actor {
                 tracing::warn!("another connection replaced this device");
                 self.generation += 1;
                 self.signaling = None;
-                self.auth = Auth::Replaced;
+                self.connection = Connection::Replaced;
                 self.mark_hosting_stale().await;
             }
             ServerMessage::SessionRequest {
@@ -667,7 +702,8 @@ impl Actor {
                             session_id,
                             accepted: false,
                             reason: Some(DenyReason::Denied),
-                            host_public_key: None,
+                            session_key: None,
+                            signature: None,
                             host_nonce: None,
                         })
                         .await;
@@ -677,42 +713,181 @@ impl Actor {
         }
     }
 
-    /// Handles the end of the signaling connection: reconnects, and ends hosting
-    /// once no viewer depends on it.
+    /// Handles the end of the signaling connection: stops for a disabled
+    /// device, otherwise reconnects; ends hosting once no viewer depends on it.
     async fn on_signaling_closed(&mut self) {
-        tracing::info!("signaling connection closed");
-        self.signaling = None;
-        self.auth = Auth::Offline;
-        self.attempts = self.attempts.saturating_add(1);
+        let reason = self.signaling.take().and_then(|s| s.end_reason());
+        tracing::info!(?reason, "signaling connection closed");
         self.mark_hosting_stale().await;
+        if reason == Some(SignalingError::DeviceDisabled) {
+            self.stop_connecting(Connection::Disabled);
+            return;
+        }
+        self.connection = Connection::Offline;
+        self.attempts = self.attempts.saturating_add(1);
         self.connect_now();
     }
 
-    /// Loads devices and contacts in the background.
+    /// Signs in to an account, creating it first when `create` is set.
+    fn sign_in(&mut self, username: String, password: String, create: bool) {
+        if self.account().is_some() || matches!(self.account_task, AccountTask::Working(_)) {
+            return;
+        }
+        self.account_task = AccountTask::Working(if create {
+            "Creating account...".into()
+        } else {
+            "Signing in...".into()
+        });
+        let api = self.api.with_token(None);
+        let tx = self.internal.clone();
+        tokio::spawn(async move {
+            let result = async {
+                if create {
+                    api.register(&username, &password).await?;
+                }
+                api.login(&username, &password).await
+            }
+            .await
+            .map(|token| (username, Secret::new(token)))
+            .map_err(|e| e.user_message());
+            let _ = tx.send(Internal::SignedIn(result));
+        });
+    }
+
+    /// Stores a new account session, links this installation and loads the lists.
+    fn on_signed_in(&mut self, result: Result<(String, Secret), String>) {
+        match result {
+            Ok((username, session_token)) => {
+                self.api = self
+                    .api
+                    .with_token(Some(session_token.expose().to_string()));
+                self.save(|s| {
+                    s.account = Some(AccountState {
+                        username,
+                        session_token,
+                    })
+                });
+                self.account_task = AccountTask::Idle;
+                self.link_account();
+                self.refresh_lists();
+            }
+            Err(message) => self.account_task = AccountTask::Failed(message),
+        }
+    }
+
+    /// Links this installation to the signed-in account over the open connection.
+    fn link_account(&mut self) {
+        let (Some(account), Some(signaling)) = (self.account(), self.signaling.clone()) else {
+            return;
+        };
+        let generation = self.generation;
+        let tx = self.internal.clone();
+        tokio::spawn(async move {
+            let result = account::link(&signaling, account.session_token.expose()).await;
+            let _ = tx.send(Internal::Linked(generation, result));
+        });
+    }
+
+    /// Handles the server's answer to linking this installation.
+    fn on_linked(&mut self, result: Result<String, LinkError>) {
+        match result {
+            Ok(username) => {
+                tracing::info!(%username, "installation linked to the account");
+                self.refresh_lists();
+            }
+            Err(LinkError::Rejected) => self.expire_account(),
+            Err(e) => tracing::warn!(error = %e, "installation not linked, retrying on reconnect"),
+        }
+    }
+
+    /// Signs out of the account: forgets it here at once, then unlinks this
+    /// installation and ends the session on the server in the background.
+    fn sign_out(&mut self) {
+        if self.account().is_none() {
+            return;
+        }
+        let api = self.api.clone();
+        let signaling = self.signaling.clone();
+        tokio::spawn(async move {
+            account::sign_out(signaling.as_ref(), &api).await;
+        });
+        self.forget_account(AccountTask::Idle);
+    }
+
+    /// Deletes the signed-in account after the server checked `password`.
+    fn delete_account(&mut self, password: String) {
+        if self.account().is_none() || matches!(self.account_task, AccountTask::Working(_)) {
+            return;
+        }
+        self.account_task = AccountTask::Working("Deleting account...".into());
+        let api = self.api.clone();
+        let tx = self.internal.clone();
+        tokio::spawn(async move {
+            let result = api.delete_account(&password).await;
+            let _ = tx.send(Internal::AccountDeleted(result));
+        });
+    }
+
+    /// Forgets a deleted account, or shows why it was not deleted.
+    fn on_account_deleted(&mut self, result: Result<(), ApiError>) {
+        match result {
+            Ok(()) => self.forget_account(AccountTask::Idle),
+            Err(e) => self.account_task = AccountTask::Failed(e.user_message()),
+        }
+    }
+
+    /// Forgets the account because the server no longer accepts its session,
+    /// and tells the user.
+    fn expire_account(&mut self) {
+        if self.account().is_none() {
+            return;
+        }
+        tracing::warn!("the account session is no longer valid");
+        let message = "Your account session expired. Please sign in again.";
+        self.banner = Some(message.into());
+        self.forget_account(AccountTask::Failed(message.into()));
+    }
+
+    /// Removes the account session, its lists and the token from the API
+    /// client; the installation stays online.
+    fn forget_account(&mut self, task: AccountTask) {
+        self.save(|s| s.account = None);
+        self.api = self.api.with_token(None);
+        self.my_devices.clear();
+        self.contacts.clear();
+        self.account_task = task;
+    }
+
+    /// Loads My devices and contacts in the background while signed in.
     fn refresh_lists(&mut self) {
-        if self.store.state().session_token.is_none() {
+        if self.account().is_none() {
             return;
         }
         let api = self.api.clone();
         let tx = self.internal.clone();
         tokio::spawn(async move {
-            let result = async { Ok((api.devices().await?, api.contacts().await?)) }.await;
+            let result = async { Ok((api.my_devices().await?, api.contacts().await?)) }.await;
             let _ = tx.send(Internal::Lists(result));
         });
     }
 
-    /// Runs an API call in the background and reloads the lists after it.
-    fn spawn_api<F>(&mut self, call: F)
+    /// Runs an account API call in the background and reloads the lists
+    /// after it; without an account it only shows a hint.
+    fn spawn_account_api<F>(&mut self, call: F)
     where
         F: std::future::Future<Output = Result<(), ApiError>> + Send + 'static,
     {
+        if self.account().is_none() {
+            self.banner = Some(SIGN_IN_FIRST_TEXT.into());
+            return;
+        }
         let api = self.api.clone();
         let tx = self.internal.clone();
         tokio::spawn(async move {
             if let Err(e) = call.await {
                 let _ = tx.send(Internal::ApiFailed(e));
             }
-            let result = async { Ok((api.devices().await?, api.contacts().await?)) }.await;
+            let result = async { Ok((api.my_devices().await?, api.contacts().await?)) }.await;
             let _ = tx.send(Internal::Lists(result));
         });
     }
@@ -760,29 +935,18 @@ impl Actor {
                 offer_forget: false,
             },
         );
-        let api = self.api.clone();
         let known = Arc::clone(&self.known);
         let tx = self.internal.clone();
         tokio::spawn(async move {
             let offered_saved = offer.as_ref().is_some_and(|(_, saved)| *saved);
             let pinned = lock(&known).get(host).is_some();
             let used_saved = offered_saved && pinned;
-            let host_key = match &offer {
-                Some(_) if may_fetch_host_key(offered_saved, pinned) => api
-                    .presence(host)
-                    .await
-                    .ok()
-                    .and_then(|p| p.public_key)
-                    .and_then(|k| PublicKey::from_base64(&k).ok()),
-                _ => None,
-            };
             let options = RequestOptions {
-                password: offer.map(|(p, _)| p),
-                host_key,
+                password: password_to_send(offer, pinned),
             };
             let result = ViewerSession::request_with(
                 signaling,
-                identity.keys,
+                identity.key,
                 known,
                 host,
                 options,
@@ -931,6 +1095,7 @@ impl Actor {
         } else if self.host.is_none() {
             self.start_hosting();
         }
+        self.update_password_access();
     }
 
     /// Sets or clears the unattended password.
@@ -954,6 +1119,7 @@ impl Actor {
             },
         };
         self.save(|s| s.settings.password_hash = hash);
+        self.update_password_access();
     }
 
     /// Publishes the current state for the UI and asks it to redraw.
@@ -962,11 +1128,12 @@ impl Actor {
         let mut settings = state.settings.clone();
         settings.password_hash = None;
         let snapshot = Snapshot {
-            auth: self.auth.clone(),
-            account: state.account.clone(),
+            connection: self.connection.clone(),
+            account: state.account.as_ref().map(|a| a.username.clone()),
+            account_task: self.account_task.clone(),
             server_url: server_url(&self.store),
             device_id: self.identity.as_ref().map(|i| i.id),
-            devices: self.devices.clone(),
+            my_devices: self.my_devices.clone(),
             contacts: self.contacts.clone(),
             prompts: self
                 .host

@@ -8,8 +8,6 @@ use argon2::Argon2;
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use surf_rac_protocol::DeviceId;
-use surf_rac_session::crypto::open_password;
-use surf_rac_session::{DeviceKeys, PublicKey};
 
 /// Wrong passwords from one viewer device that lock it out.
 pub const VIEWER_LIMIT: u32 = 5;
@@ -118,30 +116,15 @@ pub enum PasswordCheck {
     Unreadable,
 }
 
-/// Checks the password `sealed` that `viewer` offered in `session_id`
-/// against the host's password `hash`.
+/// Checks the password a viewer sent against the host's password `hash`.
 ///
-/// `own` and `host` are the host's key pair and device ID, `viewer_key` the
-/// key the request came with. Without a hash every offered password is wrong.
-pub fn check_sealed(
-    own: &DeviceKeys,
-    host: DeviceId,
-    viewer_key: &PublicKey,
-    session_id: &str,
-    viewer: DeviceId,
-    sealed: Option<&str>,
-    hash: Option<&str>,
-) -> PasswordCheck {
-    let Some(sealed) = sealed else {
-        return PasswordCheck::Absent;
-    };
-    match (
-        open_password(own, viewer_key, session_id, viewer, host, sealed),
-        hash,
-    ) {
-        (Err(_), _) => PasswordCheck::Unreadable,
-        (Ok(password), Some(hash)) if verify_password(&password, hash) => PasswordCheck::Correct,
-        (Ok(_), _) => PasswordCheck::Wrong,
+/// `received` is the opened password, or `None` when it could not be opened.
+/// Without a hash every password is wrong.
+pub fn check_password(received: Option<&str>, hash: Option<&str>) -> PasswordCheck {
+    match (received, hash) {
+        (None, _) => PasswordCheck::Unreadable,
+        (Some(password), Some(hash)) if verify_password(password, hash) => PasswordCheck::Correct,
+        (Some(_), _) => PasswordCheck::Wrong,
     }
 }
 
@@ -214,31 +197,18 @@ mod tests {
     }
 
     #[test]
-    fn sealed_passwords_are_checked_against_the_hash() {
-        use surf_rac_session::DeviceKeys;
-        use surf_rac_session::crypto::seal_password;
-        let (host, viewer) = (DeviceKeys::generate(), DeviceKeys::generate());
-        let (hid, vid) = (id(1), id(2));
+    fn received_passwords_are_checked_against_the_hash() {
         let hash = hash_password("hunter22").unwrap();
-        let seal =
-            |pw: &str| seal_password(&viewer, &host.public_key(), "s1", vid, hid, pw).unwrap();
-        let check = |sealed: Option<&str>, hash: Option<&str>| {
-            check_sealed(&host, hid, &viewer.public_key(), "s1", vid, sealed, hash)
-        };
-        assert_eq!(check(None, Some(&hash)), PasswordCheck::Absent);
         assert_eq!(
-            check(Some(&seal("hunter22")), Some(&hash)),
+            check_password(Some("hunter22"), Some(&hash)),
             PasswordCheck::Correct
         );
         assert_eq!(
-            check(Some(&seal("hunter23")), Some(&hash)),
+            check_password(Some("hunter23"), Some(&hash)),
             PasswordCheck::Wrong
         );
-        assert_eq!(check(Some(&seal("hunter22")), None), PasswordCheck::Wrong);
-        assert_eq!(
-            check(Some("garbage"), Some(&hash)),
-            PasswordCheck::Unreadable
-        );
+        assert_eq!(check_password(Some("hunter22"), None), PasswordCheck::Wrong);
+        assert_eq!(check_password(None, Some(&hash)), PasswordCheck::Unreadable);
     }
 
     #[test]

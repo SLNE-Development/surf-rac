@@ -9,13 +9,13 @@ use surf_rac_capture::{ScreenShare, ShareOptions};
 use surf_rac_input::{Grants, InputHost, InputStatus};
 use surf_rac_protocol::DeviceId;
 use surf_rac_protocol::data::{Control, DataMessage};
-use surf_rac_session::host::{HostEvent, HostSession};
-use surf_rac_session::{PublicKey, SessionConfig};
+use surf_rac_session::SessionConfig;
+use surf_rac_session::host::{HostEvent, HostSession, Password};
 use tokio::sync::{mpsc, watch};
 
 use super::actor::{Actor, Internal};
-use super::{Auth, HostViewerView, PromptView};
-use crate::access::{self, Decision};
+use super::{Connection, HostViewerView, PromptView};
+use crate::access::{self, Decision, PromptNote};
 
 /// Placeholder size of the screen track until capture starts.
 const INITIAL_TRACK: (u32, u32) = (1280, 720);
@@ -54,6 +54,8 @@ pub(super) struct Hosting {
     viewers: BTreeMap<DeviceId, HostViewer>,
     /// Requests waiting for an answer.
     pub(super) prompts: Vec<PromptView>,
+    /// What the password check found for requests that fell back to a prompt.
+    notes: BTreeMap<String, PromptNote>,
     /// Whether follow mode is on.
     pub(super) follow: bool,
     /// Whether the signaling connection this session used has closed.
@@ -126,7 +128,7 @@ impl Actor {
         tokio::spawn(async move {
             let result = HostSession::start(
                 signaling,
-                identity.keys,
+                identity.key,
                 known,
                 INITIAL_TRACK.0,
                 INITIAL_TRACK.1,
@@ -173,9 +175,11 @@ impl Actor {
                     status: None,
                     viewers: BTreeMap::new(),
                     prompts: Vec::new(),
+                    notes: BTreeMap::new(),
                     follow: false,
                     stale: false,
                 });
+                self.update_password_access();
             }
             Err(e) => {
                 tracing::warn!(error = %e, "hosting could not start");
@@ -208,17 +212,16 @@ impl Actor {
                 session_id,
                 viewer,
                 fingerprint,
-                viewer_key,
+                ..
+            } => self.on_request(session_id, *viewer, fingerprint),
+            HostEvent::PasswordReceived {
+                session_id,
+                viewer,
                 password,
+                ..
             } => {
-                self.on_request(
-                    session_id,
-                    *viewer,
-                    fingerprint,
-                    viewer_key,
-                    password.as_deref(),
-                )
-                .await
+                self.on_password(session_id, *viewer, password.as_ref())
+                    .await
             }
             HostEvent::KeyChanged(changed) => {
                 self.banner = Some(format!(
@@ -229,6 +232,7 @@ impl Actor {
             HostEvent::RequestExpired { session_id, .. } => {
                 if let Some(host) = self.host.as_mut() {
                     host.prompts.retain(|p| &p.session_id != session_id);
+                    host.notes.remove(session_id);
                 }
             }
             HostEvent::ViewerJoined { viewer } => {
@@ -287,56 +291,70 @@ impl Actor {
             HostEvent::Ended { reason } => {
                 tracing::warn!(?reason, "hosting ended");
                 self.stop_hosting().await;
-                if self.auth == Auth::Online {
+                if self.connection == Connection::Online {
                     self.schedule_restart();
                 }
             }
         }
     }
 
-    /// Decides a session request: admits it on a correct unattended password,
-    /// otherwise shows a prompt.
-    async fn on_request(
+    /// Tells the host session whether viewers may send the unattended
+    /// password: whenever one is set.
+    pub(super) fn update_password_access(&self) {
+        let set = self.store.state().settings.password_hash.is_some();
+        if let Some(host) = &self.host {
+            host.session.set_password_access(set);
+        }
+    }
+
+    /// Shows a prompt for a session request, with what the password check
+    /// found when the request fell back from a password.
+    fn on_request(&mut self, session_id: &str, viewer: DeviceId, fingerprint: &str) {
+        self.persist_known();
+        let name = self.name_of(viewer);
+        let Some(host) = self.host.as_mut() else {
+            return;
+        };
+        let note = host.notes.remove(session_id).unwrap_or(PromptNote::None);
+        host.prompts.retain(|p| p.session_id != session_id);
+        host.prompts.push(PromptView {
+            session_id: session_id.to_string(),
+            viewer,
+            name,
+            fingerprint: fingerprint.to_string(),
+            note,
+        });
+    }
+
+    /// Decides a request whose viewer sent the unattended password: admits
+    /// it on a correct password with unattended access on, otherwise falls
+    /// back to a prompt.
+    async fn on_password(
         &mut self,
         session_id: &str,
         viewer: DeviceId,
-        fingerprint: &str,
-        viewer_key: &PublicKey,
-        sealed: Option<&str>,
+        password: Option<&Password>,
     ) {
         self.persist_known();
-        let Some(identity) = self.identity.clone() else {
-            return;
-        };
-        let settings = &self.store.state().settings;
+        let settings = self.store.state().settings;
         let hash = settings
             .password_hash
             .as_ref()
             .map(|h| h.expose().to_string());
         let unattended = settings.unattended && hash.is_some();
-        let check = access::check_sealed(
-            &identity.keys,
-            identity.id,
-            viewer_key,
-            session_id,
-            viewer,
-            sealed,
-            hash.as_deref(),
-        );
+        let check = access::check_password(password.map(Password::as_str), hash.as_deref());
         let decision = access::decide(check, unattended, &mut self.lockout, viewer, Instant::now());
-        tracing::info!(viewer = %viewer, ?check, ?decision, "session request");
+        tracing::info!(viewer = %viewer, ?check, ?decision, "unattended password received");
         match decision {
             Decision::Accept => self.accept_request(session_id, viewer).await,
             Decision::Prompt(note) => {
-                let name = self.name_of(viewer);
-                if let Some(host) = self.host.as_mut() {
-                    host.prompts.push(PromptView {
-                        session_id: session_id.to_string(),
-                        viewer,
-                        name,
-                        fingerprint: fingerprint.to_string(),
-                        note,
-                    });
+                let Some(host) = self.host.as_mut() else {
+                    return;
+                };
+                host.notes.insert(session_id.to_string(), note);
+                if let Err(e) = host.session.reject_password(session_id).await {
+                    tracing::debug!(error = %e, "password not rejected");
+                    host.notes.remove(session_id);
                 }
             }
         }

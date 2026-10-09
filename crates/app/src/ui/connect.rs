@@ -6,7 +6,7 @@ use eframe::egui::{self, Align, Layout, RichText, vec2};
 use super::main_window::{format_id, parse_id};
 use super::widgets::{self, Kind, Tone};
 use super::{ClientApp, ContactDialog, icons, theme};
-use crate::runtime::{Auth, Command, ContactView};
+use crate::runtime::{Command, Connection, ContactView};
 
 /// Width of the "Your ID" card, in points.
 const ID_CARD_WIDTH: f32 = 300.0;
@@ -45,7 +45,7 @@ pub(super) fn filter_contacts<'a>(
 
 /// Draws the Connect tab.
 pub(super) fn show(app: &mut ClientApp, ui: &mut egui::Ui) {
-    let online = app.snap.auth == Auth::Online;
+    let online = app.snap.connection == Connection::Online;
     let gap = 16.0;
     let left = (ui.available_width() - ID_CARD_WIDTH - gap).max(260.0);
     ui.horizontal_top(|ui| {

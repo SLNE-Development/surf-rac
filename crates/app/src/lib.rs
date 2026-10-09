@@ -7,6 +7,7 @@ pub mod clipboard;
 pub mod defender;
 pub mod dpapi;
 pub mod fingerprint;
+pub mod installation;
 pub mod keyhook;
 pub mod keys;
 pub mod logging;

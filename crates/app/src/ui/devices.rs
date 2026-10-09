@@ -1,13 +1,14 @@
-//! The My devices tab: every device of the account with its presence.
+//! The My devices tab: every installation linked to the signed-in account
+//! with its presence.
 
 use chrono::{DateTime, Utc};
 use eframe::egui::{self, Align, Layout, RichText};
-use surf_rac_protocol::DeviceInfo;
+use surf_rac_protocol::MyDeviceInfo;
 
 use super::main_window::format_id;
 use super::widgets::{self, Kind, Tone};
 use super::{ClientApp, icons, theme};
-use crate::runtime::{Auth, Command};
+use crate::runtime::{Command, Connection};
 
 /// Returns the presence text of an offline device: when it was last seen,
 /// or "Offline" when that is unknown. Online devices get `None`.
@@ -45,7 +46,27 @@ pub(super) fn show(app: &mut ClientApp, ui: &mut egui::Ui) {
         });
     });
     ui.add_space(8.0);
-    let devices = app.snap.devices.clone();
+    if app.snap.account.is_none() {
+        widgets::card_frame(ui).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            egui::Frame::new()
+                .inner_margin(egui::Margin::symmetric(16, 18))
+                .show(ui, |ui| {
+                    ui.label(widgets::muted(
+                        ui,
+                        "Sign in to an account to see the computers linked to it.",
+                    ));
+                    if ui
+                        .add(widgets::btn(ui, Kind::Secondary, None, "Sign in"))
+                        .clicked()
+                    {
+                        app.forms.sign_in = true;
+                    }
+                });
+        });
+        return;
+    }
+    let devices = app.snap.my_devices.clone();
     widgets::card_frame(ui).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.spacing_mut().item_spacing.y = 0.0;
@@ -61,7 +82,7 @@ pub(super) fn show(app: &mut ClientApp, ui: &mut egui::Ui) {
 }
 
 /// Draws one device row: icon, name and ID, presence, Connect and the actions menu.
-fn device_row(app: &mut ClientApp, ui: &mut egui::Ui, d: &DeviceInfo) {
+fn device_row(app: &mut ClientApp, ui: &mut egui::Ui, d: &MyDeviceInfo) {
     let this = Some(d.device_id) == app.snap.device_id;
     widgets::icon_tile(ui, icons::MONITOR);
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -71,10 +92,10 @@ fn device_row(app: &mut ClientApp, ui: &mut egui::Ui, d: &DeviceInfo) {
                     .add(widgets::btn(ui, Kind::DangerText, None, "Remove"))
                     .clicked()
                 {
-                    app.send(Command::DeleteDevice(d.device_id));
+                    app.send(Command::UnlinkDevice(d.device_id));
                 }
             });
-            let enabled = d.online && app.snap.auth == Auth::Online;
+            let enabled = d.online && app.snap.connection == Connection::Online;
             if ui
                 .add_enabled(enabled, widgets::btn(ui, Kind::Secondary, None, "Connect"))
                 .clicked()

@@ -218,19 +218,6 @@ pub struct MyDeviceInfo {
     pub last_seen_at: Option<DateTime<Utc>>,
 }
 
-/// One entry of `GET /v1/devices`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct DeviceInfo {
-    /// The device's ID.
-    pub device_id: DeviceId,
-    /// Human-readable device name.
-    pub name: String,
-    /// Whether the device currently holds a WebSocket connection.
-    pub online: bool,
-    /// When the device last connected or disconnected.
-    pub last_seen_at: Option<DateTime<Utc>>,
-}
-
 /// One entry of `GET /v1/contacts`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ContactInfo {

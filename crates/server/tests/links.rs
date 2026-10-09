@@ -134,6 +134,22 @@ async fn account_deletion_removes_contacts_and_links_but_never_devices(pool: PgP
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn delete_account_locks_after_five_wrong_passwords(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let alice = app.register_and_login("alice").await;
+    for _ in 0..5 {
+        let res = app.delete_account(&alice, "wrong password!").await;
+        assert_eq!(res.status(), 401);
+    }
+    let res = app.delete_account(&alice, PASSWORD).await;
+    assert_eq!(res.status(), 429);
+    assert!(res.headers().contains_key("retry-after"));
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["error"], "locked");
+    assert_eq!(app.count("users", "username = 'alice'").await, 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn delete_account_requires_session(pool: PgPool) {
     let app = common::spawn(pool).await;
     app.register_and_login("alice").await;

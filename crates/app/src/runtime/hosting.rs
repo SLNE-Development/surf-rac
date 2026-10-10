@@ -30,6 +30,8 @@ const JOIN_WINDOW: Duration = Duration::from_secs(70);
 struct HostViewer {
     /// What it may do.
     grants: Grants,
+    /// The device name it chose for itself, cleaned for display.
+    device_name: String,
     /// Whether the clipboard syncs with it.
     clipboard: bool,
     /// Whether it joined the room.
@@ -218,10 +220,11 @@ impl Actor {
             HostEvent::PasswordReceived {
                 session_id,
                 viewer,
+                name,
                 password,
                 ..
             } => {
-                self.on_password(session_id, *viewer, password.as_ref())
+                self.on_password(session_id, *viewer, name, password.as_ref())
                     .await
             }
             HostEvent::KeyChanged(changed) => {
@@ -237,24 +240,31 @@ impl Actor {
                 }
             }
             HostEvent::ViewerJoined { viewer } => {
-                let remembered = self.grants.get(viewer).copied();
+                let remembered = self.grants.get(viewer).map(|g| Grants {
+                    pointing: true,
+                    ..*g
+                });
                 let clipboard = self.store.state().settings.clipboard_default;
+                let alias = self.contact_alias(*viewer);
                 let Some(host) = self.host.as_mut() else {
                     return;
                 };
                 host.route(&event);
-                if let (Some(grants), Some(input)) = (remembered, &host.input) {
-                    input.set_grants(*viewer, grants);
+                let entry = host.viewers.entry(*viewer).or_insert(HostViewer {
+                    grants: remembered.unwrap_or_default(),
+                    device_name: String::new(),
+                    clipboard,
+                    joined: false,
+                    accepted: Instant::now(),
+                });
+                entry.joined = true;
+                if let Some(input) = &host.input {
+                    let label = access::ghost_label(alias.as_deref(), &entry.device_name, *viewer);
+                    input.set_label(*viewer, label);
+                    if let Some(grants) = remembered {
+                        input.set_grants(*viewer, grants);
+                    }
                 }
-                host.viewers
-                    .entry(*viewer)
-                    .or_insert(HostViewer {
-                        grants: remembered.unwrap_or_default(),
-                        clipboard,
-                        joined: false,
-                        accepted: Instant::now(),
-                    })
-                    .joined = true;
             }
             HostEvent::ViewerLeft { viewer } => {
                 let Some(host) = self.host.as_mut() else {
@@ -318,11 +328,7 @@ impl Actor {
     /// found when the request fell back from a password.
     fn on_request(&mut self, session_id: &str, viewer: DeviceId, name: &str, fingerprint: &str) {
         self.persist_known();
-        let alias = self
-            .contacts
-            .iter()
-            .find(|c| c.id == viewer)
-            .map(|c| c.alias.clone());
+        let alias = self.contact_alias(viewer);
         let Some(host) = self.host.as_mut() else {
             return;
         };
@@ -338,13 +344,22 @@ impl Actor {
         });
     }
 
-    /// Decides a request whose viewer sent the unattended password: admits
-    /// it on a correct password with unattended access on, otherwise falls
-    /// back to a prompt.
+    /// Returns the host's contact alias for `viewer`, if it is a contact.
+    fn contact_alias(&self, viewer: DeviceId) -> Option<String> {
+        self.contacts
+            .iter()
+            .find(|c| c.id == viewer)
+            .map(|c| c.alias.clone())
+    }
+
+    /// Decides a request whose viewer, named `name`, sent the unattended
+    /// password: admits it on a correct password with unattended access on,
+    /// otherwise falls back to a prompt.
     async fn on_password(
         &mut self,
         session_id: &str,
         viewer: DeviceId,
+        name: &str,
         password: Option<&Password>,
     ) {
         self.persist_known();
@@ -366,7 +381,10 @@ impl Actor {
         }
         tracing::info!(viewer = %viewer, ?check, ?decision, "unattended password received");
         match decision {
-            Decision::Accept => self.accept_request(session_id, viewer).await,
+            Decision::Accept => {
+                let device_name = access::sanitize_device_name(name, viewer);
+                self.accept_request(session_id, viewer, device_name).await;
+            }
             Decision::Prompt(note) => {
                 let Some(host) = self.host.as_mut() else {
                     return;
@@ -382,10 +400,11 @@ impl Actor {
 
     /// Accepts the pending request `session_id` from the prompt.
     pub(super) async fn accept(&mut self, session_id: &str) {
-        let Some(viewer) = self.take_prompt(session_id) else {
+        let Some(prompt) = self.take_prompt(session_id) else {
             return;
         };
-        self.accept_request(session_id, viewer).await;
+        self.accept_request(session_id, prompt.viewer, prompt.device_name)
+            .await;
     }
 
     /// Denies the pending request `session_id` from the prompt.
@@ -400,18 +419,19 @@ impl Actor {
         }
     }
 
-    /// Removes the prompt of `session_id` and returns its viewer.
-    fn take_prompt(&mut self, session_id: &str) -> Option<DeviceId> {
+    /// Removes the prompt of `session_id` and returns it.
+    fn take_prompt(&mut self, session_id: &str) -> Option<PromptView> {
         let host = self.host.as_mut()?;
         let index = host
             .prompts
             .iter()
             .position(|p| p.session_id == session_id)?;
-        Some(host.prompts.remove(index).viewer)
+        Some(host.prompts.remove(index))
     }
 
-    /// Starts capture if needed and accepts `viewer`'s request.
-    async fn accept_request(&mut self, session_id: &str, viewer: DeviceId) {
+    /// Starts capture if needed and accepts the request of `viewer`, whose
+    /// cleaned self-chosen name is `device_name`.
+    async fn accept_request(&mut self, session_id: &str, viewer: DeviceId, device_name: String) {
         if let Err(e) = self.ensure_capture().await {
             tracing::error!(error = %e, "screen capture could not start");
             self.banner = Some(format!("The screen cannot be shared: {e}"));
@@ -429,6 +449,7 @@ impl Actor {
             Ok(()) => {
                 host.viewers.entry(viewer).or_insert(HostViewer {
                     grants,
+                    device_name,
                     clipboard,
                     joined: false,
                     accepted: Instant::now(),
@@ -480,9 +501,16 @@ impl Actor {
         Ok(())
     }
 
-    /// Changes what `viewer` may do and remembers it for later sessions.
+    /// Changes what `viewer` may do and remembers it for later sessions,
+    /// except pointing, which every session starts with on.
     pub(super) fn set_grants(&mut self, viewer: DeviceId, grants: Grants) {
-        self.grants.insert(viewer, grants);
+        self.grants.insert(
+            viewer,
+            Grants {
+                pointing: true,
+                ..grants
+            },
+        );
         if let Some(host) = self.host.as_mut() {
             if let Some(v) = host.viewers.get_mut(&viewer) {
                 v.grants = grants;

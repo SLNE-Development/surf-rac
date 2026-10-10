@@ -276,7 +276,10 @@ impl ClientApp {
                 widgets::toggle_chip(ui, &mut grants.keyboard, icons::KEYBOARD, "Keys").changed();
             let pointer =
                 widgets::toggle_chip(ui, &mut grants.pointer, icons::MOUSE, "Mouse").changed();
-            if pointer || keyboard {
+            let pointing =
+                widgets::toggle_chip(ui, &mut grants.pointing, icons::CROSSHAIR, "Pointing")
+                    .changed();
+            if pointer || keyboard || pointing {
                 self.send(Command::SetGrants {
                     viewer: v.id,
                     grants: Grants { ..grants },
@@ -632,6 +635,10 @@ fn input_text(view: &ViewerView) -> &'static str {
     let input = view.input;
     if input.locked {
         "The host is using the computer"
+    } else if !input.pointing && input.keyboard {
+        "Pointing off, keyboard only"
+    } else if !input.pointing {
+        "Pointing off"
     } else if input.pointer && input.keyboard {
         "Full control"
     } else if input.pointer {
@@ -644,12 +651,14 @@ fn input_text(view: &ViewerView) -> &'static str {
 }
 
 /// Returns the chip tone for what the viewer may do: warning while the host
-/// is using the computer, positive for full control, accent for partial
-/// control and neutral for view only.
+/// is using the computer, accent while pointing is off or for partial
+/// control, positive for full control and neutral for view only.
 fn input_tone(view: &ViewerView) -> Tone {
     let input = view.input;
     if input.locked {
         Tone::Warn
+    } else if !input.pointing {
+        Tone::Accent
     } else if input.pointer && input.keyboard {
         Tone::Ok
     } else if input.pointer || input.keyboard {
@@ -740,11 +749,47 @@ mod tests {
 
     #[test]
     fn input_tone_follows_the_control_level() {
+        let view = |pointer, keyboard, locked| view_with(pointer, keyboard, locked, true);
+        assert_eq!(input_tone(&view(true, true, true)), Tone::Warn);
+        assert_eq!(input_tone(&view(true, true, false)), Tone::Ok);
+        assert_eq!(input_tone(&view(true, false, false)), Tone::Accent);
+        assert_eq!(input_tone(&view(false, false, false)), Tone::Neutral);
+        assert_eq!(
+            input_tone(&view_with(true, true, false, false)),
+            Tone::Accent
+        );
+        assert_eq!(input_tone(&view_with(true, true, true, false)), Tone::Warn);
+    }
+
+    /// Checks that the toolbar names a pointing-off state, unless the host
+    /// locks input.
+    #[test]
+    fn input_text_shows_pointing_off() {
+        assert_eq!(
+            input_text(&view_with(true, false, false, false)),
+            "Pointing off"
+        );
+        assert_eq!(
+            input_text(&view_with(true, true, false, false)),
+            "Pointing off, keyboard only"
+        );
+        assert_eq!(
+            input_text(&view_with(true, true, true, false)),
+            "The host is using the computer"
+        );
+        assert_eq!(
+            input_text(&view_with(true, true, false, true)),
+            "Full control"
+        );
+    }
+
+    /// Returns a connected viewer view with the given input state.
+    fn view_with(pointer: bool, keyboard: bool, locked: bool, pointing: bool) -> ViewerView {
         use std::sync::{Arc, Mutex};
         use surf_rac_protocol::DeviceId;
         use surf_rac_protocol::data::InputState;
 
-        let view = |pointer, keyboard, locked| ViewerView {
+        ViewerView {
             session: 1,
             host: DeviceId::new(123_456_789).unwrap(),
             name: "host".into(),
@@ -756,15 +801,11 @@ mod tests {
                 keyboard,
                 locked,
                 follow: false,
-                pointing: true,
+                pointing,
             },
             clipboard: false,
             offer_forget: false,
-        };
-        assert_eq!(input_tone(&view(true, true, true)), Tone::Warn);
-        assert_eq!(input_tone(&view(true, true, false)), Tone::Ok);
-        assert_eq!(input_tone(&view(true, false, false)), Tone::Accent);
-        assert_eq!(input_tone(&view(false, false, false)), Tone::Neutral);
+        }
     }
 
     #[test]

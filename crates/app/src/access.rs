@@ -78,6 +78,37 @@ pub fn password_access_available(enabled: bool, password_set: bool, locked: bool
 /// Longest device name shown, in characters.
 pub const MAX_DEVICE_NAME_LEN: usize = 64;
 
+/// Longest label shown next to a viewer's ghost pointer, in characters,
+/// including the ellipsis of a cut label.
+pub const MAX_GHOST_LABEL_LEN: usize = 24;
+
+/// Formats a device ID in groups of three digits.
+pub fn format_id(id: DeviceId) -> String {
+    let s = id.to_string();
+    format!("{} {} {}", &s[0..3], &s[3..6], &s[6..9])
+}
+
+/// Returns the label shown next to `viewer`'s ghost pointer on the host.
+///
+/// The label is the host's contact `alias` for the viewer when it has one,
+/// otherwise the viewer's `device_name` as cleaned by
+/// [`sanitize_device_name`], otherwise the formatted ID. Labels longer than
+/// [`MAX_GHOST_LABEL_LEN`] characters are cut and end in an ellipsis.
+pub fn ghost_label(alias: Option<&str>, device_name: &str, viewer: DeviceId) -> String {
+    let alias = alias.map(str::trim).filter(|a| !a.is_empty());
+    let name = alias.map_or_else(|| sanitize_device_name(device_name, viewer), str::to_string);
+    let name = if name == viewer.to_string() {
+        format_id(viewer)
+    } else {
+        name
+    };
+    if name.chars().count() <= MAX_GHOST_LABEL_LEN {
+        return name;
+    }
+    let cut: String = name.chars().take(MAX_GHOST_LABEL_LEN - 1).collect();
+    format!("{}\u{2026}", cut.trim_end())
+}
+
 /// Decides a request like [`decide`] and also returns whether password access
 /// is still available afterwards.
 ///
@@ -216,6 +247,35 @@ pub fn decide(
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    /// Checks that a ghost label prefers the alias, then the cleaned device
+    /// name, then the formatted ID.
+    #[test]
+    fn ghost_label_prefers_alias_then_name_then_id() {
+        let viewer = DeviceId::new(386_928_003).unwrap();
+        assert_eq!(
+            ghost_label(Some("Build box"), "Laptop", viewer),
+            "Build box"
+        );
+        assert_eq!(ghost_label(Some("  "), "Lap\u{202E}top", viewer), "Laptop");
+        assert_eq!(ghost_label(None, "", viewer), "386 928 003");
+        assert_eq!(ghost_label(None, "\u{0}", viewer), "386 928 003");
+    }
+
+    /// Checks that long ghost labels are cut to 24 characters with an ellipsis.
+    #[test]
+    fn ghost_label_is_cut_with_an_ellipsis() {
+        let viewer = DeviceId::new(386_928_003).unwrap();
+        let exact = "x".repeat(MAX_GHOST_LABEL_LEN);
+        assert_eq!(ghost_label(None, &exact, viewer), exact);
+        let long = ghost_label(Some(&"y".repeat(40)), "", viewer);
+        assert_eq!(long.chars().count(), MAX_GHOST_LABEL_LEN);
+        assert!(long.ends_with('\u{2026}'));
+        assert_eq!(
+            ghost_label(None, "aaaaaaaaaaaaaaaaaaaaaaa bbbb", viewer),
+            "aaaaaaaaaaaaaaaaaaaaaaa\u{2026}"
+        );
+    }
 
     #[test]
     fn received_passwords_are_checked_against_the_hash() {

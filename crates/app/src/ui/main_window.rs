@@ -6,6 +6,7 @@ use surf_rac_protocol::DeviceId;
 
 use super::widgets::{self, Kind, Tone};
 use super::{ClientApp, Tab, connect, devices, icons, login, settings, theme};
+pub(super) use crate::access::format_id;
 use crate::runtime::{Command, Connection};
 
 /// Draws the main window and its open dialogs.
@@ -194,12 +195,6 @@ fn banners(app: &mut ClientApp, ui: &mut egui::Ui) {
             }
         });
     }
-}
-
-/// Formats a device ID in groups of three digits.
-pub(super) fn format_id(id: DeviceId) -> String {
-    let s = id.to_string();
-    format!("{} {} {}", &s[0..3], &s[3..6], &s[6..9])
 }
 
 /// Parses a device ID typed with or without spaces.

@@ -182,6 +182,18 @@ pub enum HostError {
     Signaling(#[from] SignalingError),
 }
 
+/// Why pausing or resuming a viewer's view failed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PauseError {
+    /// The device is not an accepted viewer of this session.
+    #[error("not a viewer of this session")]
+    NotViewer,
+    /// The video subscription permissions could not be updated. While any
+    /// view is paused the video track is then muted for everyone.
+    #[error("the video permissions could not be updated: {0}")]
+    Permissions(String),
+}
+
 /// A running host session; cheap to clone.
 #[derive(Clone)]
 pub struct HostSession {
@@ -213,6 +225,9 @@ struct Inner {
     rotate_lock: tokio::sync::Mutex<()>,
     /// Serializes updates of the video track's subscription permissions.
     permissions_lock: tokio::sync::Mutex<()>,
+    /// Whether the video track is muted and fed no frames because the
+    /// subscription permissions could not be applied while a view was paused.
+    video_muted: AtomicBool,
     /// Requests and viewers.
     state: Mutex<State>,
     /// Timeouts of the session.
@@ -561,6 +576,7 @@ impl HostSession {
             key_provider,
             rotate_lock: tokio::sync::Mutex::new(()),
             permissions_lock: tokio::sync::Mutex::new(()),
+            video_muted: AtomicBool::new(false),
             state: Mutex::new(State {
                 pending: HashMap::new(),
                 viewers: HashMap::new(),
@@ -648,7 +664,7 @@ impl HostSession {
             Err(reason) => inner.respond(viewer, session_id, Err(reason)).await,
             Ok((host_key, nonce)) => {
                 tracing::info!(viewer = %viewer, %session_id, "session accepted");
-                inner.apply_video_permissions().await;
+                let _ = inner.apply_video_permissions().await;
                 inner
                     .respond(viewer, session_id, Ok((&host_key, &nonce)))
                     .await?;
@@ -707,24 +723,31 @@ impl HostSession {
 
     /// Publishes one raw frame on the video track.
     ///
-    /// Fails with [`FrameError::WrongInput`] while the track takes encoded frames.
+    /// Fails with [`FrameError::WrongInput`] while the track takes encoded
+    /// frames. While the track is muted because a pause could not be enforced,
+    /// the frame is dropped.
     pub fn publish_frame(&self, frame: &Frame) -> Result<(), FrameError> {
         frame.validate()?;
         let source = self.source_for(VideoInput::Raw)?;
-        source.capture_frame(&video::to_livekit(frame));
+        if !self.inner.video_muted.load(Ordering::Acquire) {
+            source.capture_frame(&video::to_livekit(frame));
+        }
         Ok(())
     }
 
     /// Publishes one H.264 access unit on the video track.
     ///
     /// Fails with [`FrameError::WrongInput`] while the track takes raw frames, and
-    /// with [`FrameError::ZeroSize`] for an empty picture or payload.
+    /// with [`FrameError::ZeroSize`] for an empty picture or payload. While the
+    /// track is muted because a pause could not be enforced, the frame is dropped.
     pub fn publish_encoded(&self, frame: &EncodedFrame<'_>) -> Result<(), FrameError> {
         if frame.width == 0 || frame.height == 0 || frame.data.is_empty() {
             return Err(FrameError::ZeroSize);
         }
         let source = self.source_for(VideoInput::Encoded)?;
-        source.capture_encoded_frame(&video::to_livekit_encoded(frame));
+        if !self.inner.video_muted.load(Ordering::Acquire) {
+            source.capture_encoded_frame(&video::to_livekit_encoded(frame));
+        }
         Ok(())
     }
 
@@ -756,6 +779,8 @@ impl HostSession {
             .map_err(StartError::MediaUnavailable)?;
         self.inner.sync_key_index();
         let old = std::mem::replace(&mut *lock(&self.inner.video), video).sid;
+        self.inner.sync_mute();
+        let _ = self.inner.apply_video_permissions().await;
         tracing::info!(device_id = %self.inner.device, ?input, "video input switched");
         if let Err(e) = self
             .inner
@@ -812,55 +837,54 @@ impl HostSession {
     ///
     /// While paused the viewer may not subscribe to the video track, so the
     /// SFU forwards it no frames; on resume it subscribes again and the SFU
-    /// asks the encoder for a keyframe. The viewer is told with
-    /// [`Control::ViewPaused`]. Fails with [`SendError::NotConnected`] when
-    /// `viewer` is not an accepted viewer; a viewer that is accepted but not
-    /// yet in the room is told when it joins.
-    pub async fn pause_view(&self, viewer: DeviceId, paused: bool) -> Result<(), SendError> {
-        let joined = {
+    /// asks the encoder for a keyframe. Once the permissions are updated the
+    /// viewer is told with [`Control::ViewPaused`]; a viewer that is accepted
+    /// but not yet in the room is told when it joins.
+    ///
+    /// Fails with [`PauseError::NotViewer`] when `viewer` is not an accepted
+    /// viewer, and with [`PauseError::Permissions`] when the permissions could
+    /// not be updated; a pause then still holds because the video track is
+    /// muted for everyone, while a resume leaves the viewer without video.
+    pub async fn pause_view(&self, viewer: DeviceId, paused: bool) -> Result<(), PauseError> {
+        {
             let mut st = lock(&self.inner.state);
-            let v = st.viewers.get_mut(&viewer).ok_or(SendError::NotConnected)?;
+            let v = st.viewers.get_mut(&viewer).ok_or(PauseError::NotViewer)?;
             v.paused = paused;
-            v.joined
-        };
-        self.inner.apply_video_permissions().await;
-        tracing::info!(viewer = %viewer, paused, "view pause changed");
-        if joined {
-            self.inner
-                .send(
-                    viewer,
-                    &DataMessage::Control(Control::ViewPaused { paused }),
-                )
-                .await?;
         }
-        Ok(())
+        let applied = self.inner.apply_video_permissions().await;
+        tracing::info!(viewer = %viewer, paused, ok = applied.is_ok(), "view pause changed");
+        if paused || applied.is_ok() {
+            self.inner.tell_paused(viewer, paused).await;
+        }
+        applied
     }
 
     /// Pauses (`paused` true) or resumes the view of every viewer without ending their sessions.
     ///
-    /// While paused, viewers that join later start paused as well. Every
-    /// viewer in the room is told with [`Control::ViewPaused`]; viewers the
-    /// message cannot reach are skipped.
-    pub async fn pause_all(&self, paused: bool) {
-        let joined: Vec<DeviceId> = {
+    /// While paused, viewers that join later start paused as well. Once the
+    /// permissions are updated every viewer in the room is told with
+    /// [`Control::ViewPaused`]; viewers the message cannot reach are skipped.
+    /// Fails with [`PauseError::Permissions`] like [`HostSession::pause_view`].
+    pub async fn pause_all(&self, paused: bool) -> Result<(), PauseError> {
+        let viewers: Vec<DeviceId> = {
             let mut st = lock(&self.inner.state);
             st.all_paused = paused;
             st.viewers
                 .iter_mut()
-                .filter_map(|(id, v)| {
+                .map(|(id, v)| {
                     v.paused = paused;
-                    v.joined.then_some(*id)
+                    *id
                 })
                 .collect()
         };
-        self.inner.apply_video_permissions().await;
-        tracing::info!(device_id = %self.inner.device, paused, "view pause changed for all viewers");
-        for viewer in joined {
-            let msg = DataMessage::Control(Control::ViewPaused { paused });
-            if let Err(err) = self.inner.send(viewer, &msg).await {
-                tracing::warn!(viewer = %viewer, error = %err, "sending view pause failed");
+        let applied = self.inner.apply_video_permissions().await;
+        tracing::info!(device_id = %self.inner.device, paused, ok = applied.is_ok(), "view pause changed for all viewers");
+        if paused || applied.is_ok() {
+            for viewer in viewers {
+                self.inner.tell_paused(viewer, paused).await;
             }
         }
+        applied
     }
 
     /// Returns whether the view of `viewer` is paused; false for an unknown viewer.
@@ -996,31 +1020,66 @@ impl Inner {
     /// Sets who may subscribe to the video track from the viewers' pause states.
     ///
     /// With no view paused every participant may subscribe; otherwise only
-    /// the viewers whose view is not paused may. Failures are logged.
-    async fn apply_video_permissions(&self) {
+    /// the accepted viewers whose view is not paused may, and only to the
+    /// screen track. The permissions are computed from the state at the time
+    /// they are sent, and updates are serialized, so the last update always
+    /// matches the latest state.
+    ///
+    /// When the update fails while a view is paused, the video track is muted
+    /// and fed no frames until a later update succeeds, and
+    /// [`PauseError::Permissions`] is returned.
+    async fn apply_video_permissions(&self) -> Result<(), PauseError> {
         let _serial = self.permissions_lock.lock().await;
         let allowed = lock(&self.state).video_permissions();
+        let restrictive = allowed.is_some();
+        let screen = lock(&self.video).sid.clone();
         let (all, permissions) = match allowed {
             None => (true, Vec::new()),
-            Some(viewers) => (
-                false,
-                viewers
-                    .into_iter()
-                    .map(|viewer| ParticipantTrackPermission {
-                        participant_identity: room::identity(viewer),
-                        allow_all: true,
-                        allowed_track_sids: Vec::new(),
-                    })
-                    .collect(),
-            ),
+            Some(viewers) => (false, screen_permissions(&viewers, &screen)),
         };
-        if let Err(err) = self
+        let applied = self
             .room
             .local_participant()
             .set_track_subscription_permissions(all, permissions)
             .await
-        {
+            .map_err(|err| PauseError::Permissions(err.to_string()));
+        if let Err(err) = &applied {
             tracing::warn!(device_id = %self.device, error = %err, "updating video subscription permissions failed");
+        }
+        let muted = self.video_muted.load(Ordering::Acquire);
+        if let Some(mute) = mute_after_apply(applied.is_ok(), restrictive, muted) {
+            self.video_muted.store(mute, Ordering::Release);
+            self.sync_mute();
+            tracing::warn!(device_id = %self.device, muted = mute, "video track mute changed to enforce paused views");
+        }
+        applied
+    }
+
+    /// Mutes the published video track when [`Inner::video_muted`] is set and unmutes it otherwise.
+    fn sync_mute(&self) {
+        let sid = lock(&self.video).sid.clone();
+        let Some(publication) = self.room.local_participant().get_track_publication(&sid) else {
+            return;
+        };
+        if self.video_muted.load(Ordering::Acquire) {
+            publication.mute();
+        } else {
+            publication.unmute();
+        }
+    }
+
+    /// Tells `viewer` that its view is paused or resumed, if it is in the room.
+    async fn tell_paused(&self, viewer: DeviceId, paused: bool) {
+        let joined = lock(&self.state)
+            .viewers
+            .get(&viewer)
+            .is_some_and(|v| v.joined);
+        if !joined {
+            return;
+        }
+        let msg = DataMessage::Control(Control::ViewPaused { paused });
+        if let Err(err) = self.send(viewer, &msg).await {
+            tracing::warn!(viewer = %viewer, error = %err, "sending view pause failed");
         }
     }
 
@@ -1041,6 +1100,20 @@ impl Inner {
         room::send(&self.room, viewer, msg.topic(), msg.is_reliable(), sealed).await
     }
 
+    /// Follows the screen track to its new ID `sid` after the room republished
+    /// it under `previous` and reapplies its mute and subscription permissions.
+    async fn on_republished(&self, previous: &TrackSid, sid: TrackSid) {
+        {
+            let mut video = lock(&self.video);
+            if video.sid != *previous {
+                return;
+            }
+            video.sid = sid;
+        }
+        self.sync_mute();
+        let _ = self.apply_video_permissions().await;
+    }
+
     /// Forgets `viewer` and reports that it left, if it was a viewer.
     ///
     /// A viewer that was sent a media key could still hold it, so the key is rotated.
@@ -1051,12 +1124,14 @@ impl Inner {
         }
     }
 
-    /// Rotates the media key if `v` held it and reports that `viewer` left.
+    /// Rotates the media key if `v` held it, withdraws its video permission
+    /// and reports that `viewer` left.
     async fn viewer_gone(self: &Arc<Self>, viewer: DeviceId, v: Viewer) {
         tracing::info!(viewer = %viewer, session_id = %v.session_id, "viewer left");
         if v.keyed {
             spawn_rotation(self);
         }
+        let _ = self.apply_video_permissions().await;
         let _ = self.events.send(HostEvent::ViewerLeft { viewer }).await;
     }
 
@@ -1441,8 +1516,12 @@ async fn run(
                         room::read_clipboard_stream(reader, topic, participant_identity.0, gate, incoming_tx.clone());
                     }
                 }
-                Some(RoomEvent::LocalTrackPublished { .. } | RoomEvent::LocalTrackRepublished { .. }) => {
+                Some(RoomEvent::LocalTrackPublished { .. }) => {
                     inner.sync_key_index();
+                }
+                Some(RoomEvent::LocalTrackRepublished { previous_sid, publication, .. }) => {
+                    inner.sync_key_index();
+                    inner.on_republished(&previous_sid, publication.sid()).await;
                 }
                 Some(RoomEvent::Reconnecting) => {
                     watch.reconnecting();
@@ -1473,6 +1552,31 @@ async fn run(
     tracing::info!(device_id = %inner.device, ?reason, "hosting ended");
     let _ = inner.room.close().await;
     let _ = inner.events.send(HostEvent::Ended { reason }).await;
+}
+
+/// Returns subscription permissions that let each of `viewers` subscribe to
+/// the track `screen` and to no other track.
+fn screen_permissions(viewers: &[DeviceId], screen: &TrackSid) -> Vec<ParticipantTrackPermission> {
+    viewers
+        .iter()
+        .map(|viewer| ParticipantTrackPermission {
+            participant_identity: room::identity(*viewer),
+            allow_all: false,
+            allowed_track_sids: vec![screen.clone()],
+        })
+        .collect()
+}
+
+/// Returns how the video track's mute must change after a permission update:
+/// `Some(true)` to mute when the update failed (`applied` false) while a view
+/// is paused (`restrictive`), `Some(false)` to unmute once an update
+/// succeeded, and `None` to leave it as `muted` says.
+fn mute_after_apply(applied: bool, restrictive: bool, muted: bool) -> Option<bool> {
+    match (applied, muted) {
+        (true, true) => Some(false),
+        (false, false) if restrictive => Some(true),
+        _ => None,
+    }
 }
 
 /// Replaces the media key in the background.
@@ -1792,6 +1896,50 @@ mod tests {
         st.viewers.get_mut(&id(1)).unwrap().paused = true;
         st.admit(id(2), "s", channel("s"), now).unwrap();
         assert!(st.viewers[&id(2)].paused);
+        assert_eq!(st.video_permissions(), Some(vec![]));
+    }
+
+    /// A failed permission update mutes the video while a view is paused, a
+    /// successful one unmutes it, and nothing else changes the mute.
+    #[test]
+    fn video_is_muted_while_a_pause_cannot_be_enforced() {
+        assert_eq!(mute_after_apply(false, true, false), Some(true));
+        assert_eq!(mute_after_apply(false, true, true), None);
+        assert_eq!(mute_after_apply(false, false, false), None);
+        assert_eq!(mute_after_apply(false, false, true), None);
+        assert_eq!(mute_after_apply(true, true, true), Some(false));
+        assert_eq!(mute_after_apply(true, false, true), Some(false));
+        assert_eq!(mute_after_apply(true, true, false), None);
+    }
+
+    /// Restrictive permissions name each allowed viewer with only the screen
+    /// track, never every track.
+    #[test]
+    fn permissions_allow_only_the_screen_track() {
+        let screen = TrackSid::try_from("TR_screen".to_string()).unwrap();
+        let permissions = screen_permissions(&[id(1), id(2)], &screen);
+        assert_eq!(permissions.len(), 2);
+        for (p, viewer) in permissions.iter().zip([id(1), id(2)]) {
+            assert_eq!(p.participant_identity, room::identity(viewer));
+            assert!(!p.allow_all);
+            assert_eq!(p.allowed_track_sids, std::slice::from_ref(&screen));
+        }
+    }
+
+    /// Viewers that left, and participants that were never accepted, are not
+    /// in the restrictive permissions; a paused viewer never is.
+    #[test]
+    fn only_accepted_unpaused_viewers_are_allowed() {
+        let mut st = state(0, 0);
+        let now = Instant::now();
+        for n in 1..=3 {
+            st.admit(id(n), "s", channel("s"), now).unwrap();
+        }
+        st.viewers.get_mut(&id(1)).unwrap().paused = true;
+        st.viewers.remove(&id(3));
+        assert_eq!(st.video_permissions(), Some(vec![id(2)]));
+        st.all_paused = true;
+        st.viewers.get_mut(&id(2)).unwrap().paused = true;
         assert_eq!(st.video_permissions(), Some(vec![]));
     }
 

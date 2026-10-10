@@ -605,7 +605,7 @@ async fn viewer_joining_while_all_paused_starts_paused(pool: PgPool) {
     let (h, v) = (env.device("host", 1).await, env.device("viewer", 2).await);
     let (host, mut host_events) = start_host(&h, SessionConfig::default()).await;
     let feed = feed_frames(&host);
-    host.pause_all(true).await;
+    host.pause_all(true).await.unwrap();
     assert!(host.is_all_paused());
     let pending = request(&v, h.id, SessionConfig::default());
     let (_viewer, mut events) = accept_next(&host, &mut host_events, pending).await;
@@ -614,7 +614,7 @@ async fn viewer_joining_while_all_paused_starts_paused(pool: PgPool) {
     let paused_frames = count_frames(&mut events, Duration::from_secs(2)).await;
     assert_eq!(paused_frames, 0, "paused viewer received frames");
 
-    host.pause_all(false).await;
+    host.pause_all(false).await.unwrap();
     assert!(!host.is_all_paused());
     assert!(!host.is_view_paused(v.id));
     view_paused(&mut events, false, Duration::from_secs(5)).await;

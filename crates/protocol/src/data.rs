@@ -114,6 +114,11 @@ pub enum Control {
         /// True to follow where the host is working.
         on: bool,
     },
+    /// The host paused or resumed the receiving viewer's view of its screen.
+    ViewPaused {
+        /// True while the view is paused, false once it is shown again.
+        paused: bool,
+    },
 }
 
 /// A viewer's input permissions and the host-wide input status.
@@ -301,6 +306,10 @@ impl fmt::Debug for Control {
             }
             Control::InputState(state) => f.debug_tuple("InputState").field(state).finish(),
             Control::SetFollow { on } => f.debug_struct("SetFollow").field("on", on).finish(),
+            Control::ViewPaused { paused } => f
+                .debug_struct("ViewPaused")
+                .field("paused", paused)
+                .finish(),
         }
     }
 }
@@ -529,6 +538,19 @@ mod tests {
             DataMessage::decode(&[1, 4, 6, 1, 0, 1, 0]),
             Err(DecodeError::Malformed)
         );
+    }
+
+    /// Checks that a view-pause message round-trips in both states, is
+    /// appended after the existing control variants and travels reliably.
+    #[test]
+    fn view_paused_round_trips_and_appends() {
+        for paused in [true, false] {
+            let msg = DataMessage::Control(Control::ViewPaused { paused });
+            assert_eq!(DataMessage::decode(&msg.encode()).unwrap(), msg);
+            assert_eq!(msg.encode(), [1, 4, 7, u8::from(paused)]);
+            assert!(msg.is_reliable());
+            assert_eq!(msg.topic(), TOPIC_INPUT);
+        }
     }
 
     #[test]

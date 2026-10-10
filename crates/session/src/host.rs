@@ -10,6 +10,7 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use livekit::options::{TrackPublishOptions, VideoCodec, VideoEncoderBackend, VideoEncoding};
+use livekit::participant::ParticipantTrackPermission;
 use livekit::prelude::*;
 use livekit::webrtc::prelude::{RtcVideoSource, VideoResolution};
 use livekit::webrtc::video_source::native::NativeVideoSource;
@@ -210,6 +211,8 @@ struct Inner {
     key_provider: livekit::e2ee::key_provider::KeyProvider,
     /// Serializes media key rotations.
     rotate_lock: tokio::sync::Mutex<()>,
+    /// Serializes updates of the video track's subscription permissions.
+    permissions_lock: tokio::sync::Mutex<()>,
     /// Requests and viewers.
     state: Mutex<State>,
     /// Timeouts of the session.
@@ -246,6 +249,8 @@ struct State {
     active_index: u8,
     /// When each viewer was last sent a refusal.
     refused: HashMap<DeviceId, Instant>,
+    /// Whether the view is paused for every viewer, including viewers that join later.
+    all_paused: bool,
 }
 
 /// An unanswered session request.
@@ -346,6 +351,8 @@ struct Viewer {
     left_at: Option<Instant>,
     /// Serialize sealing and sending per topic so each topic's counters leave in order.
     send_locks: Arc<[tokio::sync::Mutex<()>; 3]>,
+    /// Whether the host paused this viewer's view; it may not subscribe to the video track.
+    paused: bool,
 }
 
 impl State {
@@ -430,6 +437,7 @@ impl State {
         if others >= MAX_VIEWERS {
             return Err(DenyReason::RoomFull);
         }
+        let paused = self.all_paused || self.viewers.get(&viewer).is_some_and(|v| v.paused);
         self.viewers.insert(
             viewer,
             Viewer {
@@ -440,9 +448,27 @@ impl State {
                 accepted_at: now,
                 left_at: None,
                 send_locks: Arc::default(),
+                paused,
             },
         );
         Ok(())
+    }
+
+    /// Returns who may subscribe to the video track: `None` when every
+    /// participant may, otherwise the viewers that may, which are all viewers
+    /// whose view is not paused.
+    fn video_permissions(&self) -> Option<Vec<DeviceId>> {
+        if !self.all_paused && !self.viewers.values().any(|v| v.paused) {
+            return None;
+        }
+        let mut allowed: Vec<DeviceId> = self
+            .viewers
+            .iter()
+            .filter(|(_, v)| !v.paused)
+            .map(|(id, _)| *id)
+            .collect();
+        allowed.sort_by_key(|id| id.to_string());
+        Some(allowed)
     }
 
     /// Records that `viewer` dropped out of the room at `now`; it may rejoin
@@ -534,6 +560,7 @@ impl HostSession {
             video_switch: tokio::sync::Mutex::new(()),
             key_provider,
             rotate_lock: tokio::sync::Mutex::new(()),
+            permissions_lock: tokio::sync::Mutex::new(()),
             state: Mutex::new(State {
                 pending: HashMap::new(),
                 viewers: HashMap::new(),
@@ -542,6 +569,7 @@ impl HostSession {
                 media_index: 0,
                 active_index: 0,
                 refused: HashMap::new(),
+                all_paused: false,
             }),
             config: config.clone(),
             events,
@@ -620,6 +648,7 @@ impl HostSession {
             Err(reason) => inner.respond(viewer, session_id, Err(reason)).await,
             Ok((host_key, nonce)) => {
                 tracing::info!(viewer = %viewer, %session_id, "session accepted");
+                inner.apply_video_permissions().await;
                 inner
                     .respond(viewer, session_id, Ok((&host_key, &nonce)))
                     .await?;
@@ -779,6 +808,74 @@ impl HostSession {
         self.inner.send(viewer, msg).await
     }
 
+    /// Pauses (`paused` true) or resumes the view of `viewer` without ending its session.
+    ///
+    /// While paused the viewer may not subscribe to the video track, so the
+    /// SFU forwards it no frames; on resume it subscribes again and the SFU
+    /// asks the encoder for a keyframe. The viewer is told with
+    /// [`Control::ViewPaused`]. Fails with [`SendError::NotConnected`] when
+    /// `viewer` is not an accepted viewer; a viewer that is accepted but not
+    /// yet in the room is told when it joins.
+    pub async fn pause_view(&self, viewer: DeviceId, paused: bool) -> Result<(), SendError> {
+        let joined = {
+            let mut st = lock(&self.inner.state);
+            let v = st.viewers.get_mut(&viewer).ok_or(SendError::NotConnected)?;
+            v.paused = paused;
+            v.joined
+        };
+        self.inner.apply_video_permissions().await;
+        tracing::info!(viewer = %viewer, paused, "view pause changed");
+        if joined {
+            self.inner
+                .send(
+                    viewer,
+                    &DataMessage::Control(Control::ViewPaused { paused }),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Pauses (`paused` true) or resumes the view of every viewer without ending their sessions.
+    ///
+    /// While paused, viewers that join later start paused as well. Every
+    /// viewer in the room is told with [`Control::ViewPaused`]; viewers the
+    /// message cannot reach are skipped.
+    pub async fn pause_all(&self, paused: bool) {
+        let joined: Vec<DeviceId> = {
+            let mut st = lock(&self.inner.state);
+            st.all_paused = paused;
+            st.viewers
+                .iter_mut()
+                .filter_map(|(id, v)| {
+                    v.paused = paused;
+                    v.joined.then_some(*id)
+                })
+                .collect()
+        };
+        self.inner.apply_video_permissions().await;
+        tracing::info!(device_id = %self.inner.device, paused, "view pause changed for all viewers");
+        for viewer in joined {
+            let msg = DataMessage::Control(Control::ViewPaused { paused });
+            if let Err(err) = self.inner.send(viewer, &msg).await {
+                tracing::warn!(viewer = %viewer, error = %err, "sending view pause failed");
+            }
+        }
+    }
+
+    /// Returns whether the view of `viewer` is paused; false for an unknown viewer.
+    pub fn is_view_paused(&self, viewer: DeviceId) -> bool {
+        lock(&self.inner.state)
+            .viewers
+            .get(&viewer)
+            .is_some_and(|v| v.paused)
+    }
+
+    /// Returns whether the view is paused for every viewer, including viewers that join later.
+    pub fn is_all_paused(&self) -> bool {
+        lock(&self.inner.state).all_paused
+    }
+
     /// Ends the session with `viewer`: tells it to hang up and frees its slot.
     pub async fn hangup(&self, viewer: DeviceId) -> Result<(), SendError> {
         let result = self
@@ -894,6 +991,37 @@ impl Inner {
             })
             .await?;
         Ok(())
+    }
+
+    /// Sets who may subscribe to the video track from the viewers' pause states.
+    ///
+    /// With no view paused every participant may subscribe; otherwise only
+    /// the viewers whose view is not paused may. Failures are logged.
+    async fn apply_video_permissions(&self) {
+        let _serial = self.permissions_lock.lock().await;
+        let allowed = lock(&self.state).video_permissions();
+        let (all, permissions) = match allowed {
+            None => (true, Vec::new()),
+            Some(viewers) => (
+                false,
+                viewers
+                    .into_iter()
+                    .map(|viewer| ParticipantTrackPermission {
+                        participant_identity: room::identity(viewer),
+                        allow_all: true,
+                        allowed_track_sids: Vec::new(),
+                    })
+                    .collect(),
+            ),
+        };
+        if let Err(err) = self
+            .room
+            .local_participant()
+            .set_track_subscription_permissions(all, permissions)
+            .await
+        {
+            tracing::warn!(device_id = %self.device, error = %err, "updating video subscription permissions failed");
+        }
     }
 
     /// Seals `msg` for `viewer` and sends it.
@@ -1193,16 +1321,23 @@ impl Inner {
                     v.joined = true;
                     v.keyed = true;
                     v.left_at = None;
-                    keys
+                    (keys, v.paused)
                 }
                 _ => return,
             }
         };
+        let (keys, paused) = keys;
         for (index, key) in keys {
             let msg = DataMessage::Control(Control::MediaKey { index, key });
             if let Err(err) = self.send(viewer, &msg).await {
                 tracing::warn!(viewer = %viewer, error = %err, "sending media key failed");
                 return;
+            }
+        }
+        if paused {
+            let msg = DataMessage::Control(Control::ViewPaused { paused: true });
+            if let Err(err) = self.send(viewer, &msg).await {
+                tracing::warn!(viewer = %viewer, error = %err, "sending view pause failed");
             }
         }
         tracing::info!(viewer = %viewer, "viewer joined");
@@ -1474,6 +1609,7 @@ mod tests {
             active_key: SessionKey::from_bytes([active_index; 32]),
             active_index,
             refused: HashMap::new(),
+            all_paused: false,
         }
     }
 
@@ -1627,6 +1763,47 @@ mod tests {
         );
         assert_eq!(gone, vec![("old".to_owned(), id(1), false)]);
         assert!(st.pending.contains_key("new"));
+    }
+
+    /// Every participant may subscribe while no view is paused; once one is,
+    /// only the viewers whose view is not paused may.
+    #[test]
+    fn paused_viewers_lose_the_video_permission() {
+        let mut st = state(0, 0);
+        let now = Instant::now();
+        for n in 1..=3 {
+            st.admit(id(n), "s", channel("s"), now).unwrap();
+        }
+        assert_eq!(st.video_permissions(), None);
+        st.viewers.get_mut(&id(2)).unwrap().paused = true;
+        assert_eq!(st.video_permissions(), Some(vec![id(1), id(3)]));
+        st.viewers.get_mut(&id(2)).unwrap().paused = false;
+        assert_eq!(st.video_permissions(), None);
+    }
+
+    /// While every view is paused no viewer may subscribe, and a viewer
+    /// admitted meanwhile starts paused.
+    #[test]
+    fn viewers_admitted_while_all_paused_start_paused() {
+        let mut st = state(0, 0);
+        let now = Instant::now();
+        st.admit(id(1), "s", channel("s"), now).unwrap();
+        st.all_paused = true;
+        st.viewers.get_mut(&id(1)).unwrap().paused = true;
+        st.admit(id(2), "s", channel("s"), now).unwrap();
+        assert!(st.viewers[&id(2)].paused);
+        assert_eq!(st.video_permissions(), Some(vec![]));
+    }
+
+    /// A viewer that is readmitted into its unkeyed slot keeps its paused view.
+    #[test]
+    fn readmitted_viewer_stays_paused() {
+        let mut st = state(0, 0);
+        let now = Instant::now();
+        st.admit(id(1), "s1", channel("s1"), now).unwrap();
+        st.viewers.get_mut(&id(1)).unwrap().paused = true;
+        st.admit(id(1), "s2", channel("s2"), now).unwrap();
+        assert!(st.viewers[&id(1)].paused);
     }
 
     /// Admitting a viewer that already holds a keyed slot under a new session is denied

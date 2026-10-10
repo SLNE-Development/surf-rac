@@ -9,10 +9,11 @@ use common::{
     start_host, viewer_event,
 };
 use sqlx::PgPool;
-use surf_rac_protocol::data::{ClipboardKind, DataMessage};
+use surf_rac_protocol::data::{ClipboardKind, Control, DataMessage};
 use surf_rac_session::host::HostEvent;
 use surf_rac_session::viewer::{RequestError, RequestOptions, ViewerEvent};
 use surf_rac_session::{EndReason, FrameError, SessionConfig, VideoInput};
+use tokio::sync::mpsc::Receiver;
 
 /// Returns request options that authenticate with `password`.
 fn with_password(password: &str) -> RequestOptions {
@@ -526,4 +527,98 @@ async fn encoded_input_rejects_raw_frames_and_switches_back(pool: PgPool) {
         "only {} stamped frames after switching back",
         stamps.len()
     );
+}
+
+/// Waits up to `wait` for `events` to report the view pause state `paused`,
+/// discarding everything before it.
+async fn view_paused(events: &mut Receiver<ViewerEvent>, paused: bool, wait: Duration) {
+    viewer_event(events, wait, |e| {
+        matches!(
+            e,
+            ViewerEvent::DataReceived(DataMessage::Control(Control::ViewPaused { paused: p }))
+                if *p == paused
+        )
+    })
+    .await;
+}
+
+/// Counts the video frames `events` delivers within `wait`.
+async fn count_frames(events: &mut Receiver<ViewerEvent>, wait: Duration) -> usize {
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut frames = 0;
+    while let Ok(Some(ev)) = tokio::time::timeout_at(deadline, events.recv()).await {
+        if matches!(ev, ViewerEvent::VideoFrame(_)) {
+            frames += 1;
+        }
+    }
+    frames
+}
+
+/// A viewer whose view is paused is told so and receives no frames for two seconds while
+/// another viewer keeps receiving; after the view is resumed it is told so and frames arrive
+/// again.
+#[sqlx::test(migrations = "../server/migrations")]
+async fn paused_viewer_gets_no_frames_until_resumed(pool: PgPool) {
+    let env = TestEnv::start(pool).await;
+    let h = env.device("host", 1).await;
+    let (a, b) = (
+        env.device("paused", 2).await,
+        env.device("watching", 3).await,
+    );
+    let (host, mut host_events) = start_host(&h, SessionConfig::default()).await;
+    let feed = feed_frames(&host);
+    let pending = request(&a, h.id, SessionConfig::default());
+    let (_va, mut a_events) = accept_next(&host, &mut host_events, pending).await;
+    let pending = request(&b, h.id, SessionConfig::default());
+    let (_vb, mut b_events) = accept_next(&host, &mut host_events, pending).await;
+    assert!(count_frames(&mut a_events, Duration::from_secs(10)).await >= 10);
+    assert!(count_frames(&mut b_events, Duration::from_secs(1)).await >= 1);
+
+    host.pause_view(a.id, true).await.unwrap();
+    assert!(host.is_view_paused(a.id));
+    assert!(!host.is_view_paused(b.id));
+    view_paused(&mut a_events, true, Duration::from_secs(5)).await;
+    let _in_flight = count_frames(&mut a_events, Duration::from_millis(500)).await;
+    let _ = count_frames(&mut b_events, Duration::from_millis(100)).await;
+    let (paused_frames, watching_frames) = tokio::join!(
+        count_frames(&mut a_events, Duration::from_secs(2)),
+        count_frames(&mut b_events, Duration::from_secs(2)),
+    );
+    assert_eq!(paused_frames, 0, "paused viewer received frames");
+    assert!(
+        watching_frames >= 10,
+        "unpaused viewer got only {watching_frames} frames"
+    );
+
+    host.pause_view(a.id, false).await.unwrap();
+    view_paused(&mut a_events, false, Duration::from_secs(5)).await;
+    let resumed = count_frames(&mut a_events, Duration::from_secs(5)).await;
+    feed.abort();
+    assert!(resumed >= 10, "only {resumed} frames after resuming");
+}
+
+/// While the view is paused for all viewers, a viewer that joins starts paused, is told so and
+/// receives no frames; resuming all viewers brings its frames.
+#[sqlx::test(migrations = "../server/migrations")]
+async fn viewer_joining_while_all_paused_starts_paused(pool: PgPool) {
+    let env = TestEnv::start(pool).await;
+    let (h, v) = (env.device("host", 1).await, env.device("viewer", 2).await);
+    let (host, mut host_events) = start_host(&h, SessionConfig::default()).await;
+    let feed = feed_frames(&host);
+    host.pause_all(true).await;
+    assert!(host.is_all_paused());
+    let pending = request(&v, h.id, SessionConfig::default());
+    let (_viewer, mut events) = accept_next(&host, &mut host_events, pending).await;
+    assert!(host.is_view_paused(v.id));
+    view_paused(&mut events, true, Duration::from_secs(5)).await;
+    let paused_frames = count_frames(&mut events, Duration::from_secs(2)).await;
+    assert_eq!(paused_frames, 0, "paused viewer received frames");
+
+    host.pause_all(false).await;
+    assert!(!host.is_all_paused());
+    assert!(!host.is_view_paused(v.id));
+    view_paused(&mut events, false, Duration::from_secs(5)).await;
+    let resumed = count_frames(&mut events, Duration::from_secs(10)).await;
+    feed.abort();
+    assert!(resumed >= 10, "only {resumed} frames after resuming");
 }

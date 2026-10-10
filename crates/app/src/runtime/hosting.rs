@@ -111,6 +111,28 @@ fn join_expired(accepted: Instant, joined: bool, now: Instant) -> bool {
     !joined && now.saturating_duration_since(accepted) >= JOIN_WINDOW
 }
 
+/// Marks `viewer` as joined in `viewers` and returns its entry.
+///
+/// A viewer without an entry gets one with `remembered` grants, or the
+/// defaults when there are none, and `clipboard` sync. A viewer that already
+/// has an entry keeps the grants and clipboard sync it has.
+fn join_viewer(
+    viewers: &mut BTreeMap<DeviceId, HostViewer>,
+    viewer: DeviceId,
+    remembered: Option<Grants>,
+    clipboard: bool,
+) -> &mut HostViewer {
+    let entry = viewers.entry(viewer).or_insert(HostViewer {
+        grants: remembered.unwrap_or_default(),
+        device_name: String::new(),
+        clipboard,
+        joined: false,
+        accepted: Instant::now(),
+    });
+    entry.joined = true;
+    entry
+}
+
 impl Actor {
     /// Starts hosting when allowed, connected and not already running.
     pub(super) fn start_hosting(&mut self) {
@@ -250,20 +272,11 @@ impl Actor {
                     return;
                 };
                 host.route(&event);
-                let entry = host.viewers.entry(*viewer).or_insert(HostViewer {
-                    grants: remembered.unwrap_or_default(),
-                    device_name: String::new(),
-                    clipboard,
-                    joined: false,
-                    accepted: Instant::now(),
-                });
-                entry.joined = true;
+                let entry = join_viewer(&mut host.viewers, *viewer, remembered, clipboard);
                 if let Some(input) = &host.input {
                     let label = access::ghost_label(alias.as_deref(), &entry.device_name, *viewer);
                     input.set_label(*viewer, label);
-                    if let Some(grants) = remembered {
-                        input.set_grants(*viewer, grants);
-                    }
+                    input.set_grants(*viewer, entry.grants);
                 }
             }
             HostEvent::ViewerLeft { viewer } => {
@@ -645,5 +658,48 @@ mod tests {
         assert!(!join_expired(accepted, false, accepted + JOIN_WINDOW / 2));
         assert!(join_expired(accepted, false, accepted + JOIN_WINDOW));
         assert!(!join_expired(accepted, true, accepted + JOIN_WINDOW * 10));
+    }
+
+    /// Returns the test device ID with offset `n`.
+    fn id(n: u32) -> DeviceId {
+        DeviceId::new(100_000_000 + n).unwrap()
+    }
+
+    /// A viewer that joins again keeps the grants the host set this session,
+    /// even when the remembered grants differ.
+    #[test]
+    fn rejoining_viewer_keeps_the_hosts_grants() {
+        let mut viewers = BTreeMap::new();
+        let revoked = Grants {
+            pointer: false,
+            keyboard: true,
+            pointing: false,
+        };
+        let remembered = Some(Grants::default());
+        join_viewer(&mut viewers, id(1), remembered, true).grants = revoked;
+        let entry = join_viewer(&mut viewers, id(1), remembered, false);
+        assert_eq!(entry.grants, revoked);
+        assert!(entry.clipboard);
+        assert!(entry.joined);
+    }
+
+    /// A viewer that joins without an entry gets the remembered grants, or
+    /// the defaults when none are remembered.
+    #[test]
+    fn new_viewer_gets_remembered_or_default_grants() {
+        let mut viewers = BTreeMap::new();
+        let remembered = Grants {
+            pointer: false,
+            keyboard: false,
+            pointing: true,
+        };
+        assert_eq!(
+            join_viewer(&mut viewers, id(1), Some(remembered), true).grants,
+            remembered
+        );
+        assert_eq!(
+            join_viewer(&mut viewers, id(2), None, true).grants,
+            Grants::default()
+        );
     }
 }

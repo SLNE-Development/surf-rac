@@ -1036,33 +1036,16 @@ impl Actor {
             return;
         };
         match result {
-            Ok((s, mut events)) => {
+            Ok((s, events)) => {
                 viewing.session = Some(s);
                 let host = viewing.host;
-                let frame = Arc::clone(&viewing.frame);
-                let tx = self.internal.clone();
-                let repaint = Arc::clone(&self.repaint);
-                tokio::spawn(async move {
-                    let mut seq = 0;
-                    while let Some(event) = events.recv().await {
-                        if let ViewerEvent::VideoFrame(f) = event {
-                            let rgba = yuv::to_rgba(&f);
-                            if rgba.is_empty() {
-                                continue;
-                            }
-                            seq += 1;
-                            *lock(&frame) = Some(FrameImage {
-                                width: f.width,
-                                height: f.height,
-                                rgba: Arc::new(rgba),
-                                seq,
-                            });
-                            repaint();
-                        } else if tx.send(Internal::Viewer(session, event)).is_err() {
-                            return;
-                        }
-                    }
-                });
+                tokio::spawn(pump_viewer_events(
+                    session,
+                    events,
+                    Arc::clone(&viewing.frame),
+                    self.internal.clone(),
+                    Arc::clone(&self.repaint),
+                ));
                 if let Some(password) = remember {
                     self.save(|s| {
                         s.saved_passwords.insert(host, Secret::new(password));
@@ -1228,6 +1211,51 @@ impl Actor {
     }
 }
 
+/// Moves the events of viewer session `session` to the actor and keeps its
+/// newest decoded frame in `frame`.
+///
+/// When the session ends, the frame is dropped before the end is reported, so
+/// the host's picture is neither drawn nor held in memory afterwards, and no
+/// later frame can replace it. Returns once the session ended or the actor is
+/// gone.
+async fn pump_viewer_events(
+    session: u64,
+    mut events: mpsc::Receiver<ViewerEvent>,
+    frame: Arc<Mutex<Option<FrameImage>>>,
+    tx: mpsc::UnboundedSender<Internal>,
+    repaint: Repaint,
+) {
+    let mut seq = 0;
+    while let Some(event) = events.recv().await {
+        match event {
+            ViewerEvent::VideoFrame(f) => {
+                let rgba = yuv::to_rgba(&f);
+                if rgba.is_empty() {
+                    continue;
+                }
+                seq += 1;
+                *lock(&frame) = Some(FrameImage {
+                    width: f.width,
+                    height: f.height,
+                    rgba: Arc::new(rgba),
+                    seq,
+                });
+                repaint();
+            }
+            ViewerEvent::Ended { .. } => {
+                *lock(&frame) = None;
+                let _ = tx.send(Internal::Viewer(session, event));
+                return;
+            }
+            event => {
+                if tx.send(Internal::Viewer(session, event)).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -1361,5 +1389,33 @@ mod tests {
         actor.connect_to(DeviceId::new(987_654_321).unwrap(), None, false);
         assert_eq!(actor.banner.as_deref(), Some(NOT_CONNECTED_TEXT));
         assert!(actor.viewers.is_empty());
+    }
+
+    /// Ending a viewer session drops the host's last frame before the end is
+    /// reported, and nothing after the end is read.
+    #[tokio::test]
+    async fn ended_session_drops_the_last_frame() {
+        let (events_tx, events) = mpsc::channel(4);
+        let (tx, mut internal) = mpsc::unbounded_channel();
+        let frame = Arc::new(Mutex::new(Some(FrameImage {
+            width: 1,
+            height: 1,
+            rgba: Arc::new(vec![1, 2, 3, 4]),
+            seq: 1,
+        })));
+        events_tx
+            .send(ViewerEvent::Ended {
+                reason: surf_rac_session::EndReason::Hangup,
+            })
+            .await
+            .unwrap();
+        events_tx.send(ViewerEvent::Connected).await.unwrap();
+        pump_viewer_events(7, events, Arc::clone(&frame), tx, Arc::new(|| {})).await;
+        assert!(frame.lock().unwrap().is_none());
+        assert!(matches!(
+            internal.try_recv(),
+            Ok(Internal::Viewer(7, ViewerEvent::Ended { .. }))
+        ));
+        assert!(internal.try_recv().is_err());
     }
 }

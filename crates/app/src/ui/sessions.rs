@@ -367,6 +367,7 @@ impl ClientApp {
                 let frame = view.frame.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 let Some(frame) = frame else {
                     state.picture = None;
+                    state.texture = None;
                     ui.centered_and_justified(|ui| {
                         ui.label(RichText::new(status_text(&view.status)).color(p.muted));
                     });

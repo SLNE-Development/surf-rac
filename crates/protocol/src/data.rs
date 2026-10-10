@@ -117,7 +117,9 @@ pub enum Control {
 }
 
 /// A viewer's input permissions and the host-wide input status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+///
+/// The default grants nothing, with pointing on and no lock or follow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputState {
     /// Whether the viewer may move, click and scroll with the real cursor.
     pub pointer: bool,
@@ -127,7 +129,47 @@ pub struct InputState {
     pub locked: bool,
     /// Whether the shared monitor follows where the host is working.
     pub follow: bool,
+    /// Whether the host shows or injects the viewer's pointer at all; true
+    /// when the sender did not include it.
+    #[serde(default = "pointing_default")]
+    pub pointing: bool,
 }
+
+impl Default for InputState {
+    /// Returns a state with no pointer or keyboard grant, no lock, follow
+    /// off and pointing on.
+    fn default() -> InputState {
+        InputState {
+            pointer: false,
+            keyboard: false,
+            locked: false,
+            follow: false,
+            pointing: true,
+        }
+    }
+}
+
+/// Returns the value of [`InputState::pointing`] when it is missing: true.
+fn pointing_default() -> bool {
+    true
+}
+
+/// The layout of [`InputState`] without [`InputState::pointing`].
+#[derive(Deserialize)]
+struct InputStateWithoutPointing {
+    /// See [`InputState::pointer`].
+    pointer: bool,
+    /// See [`InputState::keyboard`].
+    keyboard: bool,
+    /// See [`InputState::locked`].
+    locked: bool,
+    /// See [`InputState::follow`].
+    follow: bool,
+}
+
+/// Leading body bytes of an encoded [`Control::InputState`] message: the
+/// [`DataMessage::Control`] tag followed by the [`Control::InputState`] tag.
+const INPUT_STATE_PREFIX: [u8; 2] = [4, 5];
 
 /// Most monitors a [`ScreenState`] lists.
 pub const MAX_MONITORS: usize = 16;
@@ -317,8 +359,25 @@ impl DataMessage {
         }
         match postcard::take_from_bytes(body) {
             Ok((msg, [])) => Ok(msg),
-            _ => Err(DecodeError::Malformed),
+            _ => decode_input_state_without_pointing(body).ok_or(DecodeError::Malformed),
         }
+    }
+}
+
+/// Decodes `body` as a [`Control::InputState`] message that lacks
+/// [`InputState::pointing`], filling it in as true; `None` when `body` is
+/// not such a message.
+fn decode_input_state_without_pointing(body: &[u8]) -> Option<DataMessage> {
+    let rest = body.strip_prefix(&INPUT_STATE_PREFIX[..])?;
+    match postcard::take_from_bytes::<InputStateWithoutPointing>(rest) {
+        Ok((s, [])) => Some(DataMessage::Control(Control::InputState(InputState {
+            pointer: s.pointer,
+            keyboard: s.keyboard,
+            locked: s.locked,
+            follow: s.follow,
+            pointing: pointing_default(),
+        }))),
+        _ => None,
     }
 }
 
@@ -417,14 +476,59 @@ mod tests {
             keyboard: false,
             locked: true,
             follow: false,
+            pointing: false,
         }));
         assert_eq!(DataMessage::decode(&state.encode()).unwrap(), state);
-        assert_eq!(state.encode(), [1, 4, 5, 1, 0, 1, 0]);
+        assert_eq!(state.encode(), [1, 4, 5, 1, 0, 1, 0, 0]);
         let follow = DataMessage::Control(Control::SetFollow { on: true });
         assert_eq!(DataMessage::decode(&follow.encode()).unwrap(), follow);
         assert_eq!(follow.encode(), [1, 4, 6, 1]);
         assert!(follow.is_reliable());
         assert_eq!(follow.topic(), TOPIC_INPUT);
+    }
+
+    /// Checks that an input state with pointing on and off survives encoding.
+    #[test]
+    fn input_state_pointing_round_trips() {
+        for pointing in [true, false] {
+            let msg = DataMessage::Control(Control::InputState(InputState {
+                pointer: false,
+                keyboard: true,
+                locked: false,
+                follow: true,
+                pointing,
+            }));
+            assert_eq!(DataMessage::decode(&msg.encode()).unwrap(), msg);
+        }
+    }
+
+    /// Checks that an input state encoded without the pointing field decodes
+    /// with pointing on, and that other truncations still fail.
+    #[test]
+    fn input_state_without_pointing_means_pointing() {
+        let decoded = DataMessage::decode(&[1, 4, 5, 1, 0, 1, 0]).unwrap();
+        assert_eq!(
+            decoded,
+            DataMessage::Control(Control::InputState(InputState {
+                pointer: true,
+                keyboard: false,
+                locked: true,
+                follow: false,
+                pointing: true,
+            }))
+        );
+        assert_eq!(
+            DataMessage::decode(&[1, 4, 5, 1, 0, 1]),
+            Err(DecodeError::Malformed)
+        );
+        assert_eq!(
+            DataMessage::decode(&[1, 4, 5, 1, 0, 1, 0, 1, 0]),
+            Err(DecodeError::Malformed)
+        );
+        assert_eq!(
+            DataMessage::decode(&[1, 4, 6, 1, 0, 1, 0]),
+            Err(DecodeError::Malformed)
+        );
     }
 
     #[test]

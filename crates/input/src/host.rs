@@ -371,7 +371,7 @@ impl<P: Platform, S: Share> Runner<P, S> {
         let mut ghosts_changed = false;
         for action in actions {
             match action {
-                Action::Ghost { viewer, slot, at } => {
+                Action::Ghost { viewer, slot, at, .. } => {
                     ghosts_changed = true;
                     match at {
                         Some((x, y)) => self.ghosts.insert(viewer, (slot, x, y)),
@@ -754,7 +754,7 @@ mod tests {
         let h = harness();
         h.control.send(Command::Joined(v(1))).unwrap();
         h.control.send(Command::Joined(v(2))).unwrap();
-        h.control.send(Command::Grants(v(2), Grants { pointer: false, keyboard: true })).unwrap();
+        h.control.send(Command::Grants(v(2), Grants { pointer: false, keyboard: true, pointing: true })).unwrap();
         settle().await;
         h.input.send((v(1), DataMessage::PointerButton { button: MouseButton::Left, down: true })).await.unwrap();
         h.input.send((v(2), DataMessage::PointerMove { x: 1, y: 2, monitor: 0 })).await.unwrap();
@@ -821,7 +821,7 @@ mod tests {
     async fn ghosts_reach_platform_and_stop_releases() {
         let mut h = harness();
         h.control.send(Command::Joined(v(1))).unwrap();
-        h.control.send(Command::Grants(v(1), Grants { pointer: false, keyboard: true })).unwrap();
+        h.control.send(Command::Grants(v(1), Grants { pointer: false, keyboard: true, pointing: true })).unwrap();
         settle().await;
         h.input.send((v(1), DataMessage::PointerMove { x: 10, y: 20, monitor: 1 })).await.unwrap();
         h.input.send((v(1), DataMessage::Key { code: 0x2A, down: true })).await.unwrap();

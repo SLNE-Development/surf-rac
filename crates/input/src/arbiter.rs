@@ -11,8 +11,8 @@ use surf_rac_protocol::data::{Control, DataMessage, InputState, MouseButton};
 /// How long physical host input locks out all remote input.
 pub const LOCKOUT: Duration = Duration::from_secs(5);
 
-/// How long a ghost pointer stays visible after its last move.
-pub const GHOST_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a ghost pointer stays visible after its last move or click.
+pub const GHOST_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Largest wheel amount per message and axis, in units of 120 per notch.
 pub const MAX_WHEEL: i32 = 1200;
@@ -36,14 +36,25 @@ pub struct Grants {
     pub pointer: bool,
     /// Type.
     pub keyboard: bool,
+    /// Have the pointer injected or shown as a ghost at all; when off, moves,
+    /// clicks and scrolls are dropped whatever `pointer` says.
+    pub pointing: bool,
+}
+
+impl Grants {
+    /// Returns whether the pointer may move, click and scroll with the real cursor.
+    fn controls_pointer(self) -> bool {
+        self.pointer && self.pointing
+    }
 }
 
 impl Default for Grants {
-    /// Returns grants with pointer and keyboard both allowed.
+    /// Returns grants with pointer, keyboard and pointing all allowed.
     fn default() -> Grants {
         Grants {
             pointer: true,
             keyboard: true,
+            pointing: true,
         }
     }
 }
@@ -87,6 +98,8 @@ pub enum Action {
         slot: u8,
         /// Desktop position, `None` to hide.
         at: Option<(i32, i32)>,
+        /// Whether the viewer clicked at this position.
+        click: bool,
     },
     /// Send a viewer its input state.
     Send(DeviceId, InputState),
@@ -127,6 +140,8 @@ struct Viewer {
     sent: Option<InputState>,
     /// When its visible ghost pointer expires; `None` while hidden.
     ghost_until: Option<Instant>,
+    /// Desktop position of its last valid pointer move.
+    last_at: Option<(i32, i32)>,
 }
 
 /// Merges input from several viewers and decides what reaches the host.
@@ -173,6 +188,7 @@ impl Arbiter {
                     slot,
                     sent: None,
                     ghost_until: None,
+                    last_at: None,
                 },
             );
         }
@@ -190,23 +206,34 @@ impl Arbiter {
                 viewer,
                 slot: gone.slot,
                 at: None,
+                click: false,
             });
         }
         out.extend(self.sync(now));
         out
     }
 
-    /// Sets `viewer`'s grants; a revoked grant releases what the viewer holds under it.
+    /// Sets `viewer`'s grants; a revoked grant releases what the viewer holds
+    /// under it, and revoking pointing hides its ghost at once.
     pub fn set_grants(&mut self, viewer: DeviceId, grants: Grants, now: Instant) -> Vec<Action> {
         let Some(v) = self.viewers.get_mut(&viewer) else {
             return Vec::new();
         };
         let old = std::mem::replace(&mut v.grants, grants);
-        let mut out = self.release_viewer(
+        let mut out = Vec::new();
+        if !grants.pointing && v.ghost_until.take().is_some() {
+            out.push(Action::Ghost {
+                viewer,
+                slot: v.slot,
+                at: None,
+                click: false,
+            });
+        }
+        out.extend(self.release_viewer(
             viewer,
             old.keyboard && !grants.keyboard,
-            old.pointer && !grants.pointer,
-        );
+            old.controls_pointer() && !grants.controls_pointer(),
+        ));
         out.extend(self.sync(now));
         out
     }
@@ -265,8 +292,9 @@ impl Arbiter {
     ///
     /// `geometry` holds the desktop rectangle of each monitor, indexed like the
     /// screen state's monitors. Moves on unknown monitors, oversized key codes
-    /// and input the viewer may not give are dropped. Moves the viewer may not
-    /// inject become ghost pointer moves.
+    /// and input the viewer may not give are dropped. Without pointing, moves,
+    /// clicks and scrolls are dropped. Moves and button presses the viewer may
+    /// not inject become ghost pointer moves and ghost clicks.
     pub fn message(&mut self, viewer: DeviceId, msg: &DataMessage, geometry: &[MonitorRect], now: Instant) -> Vec<Action> {
         let Some(v) = self.viewers.get(&viewer) else {
             self.invalid += 1;
@@ -274,7 +302,7 @@ impl Arbiter {
         };
         let grants = v.grants;
         let locked = self.locked(now);
-        let pointer = grants.pointer && !locked;
+        let pointer = grants.controls_pointer() && !locked;
         let mut out = Vec::new();
         match *msg {
             DataMessage::PointerMove { x, y, monitor } => {
@@ -283,12 +311,17 @@ impl Arbiter {
                     return out;
                 };
                 let v = self.viewers.get_mut(&viewer).expect("viewer checked above");
+                if !grants.pointing {
+                    return out;
+                }
+                v.last_at = Some(at);
                 if pointer {
                     if v.ghost_until.take().is_some() {
                         out.push(Action::Ghost {
                             viewer,
                             slot: v.slot,
                             at: None,
+                            click: false,
                         });
                     }
                     out.push(Action::Move { x: at.0, y: at.1 });
@@ -298,6 +331,7 @@ impl Arbiter {
                         viewer,
                         slot: v.slot,
                         at: Some(at),
+                        click: false,
                     });
                 }
             }
@@ -305,6 +339,18 @@ impl Arbiter {
                 let i = button_index(button);
                 if let Some(down) = hold(&mut self.buttons[i], viewer, down) {
                     out.push(Action::Button { button, down });
+                }
+            }
+            DataMessage::PointerButton { down: true, .. } if grants.pointing => {
+                let v = self.viewers.get_mut(&viewer).expect("viewer checked above");
+                if let Some(at) = v.last_at {
+                    v.ghost_until = Some(now + GHOST_TIMEOUT);
+                    out.push(Action::Ghost {
+                        viewer,
+                        slot: v.slot,
+                        at: Some(at),
+                        click: true,
+                    });
                 }
             }
             DataMessage::Wheel { dx, dy } if pointer => {
@@ -338,6 +384,7 @@ impl Arbiter {
                     viewer,
                     slot: v.slot,
                     at: None,
+                    click: false,
                 });
             }
         }
@@ -389,6 +436,7 @@ impl Arbiter {
                 keyboard: v.grants.keyboard,
                 locked,
                 follow,
+                pointing: v.grants.pointing,
             };
             if v.sent != Some(state) {
                 v.sent = Some(state);
@@ -509,7 +557,7 @@ mod tests {
 
     /// Returns the input state viewers get with default grants.
     fn state(locked: bool, follow: bool) -> InputState {
-        InputState { pointer: true, keyboard: true, locked, follow }
+        InputState { pointer: true, keyboard: true, locked, follow, pointing: true }
     }
 
     /// Returns an arbiter with viewers 1 and 2 joined, and the time they joined.
@@ -529,7 +577,121 @@ mod tests {
         assert_eq!(a.viewer_joined(v(1), t0), []);
         let status = a.status(t0);
         assert_eq!(status.viewers[&v(1)], ViewerStatus { grants: Grants::default(), slot: 0 });
-        assert!(Grants::default().pointer && Grants::default().keyboard);
+        assert!(Grants::default().pointer && Grants::default().keyboard && Grants::default().pointing);
+    }
+
+    /// Returns grants with clicks and keyboard on and pointing off.
+    fn not_pointing() -> Grants {
+        Grants { pointer: true, keyboard: true, pointing: false }
+    }
+
+    /// Checks that a viewer without pointing has its moves, clicks and
+    /// scrolls dropped, keeps its keyboard and is told pointing is off.
+    #[test]
+    fn without_pointing_pointer_input_is_dropped() {
+        let (mut a, t0) = two();
+        assert_eq!(
+            a.set_grants(v(1), not_pointing(), t0),
+            [Action::Send(v(1), InputState { pointing: false, ..state(false, false) })]
+        );
+        assert_eq!(a.message(v(1), &mv(5, 5, 0), &geo(), t0), []);
+        assert_eq!(a.message(v(1), &button(MouseButton::Left, true), &geo(), t0), []);
+        assert_eq!(a.message(v(1), &button(MouseButton::Left, false), &geo(), t0), []);
+        assert_eq!(a.message(v(1), &DataMessage::Wheel { dx: 0, dy: 120 }, &geo(), t0), []);
+        assert_eq!(a.message(v(1), &key(0x1E, true), &geo(), t0), [Action::Key { code: 0x1E, down: true }]);
+        assert_eq!(a.take_invalid(), 0, "dropped pointer input is not invalid");
+        assert!(!a.status(t0).viewers[&v(1)].grants.pointing);
+    }
+
+    /// Checks that a viewer without pointing shows no ghost while locked out.
+    #[test]
+    fn without_pointing_no_ghost_during_lockout() {
+        let (mut a, t0) = two();
+        a.set_grants(v(1), not_pointing(), t0);
+        a.host_input(t0, t0);
+        assert_eq!(a.message(v(1), &mv(5, 5, 0), &geo(), t0), []);
+        assert_eq!(a.message(v(1), &button(MouseButton::Left, true), &geo(), t0), []);
+    }
+
+    /// Checks that revoking pointing hides the viewer's ghost at once and
+    /// releases the buttons it holds.
+    #[test]
+    fn revoking_pointing_hides_ghost_and_releases_buttons() {
+        let (mut a, t0) = two();
+        a.message(v(2), &button(MouseButton::Middle, true), &geo(), t0);
+        a.set_grants(v(1), Grants { pointer: false, keyboard: true, pointing: true }, t0);
+        a.message(v(1), &mv(7, 8, 0), &geo(), t0);
+        assert_eq!(
+            a.set_grants(v(1), Grants { pointer: false, keyboard: true, pointing: false }, t0),
+            [
+                Action::Ghost { viewer: v(1), slot: 0, at: None, click: false },
+                Action::Send(v(1), InputState { pointer: false, pointing: false, ..state(false, false) }),
+            ]
+        );
+        assert_eq!(a.tick(t0 + GHOST_TIMEOUT), [], "the ghost is already hidden");
+        assert_eq!(
+            a.set_grants(v(2), not_pointing(), t0),
+            [
+                Action::Button { button: MouseButton::Middle, down: false },
+                Action::Send(v(2), InputState { pointing: false, ..state(false, false) }),
+            ]
+        );
+    }
+
+    /// Checks that restoring pointing lets moves through again.
+    #[test]
+    fn restoring_pointing_injects_again() {
+        let (mut a, t0) = two();
+        a.set_grants(v(1), not_pointing(), t0);
+        a.set_grants(v(1), Grants::default(), t0);
+        assert_eq!(a.message(v(1), &mv(9, 9, 0), &geo(), t0), [Action::Move { x: 9, y: 9 }]);
+    }
+
+    /// Checks that pointing is on for each joining viewer, also after a
+    /// viewer with pointing off left and joined again.
+    #[test]
+    fn pointing_is_on_for_each_join() {
+        let (mut a, t0) = two();
+        a.set_grants(v(1), not_pointing(), t0);
+        a.viewer_left(v(1), t0);
+        assert_eq!(a.viewer_joined(v(1), t0), [Action::Send(v(1), state(false, false))]);
+        assert!(a.status(t0).viewers[&v(1)].grants.pointing);
+    }
+
+    /// Checks that a press that is not injected becomes a ghost click at the
+    /// last position, refreshing the ghost's timeout, while releases and
+    /// other buttons' releases stay silent.
+    #[test]
+    fn ghost_click_refreshes_timeout() {
+        let (mut a, t0) = two();
+        a.set_grants(v(1), Grants { pointer: false, keyboard: true, pointing: true }, t0);
+        a.message(v(1), &mv(40, 50, 0), &geo(), t0);
+        let t1 = t0 + Duration::from_secs(2);
+        assert_eq!(
+            a.message(v(1), &button(MouseButton::Right, true), &geo(), t1),
+            [Action::Ghost { viewer: v(1), slot: 0, at: Some((40, 50)), click: true }]
+        );
+        assert_eq!(a.message(v(1), &button(MouseButton::Right, false), &geo(), t1), []);
+        assert_eq!(a.tick(t0 + GHOST_TIMEOUT), [], "the click kept the ghost visible");
+        assert_eq!(
+            a.tick(t1 + GHOST_TIMEOUT),
+            [Action::Ghost { viewer: v(1), slot: 0, at: None, click: false }]
+        );
+    }
+
+    /// Checks that a ghost click during a lockout shows at the position of
+    /// the last injected move, and that a press before any move shows nothing.
+    #[test]
+    fn ghost_click_during_lockout_uses_last_position() {
+        let (mut a, t0) = two();
+        assert_eq!(a.message(v(2), &button(MouseButton::Left, true), &geo(), t0).len(), 1);
+        a.message(v(1), &mv(1930, 20, 0), &geo(), t0);
+        a.host_input(t0, t0);
+        assert_eq!(
+            a.message(v(1), &button(MouseButton::Left, true), &geo(), t0),
+            [Action::Ghost { viewer: v(1), slot: 0, at: Some((1919, 20)), click: true }]
+        );
+        assert_eq!(a.message(v(2), &button(MouseButton::Left, true), &geo(), t0), []);
     }
 
     #[test]
@@ -596,19 +758,23 @@ mod tests {
         let (mut a, t0) = two();
         a.message(v(1), &button(MouseButton::Right, true), &geo(), t0);
         a.message(v(1), &key(0x10, true), &geo(), t0);
-        let grants = Grants { pointer: false, keyboard: true };
+        let grants = Grants { pointer: false, keyboard: true, pointing: true };
         assert_eq!(
             a.set_grants(v(1), grants, t0),
             [
                 Action::Button { button: MouseButton::Right, down: false },
-                Action::Send(v(1), InputState { pointer: false, keyboard: true, locked: false, follow: false }),
+                Action::Send(v(1), InputState { pointer: false, keyboard: true, locked: false, follow: false, pointing: true }),
             ]
         );
         assert_eq!(
             a.message(v(1), &mv(100, 200, 0), &geo(), t0),
-            [Action::Ghost { viewer: v(1), slot: 0, at: Some((100, 200)) }]
+            [Action::Ghost { viewer: v(1), slot: 0, at: Some((100, 200)), click: false }]
         );
-        assert_eq!(a.message(v(1), &button(MouseButton::Left, true), &geo(), t0), []);
+        assert_eq!(
+            a.message(v(1), &button(MouseButton::Left, true), &geo(), t0),
+            [Action::Ghost { viewer: v(1), slot: 0, at: Some((100, 200)), click: true }]
+        );
+        assert_eq!(a.message(v(1), &button(MouseButton::Left, false), &geo(), t0), []);
         assert_eq!(a.message(v(1), &DataMessage::Wheel { dx: 0, dy: 120 }, &geo(), t0), []);
         assert_eq!(a.message(v(1), &key(0x10, false), &geo(), t0), [Action::Key { code: 0x10, down: false }]);
     }
@@ -617,7 +783,7 @@ mod tests {
     fn revoke_keyboard_releases_keys() {
         let (mut a, t0) = two();
         a.message(v(2), &key(0x2A, true), &geo(), t0);
-        let out = a.set_grants(v(2), Grants { pointer: true, keyboard: false }, t0);
+        let out = a.set_grants(v(2), Grants { pointer: true, keyboard: false, pointing: true }, t0);
         assert_eq!(out[0], Action::Key { code: 0x2A, down: false });
         assert_eq!(a.message(v(2), &key(0x1E, true), &geo(), t0), []);
         assert_eq!(a.set_grants(v(9), Grants::default(), t0), []);
@@ -626,12 +792,12 @@ mod tests {
     #[test]
     fn real_move_clears_ghost() {
         let (mut a, t0) = two();
-        a.set_grants(v(2), Grants { pointer: false, keyboard: true }, t0);
+        a.set_grants(v(2), Grants { pointer: false, keyboard: true, pointing: true }, t0);
         a.message(v(2), &mv(1, 1, 0), &geo(), t0);
         a.set_grants(v(2), Grants::default(), t0);
         assert_eq!(
             a.message(v(2), &mv(2, 2, 0), &geo(), t0),
-            [Action::Ghost { viewer: v(2), slot: 1, at: None }, Action::Move { x: 2, y: 2 }]
+            [Action::Ghost { viewer: v(2), slot: 1, at: None, click: false }, Action::Move { x: 2, y: 2 }]
         );
     }
 
@@ -652,7 +818,7 @@ mod tests {
         assert_eq!(a.message(v(2), &key(0x1E, true), &geo(), t1), []);
         assert_eq!(
             a.message(v(1), &mv(3, 4, 0), &geo(), t1),
-            [Action::Ghost { viewer: v(1), slot: 0, at: Some((3, 4)) }]
+            [Action::Ghost { viewer: v(1), slot: 0, at: Some((3, 4)), click: false }]
         );
     }
 
@@ -672,19 +838,22 @@ mod tests {
         assert_eq!(a.host_input(t0, end), [], "stale host input does not lock again");
     }
 
+    /// Checks that a ghost hides exactly [`GHOST_TIMEOUT`] after its last move,
+    /// and that a leaving viewer's ghost is hidden.
     #[test]
-    fn ghost_expires_after_five_seconds() {
+    fn ghost_expires_after_timeout() {
+        assert_eq!(GHOST_TIMEOUT, Duration::from_secs(3));
         let (mut a, t0) = two();
-        a.set_grants(v(1), Grants { pointer: false, keyboard: false }, t0);
+        a.set_grants(v(1), Grants { pointer: false, keyboard: false, pointing: true }, t0);
         a.message(v(1), &mv(1, 1, 0), &geo(), t0);
         assert_eq!(a.tick(t0 + GHOST_TIMEOUT - Duration::from_millis(1)), []);
         assert_eq!(
             a.tick(t0 + GHOST_TIMEOUT),
-            [Action::Ghost { viewer: v(1), slot: 0, at: None }]
+            [Action::Ghost { viewer: v(1), slot: 0, at: None, click: false }]
         );
         assert_eq!(a.tick(t0 + GHOST_TIMEOUT * 2), []);
         a.message(v(1), &mv(1, 1, 0), &geo(), t0);
-        assert_eq!(a.viewer_left(v(1), t0), [Action::Ghost { viewer: v(1), slot: 0, at: None }]);
+        assert_eq!(a.viewer_left(v(1), t0), [Action::Ghost { viewer: v(1), slot: 0, at: None, click: false }]);
     }
 
     #[test]
@@ -712,7 +881,7 @@ mod tests {
         let (mut a, t0) = two();
         a.message(v(9), &key(0x1E, true), &geo(), t0);
         a.message(v(1), &mv(1, 1, 7), &geo(), t0);
-        a.set_grants(v(1), Grants { pointer: true, keyboard: false }, t0);
+        a.set_grants(v(1), Grants { pointer: true, keyboard: false, pointing: true }, t0);
         a.message(v(1), &key(0x1E, true), &geo(), t0);
         assert_eq!(a.take_invalid(), 2, "a key without the grant is not invalid");
     }
@@ -720,7 +889,7 @@ mod tests {
     #[test]
     fn input_state_only_on_change() {
         let (mut a, t0) = two();
-        let off = Grants { pointer: false, keyboard: true };
+        let off = Grants { pointer: false, keyboard: true, pointing: true };
         assert_eq!(a.set_grants(v(1), off, t0).len(), 1);
         assert_eq!(a.set_grants(v(1), off, t0), []);
         assert_eq!(a.set_grants(v(1), Grants::default(), t0).len(), 1);

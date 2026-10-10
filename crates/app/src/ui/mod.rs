@@ -241,6 +241,7 @@ mod tests {
                 keyboard,
                 locked,
                 follow: false,
+                pointing: true,
             },
             clipboard: false,
             offer_forget: false,

@@ -56,6 +56,8 @@ mod tests {
         tokio::time::timeout(wait, w.expired()).await.is_ok()
     }
 
+    /// A reconnect watch expires once the window has passed since the first
+    /// reconnecting signal, and a repeated signal does not restart it.
     #[tokio::test(start_paused = true)]
     async fn expires_after_window() {
         let mut w = ReconnectWatch::new(Duration::from_secs(30));
@@ -65,6 +67,8 @@ mod tests {
         assert!(expires_within(&mut w, Duration::from_secs(2)).await);
     }
 
+    /// Reconnecting cancels the pending expiry, and a later reconnecting signal starts
+    /// a fresh window.
     #[tokio::test(start_paused = true)]
     async fn reconnected_cancels() {
         let mut w = ReconnectWatch::new(Duration::from_secs(30));
@@ -77,6 +81,7 @@ mod tests {
         assert!(expires_within(&mut w, Duration::from_secs(2)).await);
     }
 
+    /// A watch that never saw a reconnecting signal does not expire.
     #[tokio::test(start_paused = true)]
     async fn idle_never_expires() {
         let mut w = ReconnectWatch::new(Duration::from_secs(30));

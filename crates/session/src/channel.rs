@@ -216,10 +216,12 @@ mod tests {
     use super::*;
     use surf_rac_protocol::data::ClipboardKind;
 
+    /// Returns a channel for session `s1` on `side` with a fixed test key.
     fn channel(side: Side) -> PeerChannel {
         PeerChannel::new("s1".into(), SessionKey::from_bytes([4; 32]), side)
     }
 
+    /// Returns a viewer-side sending channel and a host-side receiving channel.
     fn pair() -> (PeerChannel, PeerChannel) {
         (channel(Side::Viewer), channel(Side::Host))
     }
@@ -232,6 +234,7 @@ mod tests {
         crypto::seal(&SessionKey::from_bytes([4; 32]), topic, "s1", &p)
     }
 
+    /// A message sealed by the viewer opens on the host under its own topic.
     #[test]
     fn channel_round_trip() {
         let (mut tx, mut rx) = pair();
@@ -243,6 +246,9 @@ mod tests {
         assert_eq!(rx.open(TOPIC_INPUT, &sealed), Inbound::Message(msg));
     }
 
+    /// A message opened under a topic other than the one it was sealed for is dropped,
+    /// and a message whose sealed topic does not match its content is dropped on every
+    /// topic.
     #[test]
     fn channel_rejects_topic_mismatch() {
         let (mut tx, mut rx) = pair();
@@ -270,6 +276,8 @@ mod tests {
         assert_eq!(rx.open("other/topic", &wrong), Inbound::Dropped);
     }
 
+    /// A message opened a second time is dropped, while the sender's next message is
+    /// still accepted.
     #[test]
     fn replayed_message_is_dropped() {
         let (mut tx, mut rx) = pair();
@@ -290,6 +298,8 @@ mod tests {
         assert!(matches!(rx.open(TOPIC_INPUT, &next), Inbound::Message(_)));
     }
 
+    /// A message sealed by one viewer is dropped by another viewer-side channel instead
+    /// of being accepted as from the host.
     #[test]
     fn reflected_message_is_dropped() {
         let (mut viewer, _) = pair();
@@ -303,6 +313,8 @@ mod tests {
         assert_eq!(other_viewer.open(TOPIC_INPUT, &sealed), Inbound::Dropped);
     }
 
+    /// Pointer moves arriving out of order inside the replay window are accepted once
+    /// each, while a duplicate or a counter that fell behind the window is dropped.
     #[test]
     fn lossy_reordering_within_window_is_accepted() {
         let (mut tx, mut rx) = pair();
@@ -353,6 +365,8 @@ mod tests {
         assert_eq!(rx.open(TOPIC_POINTER, &late), Inbound::Dropped);
     }
 
+    /// On the input and clipboard topics, a message older than one already accepted is
+    /// dropped.
     #[test]
     fn reliable_topics_reject_reordering() {
         let (mut tx, mut rx) = pair();
@@ -386,6 +400,8 @@ mod tests {
         assert_eq!(rx.open(TOPIC_CLIPBOARD, &c1), Inbound::Dropped);
     }
 
+    /// Counters are tracked per topic, so a later message on one topic does not make an
+    /// earlier one on another topic look replayed.
     #[test]
     fn topics_count_independently() {
         let (mut tx, mut rx) = pair();
@@ -408,6 +424,8 @@ mod tests {
         assert!(matches!(rx.open(TOPIC_INPUT, &key), Inbound::Message(_)));
     }
 
+    /// Undecryptable messages are dropped until the failure limit is reached in a row,
+    /// which reports a crypto limit; a valid message in between resets the count.
     #[test]
     fn channel_crypto_limit_after_ten() {
         let (mut tx, mut rx) = pair();
@@ -431,6 +449,8 @@ mod tests {
         );
     }
 
+    /// A message carrying an unknown protocol version byte is reported with that
+    /// version.
     #[test]
     fn channel_unknown_version() {
         let (_, mut rx) = pair();
@@ -438,6 +458,8 @@ mod tests {
         assert_eq!(rx.open(TOPIC_INPUT, &sealed), Inbound::UnknownVersion(99));
     }
 
+    /// Sealing a clipboard payload one byte over the limit fails with its size, while a
+    /// payload exactly at the limit seals and opens.
     #[test]
     fn clipboard_over_limit_refused() {
         let (mut tx, mut rx) = pair();

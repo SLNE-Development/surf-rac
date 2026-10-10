@@ -1463,6 +1463,8 @@ mod tests {
             .unwrap();
     }
 
+    /// Returns an empty host state with the given media and active key indices, each
+    /// key filled with its index.
     fn state(media_index: u8, active_index: u8) -> State {
         State {
             pending: HashMap::new(),
@@ -1475,6 +1477,7 @@ mod tests {
         }
     }
 
+    /// Returns the test device ID with offset `n`.
     fn id(n: u32) -> DeviceId {
         DeviceId::new(100_000_000 + n).unwrap()
     }
@@ -1513,6 +1516,9 @@ mod tests {
         }
     }
 
+    /// A request whose password challenge went unanswered for the challenge timeout
+    /// expires, while a prompt still waiting on the host user lasts until the request
+    /// timeout.
     #[test]
     fn unanswered_challenge_expires_after_challenge_timeout() {
         let mut st = state(0, 0);
@@ -1544,6 +1550,8 @@ mod tests {
         );
     }
 
+    /// The host's agreed session key matches the key the viewer derives, and a password
+    /// the viewer seals to the agreed host key opens on the host.
     #[test]
     fn host_and_viewer_derive_equal_keys_through_the_challenge() {
         let (host, viewer) = (id(1), id(2));
@@ -1578,6 +1586,7 @@ mod tests {
         assert_eq!(opened, "hunter22");
     }
 
+    /// A password exposes its text through `as_str` but not through debug output.
     #[test]
     fn password_debug_hides_text() {
         let password = Password("hunter22".into());
@@ -1585,6 +1594,8 @@ mod tests {
         assert!(!format!("{password:?}").contains("hunter22"));
     }
 
+    /// A session request verifies only with a viewer-role signature for the same
+    /// session by the claimed identity over a valid key.
     #[test]
     fn verify_request_accepts_only_a_viewer_signature_for_the_session() {
         let identity = IdentityKey::generate();
@@ -1601,6 +1612,8 @@ mod tests {
         assert!(verify_request("s1", "AAAA", &b64(Role::Viewer), &id_b64).is_err());
     }
 
+    /// A pending request older than the request timeout expires, while a newer one
+    /// stays.
     #[test]
     fn pending_requests_expire() {
         let mut st = state(0, 0);
@@ -1616,6 +1629,8 @@ mod tests {
         assert!(st.pending.contains_key("new"));
     }
 
+    /// Admitting a viewer that already holds a keyed slot under a new session is denied
+    /// and the original session is kept.
     #[test]
     fn keyed_viewer_cannot_be_replaced() {
         let mut st = state(0, 0);
@@ -1629,6 +1644,8 @@ mod tests {
         assert_eq!(st.viewers[&id(1)].session_id, "s1");
     }
 
+    /// A viewer with an unkeyed slot is readmitted under a new session in the same
+    /// slot, so the room stays full for others.
     #[test]
     fn unkeyed_slot_is_replaced_without_counting_twice() {
         let mut st = state(0, 0);
@@ -1644,6 +1661,8 @@ mod tests {
         );
     }
 
+    /// Unkeyed slots older than the join window are freed when a new viewer is
+    /// admitted, while keyed slots are kept.
     #[test]
     fn stale_unkeyed_slots_are_freed() {
         let mut st = state(0, 0);
@@ -1658,6 +1677,8 @@ mod tests {
         assert_eq!(st.viewers.len(), 2);
     }
 
+    /// A viewer that leaves is marked as not joined and is removed only once the
+    /// reconnect window has passed.
     #[test]
     fn viewer_that_drops_out_expires_after_window() {
         let mut st = state(0, 0);
@@ -1679,16 +1700,21 @@ mod tests {
         assert!(st.viewers.is_empty());
     }
 
+    /// A viewer joining with no key rotation in progress receives only the active key.
     #[test]
     fn joining_viewer_gets_active_key_only_when_settled() {
         assert_eq!(state(2, 2).join_keys(), vec![(2, [2; 32])]);
     }
 
+    /// A viewer joining during a key rotation receives both the active and the new
+    /// media key.
     #[test]
     fn joining_viewer_gets_both_keys_during_rotation() {
         assert_eq!(state(3, 2).join_keys(), vec![(2, [2; 32]), (3, [3; 32])]);
     }
 
+    /// Frame cryptors created for newly published tracks start at key index 0 and move
+    /// to the current index once the own key index is synced.
     #[tokio::test(flavor = "multi_thread")]
     async fn new_cryptors_take_current_key_index() {
         let now = unix_now();
@@ -1724,6 +1750,8 @@ mod tests {
         lk_room.close().await.unwrap();
     }
 
+    /// Video published with raw or encoded input encrypts with the given active key
+    /// index from the start.
     #[tokio::test(flavor = "multi_thread")]
     async fn republished_video_encrypts_with_active_key_at_once() {
         let now = unix_now();

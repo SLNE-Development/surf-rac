@@ -550,6 +550,7 @@ fn aad(topic: &str, session_id: &str) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// Returns a fixed host and viewer device ID pair.
     fn ids() -> (DeviceId, DeviceId) {
         (
             DeviceId::new(123_456_789).unwrap(),
@@ -565,6 +566,8 @@ mod tests {
             .to_bytes()
     }
 
+    /// The registration signature equals a plain signature over the protocol's register
+    /// message and changes with the device name.
     #[test]
     fn registration_signature_covers_the_register_message() {
         let id = IdentityKey::generate();
@@ -581,6 +584,7 @@ mod tests {
         );
     }
 
+    /// A challenge signature verifies against the signing key and the same nonce.
     #[test]
     fn challenge_signature_verifies() {
         let id = IdentityKey::generate();
@@ -588,6 +592,8 @@ mod tests {
         assert_eq!(id.public().verify_challenge(&[7; 32], &sig), Ok(()));
     }
 
+    /// A challenge signature fails verification for a different nonce or a different
+    /// public key.
     #[test]
     fn challenge_signature_rejects_other_nonce_and_other_key() {
         let id = IdentityKey::generate();
@@ -604,6 +610,8 @@ mod tests {
         );
     }
 
+    /// The challenge signature is a plain signature over the challenge domain tag
+    /// followed by the nonce.
     #[test]
     fn challenge_signature_covers_domain_tag_and_nonce() {
         let id = IdentityKey::generate();
@@ -612,6 +620,8 @@ mod tests {
         assert_eq!(id.sign_challenge(&[7; 32]), reference_sign(&id, &msg));
     }
 
+    /// A session signature verifies only for the same role, session ID, ephemeral key
+    /// and signing identity.
     #[test]
     fn session_signature_binds_role_session_and_key() {
         let id = IdentityKey::generate();
@@ -643,6 +653,8 @@ mod tests {
         );
     }
 
+    /// The session signature is a plain signature over the session domain tag, role
+    /// name, session ID and ephemeral key, for both roles.
     #[test]
     fn session_signature_covers_domain_role_session_and_key() {
         let id = IdentityKey::generate();
@@ -656,6 +668,8 @@ mod tests {
         }
     }
 
+    /// An identity key rebuilt from its bytes has the same public key, and a fresh key
+    /// differs.
     #[test]
     fn identity_key_bytes_restore_same_key() {
         let id = IdentityKey::generate();
@@ -664,6 +678,8 @@ mod tests {
         assert_ne!(IdentityKey::generate().public(), id.public());
     }
 
+    /// An identity public key survives a base64 round trip, and short or non-base64
+    /// input is rejected as an invalid key.
     #[test]
     fn identity_public_base64_round_trip_and_validation() {
         let public = IdentityKey::generate().public();
@@ -678,6 +694,8 @@ mod tests {
         );
     }
 
+    /// A signature survives a base64 round trip, and short or non-base64 input is
+    /// rejected as an invalid signature.
     #[test]
     fn signature_base64_round_trip_and_validation() {
         let sig = IdentityKey::generate().sign_challenge(&[1; 32]);
@@ -692,6 +710,8 @@ mod tests {
         );
     }
 
+    /// The fingerprint is the first 16 bytes of the key's SHA-256 digest as hex in
+    /// eight colon-separated groups, and differs between keys.
     #[test]
     fn fingerprint_is_grouped_hex_of_key_digest() {
         let a = IdentityKey::from_bytes([1; 32]).public();
@@ -703,6 +723,8 @@ mod tests {
         assert_ne!(fp, IdentityKey::from_bytes([2; 32]).public().fingerprint());
     }
 
+    /// An identity public key serializes to a JSON base64 string, deserializes back,
+    /// and rejects a wrong-length value.
     #[test]
     fn identity_public_serde_is_base64() {
         let public = IdentityKey::generate().public();
@@ -715,6 +737,8 @@ mod tests {
         assert!(serde_json::from_str::<IdentityPublic>("\"AAAA\"").is_err());
     }
 
+    /// An ephemeral public key survives a base64 round trip, and short or non-base64
+    /// input is rejected as an invalid key.
     #[test]
     fn ephemeral_public_base64_requires_32_bytes() {
         let key = Ephemeral::generate().public();
@@ -729,6 +753,7 @@ mod tests {
         );
     }
 
+    /// Key agreement yields the same shared secret on both sides.
     #[test]
     fn agree_gives_both_sides_the_same_secret() {
         let (a, b) = (Ephemeral::generate(), Ephemeral::generate());
@@ -736,6 +761,7 @@ mod tests {
         assert_ne!(Ephemeral::generate().public(), a.public());
     }
 
+    /// Key agreement with the all-zero low-order point fails with LowOrderPoint.
     #[test]
     fn agree_rejects_low_order_point() {
         let a = Ephemeral::generate();
@@ -790,6 +816,8 @@ mod tests {
         }
     }
 
+    /// Host and viewer derive the same session key, and changing the session ID, nonce,
+    /// device order or ephemeral key order yields a different key.
     #[test]
     fn both_sides_derive_same_session_key_from_ephemerals() {
         let f = Fixture::new();
@@ -830,6 +858,8 @@ mod tests {
         assert_ne!(host_side.as_bytes(), swapped_keys.as_bytes());
     }
 
+    /// The session key equals HKDF-SHA256 with the session ID and nonce as salt and the
+    /// version tag, device IDs, host key and viewer key as info.
     #[test]
     fn session_key_uses_documented_hkdf_layout() {
         let (hid, vid) = ids();
@@ -850,6 +880,8 @@ mod tests {
         assert_eq!(key.as_bytes(), &expected);
     }
 
+    /// A message recorded under one session key does not open under the key derived for
+    /// a replayed request with a new nonce.
     #[test]
     fn replayed_request_gets_fresh_key() {
         let f = Fixture::new();
@@ -862,6 +894,8 @@ mod tests {
         );
     }
 
+    /// A password sealed to the host's ephemeral key opens with that key and the
+    /// viewer's public key.
     #[test]
     fn password_sealed_to_host_ephemeral_opens_with_it() {
         let (host, viewer) = (Ephemeral::generate(), Ephemeral::generate());
@@ -871,6 +905,8 @@ mod tests {
         assert_eq!(opened, "hunter22");
     }
 
+    /// A sealed password fails to open with a different host ephemeral key or a
+    /// different viewer public key.
     #[test]
     fn password_opens_only_with_the_host_ephemeral() {
         let (host, viewer, other) = (
@@ -890,6 +926,8 @@ mod tests {
         );
     }
 
+    /// A sealed password opens only for the session ID and viewer and host device IDs
+    /// it was sealed for.
     #[test]
     fn password_is_bound_to_session_and_devices() {
         let (host, viewer) = (Ephemeral::generate(), Ephemeral::generate());
@@ -906,6 +944,9 @@ mod tests {
         assert_eq!(open("s1", vid, hid).as_deref(), Ok("pw"));
     }
 
+    /// The password key equals HKDF-SHA256 over the shared secret with the password
+    /// tag, session ID and device IDs as info, and the sealed form is nonce, ciphertext
+    /// and tag.
     #[test]
     fn password_key_uses_documented_hkdf_layout() {
         let (host, viewer) = (Ephemeral::generate(), Ephemeral::generate());
@@ -926,6 +967,7 @@ mod tests {
         assert_eq!(plain, b"pw");
     }
 
+    /// Sealing a password to the all-zero host key fails with LowOrderPoint.
     #[test]
     fn password_seal_rejects_low_order_host_key() {
         let viewer = Ephemeral::generate();
@@ -937,6 +979,8 @@ mod tests {
         );
     }
 
+    /// Opening a password fails for a ciphertext with a flipped bit and for empty,
+    /// non-base64 or too-short input.
     #[test]
     fn tampered_or_garbage_password_fails() {
         let (host, viewer) = (Ephemeral::generate(), Ephemeral::generate());
@@ -951,6 +995,8 @@ mod tests {
         }
     }
 
+    /// A sealed message opens with the same key, topic and session, and fails with a
+    /// different topic, session, key, a flipped bit or a truncated input.
     #[test]
     fn seal_open_round_trip_and_tamper() {
         let k = SessionKey::random();
@@ -971,6 +1017,7 @@ mod tests {
         );
     }
 
+    /// Sealing the same plaintext twice uses different nonces.
     #[test]
     fn nonces_differ() {
         let k = SessionKey::random();
@@ -980,6 +1027,8 @@ mod tests {
         );
     }
 
+    /// Debug output of session keys, identity keys and ephemeral keys does not reveal
+    /// their secret bytes.
     #[test]
     fn debug_hides_secrets() {
         let k = SessionKey::from_bytes([0xAB; 32]);

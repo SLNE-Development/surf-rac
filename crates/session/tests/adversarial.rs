@@ -47,6 +47,8 @@ async fn eavesdrop(
     (lk_room, events)
 }
 
+/// When one of two viewers leaves, the remaining viewer receives the rotated media key and keeps
+/// decoding stamped frames.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn key_rotates_when_viewer_leaves(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -87,6 +89,8 @@ async fn key_rotates_when_viewer_leaves(pool: PgPool) {
     );
 }
 
+/// A host hangup of one viewer ends that viewer's session and rotates the media key for the viewer
+/// that stays.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn hangup_rotates_key_for_remaining_viewers(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -119,6 +123,8 @@ async fn hangup_rotates_key_for_remaining_viewers(pool: PgPool) {
     .expect("remaining viewer got the rotated key");
 }
 
+/// A participant that joins the host's LiveKit room without the session key decodes no stamped
+/// frame, while the legitimate viewer does.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn sfu_path_payload_is_encrypted(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -181,6 +187,8 @@ async fn sfu_path_payload_is_encrypted(pool: PgPool) {
     assert_eq!(stamped, 0, "eavesdropper read the screen");
 }
 
+/// Data packets and clipboard streams forged by an eavesdropper in the room reach neither host nor
+/// viewer, while real data still flows both ways.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn forged_data_from_eavesdropper_is_ignored(pool: PgPool) {
     let env = TestEnv::start(pool).await;

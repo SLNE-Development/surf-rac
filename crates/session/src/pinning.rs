@@ -66,10 +66,14 @@ mod tests {
     use super::*;
     use crate::crypto::IdentityKey;
 
+    /// Returns a fixed test device ID.
     fn id() -> DeviceId {
         DeviceId::new(123_456_789).unwrap()
     }
 
+    /// The first key seen for a device is pinned, a different key is reported as a
+    /// change with both fingerprints, and after trusting the new key the old one is
+    /// refused.
     #[test]
     fn pinning_tofu_then_change_then_trust() {
         let mut known = KnownKeys::default();
@@ -89,6 +93,7 @@ mod tests {
         assert!(known.check(id(), &k1).is_err());
     }
 
+    /// Pinned keys survive a JSON round trip.
     #[test]
     fn known_keys_serde_round_trip() {
         let mut known = KnownKeys::default();

@@ -207,6 +207,8 @@ fn copy_rows_in(src: &[u8], plane: &mut [u8], stride: usize, row_len: usize, row
 mod tests {
     use super::*;
 
+    /// Returns a frame of the given format and size filled with a repeating byte
+    /// pattern.
     fn frame(format: PixelFormat, w: u32, h: u32) -> Frame {
         let len = Frame::expected_len(format, w, h);
         Frame {
@@ -218,6 +220,8 @@ mod tests {
         }
     }
 
+    /// Expected frame lengths round chroma planes up for odd dimensions and match the
+    /// 4:2:0 size for even ones.
     #[test]
     fn frame_len_odd_dimensions() {
         assert_eq!(Frame::expected_len(PixelFormat::I420, 3, 3), 9 + 2 * 2 * 2);
@@ -228,6 +232,8 @@ mod tests {
         );
     }
 
+    /// Validation accepts a correctly sized frame and rejects one with a wrong data
+    /// length or a zero dimension.
     #[test]
     fn validate_rejects_wrong_length_and_zero() {
         let mut f = frame(PixelFormat::I420, 4, 4);
@@ -247,6 +253,8 @@ mod tests {
         assert_eq!(z.validate(), Err(FrameError::ZeroSize));
     }
 
+    /// An I420 frame with odd dimensions converts to LiveKit and back unchanged,
+    /// timestamp included.
     #[test]
     fn livekit_round_trip_i420() {
         let f = frame(PixelFormat::I420, 33, 17);
@@ -261,6 +269,8 @@ mod tests {
         assert_eq!(back.data, f.data);
     }
 
+    /// An NV12 frame converted through LiveKit comes back as I420 with the same luma
+    /// plane and the I420 length.
     #[test]
     fn livekit_from_nv12_keeps_luma() {
         let f = frame(PixelFormat::Nv12, 16, 8);

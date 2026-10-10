@@ -78,6 +78,8 @@ pub fn read_stamp(frame: &Frame) -> Option<i64> {
     (checksum(micros) == (value & 0xffff) as u16 && micros > 0).then_some(micros)
 }
 
+/// A stamped timestamp is read back from frames of two sizes, and a uniformly grey frame yields no
+/// stamp.
 #[test]
 fn stamp_round_trip() {
     assert_eq!(

@@ -68,6 +68,8 @@ fn ws_url(server: &str) -> String {
         .replacen("http://", "ws://", 1)
 }
 
+/// Registers a host on the deployed server, prints its device ID and accepts every viewer for a set
+/// duration, publishing stamped frames and echoing key messages.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a deployed server; run on the first machine"]
 async fn remote_host() {
@@ -131,6 +133,8 @@ async fn remote_host() {
     host.close().await;
 }
 
+/// Connects as a viewer to the running remote host, prints connection time, frame rate and data
+/// round-trip times, and requires at least 100 frames in 10 s.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a running remote_host; run on the second machine"]
 async fn remote_viewer() {
@@ -180,6 +184,8 @@ async fn remote_viewer() {
     assert!(outcome >= 100, "only {outcome} frames in 10 s");
 }
 
+/// Runs a full session between two devices through the deployed server and requires at least 100
+/// stamped frames with a median one-way delay under 200 ms and data in both directions.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a deployed server"]
 async fn session_through_deployed_server() {

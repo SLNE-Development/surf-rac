@@ -97,16 +97,16 @@ pub(crate) async fn connect(
     Ok((room, events))
 }
 
-/// Maps a LiveKit join failure to a [`JoinError`].
-///
-/// LiveKit reports refused tokens as HTTP 401 or 403 from its signaling
-/// endpoint; every other failure counts as LiveKit being unavailable.
 /// Returns whether `text` names HTTP status 401 or 403 as a whole number.
 fn is_rejection(text: &str) -> bool {
     text.split(|c: char| !c.is_ascii_alphanumeric())
         .any(|number| number == "401" || number == "403")
 }
 
+/// Maps a LiveKit join failure to a [`JoinError`].
+///
+/// LiveKit reports refused tokens as HTTP 401 or 403 from its signaling
+/// endpoint; every other failure counts as LiveKit being unavailable.
 fn classify(err: RoomError) -> JoinError {
     let text = err.to_string();
     if is_rejection(&text) {
@@ -214,6 +214,8 @@ mod tests {
     use super::*;
     use crate::testutil::{env, mint_token, room_name, unix_now};
 
+    /// Errors naming 401 or 403 as a whole number count as rejections, while those
+    /// digits inside a host name or a longer number do not.
     #[test]
     fn rejection_needs_a_whole_status_code() {
         assert!(is_rejection(
@@ -226,6 +228,8 @@ mod tests {
         assert!(!is_rejection("timeout after 4010 ms"));
     }
 
+    /// The stream gate admits two concurrent streams, refuses a third, and frees a slot
+    /// when a stream ends.
     #[test]
     fn stream_gate_limits_concurrent_streams() {
         let gate = StreamGate::new();
@@ -236,6 +240,7 @@ mod tests {
         assert!(gate.admit().is_some(), "slot freed when a stream ends");
     }
 
+    /// Joining LiveKit with an expired token fails as Rejected.
     #[tokio::test(flavor = "multi_thread")]
     async fn expired_token_is_rejected() {
         let now = unix_now();
@@ -246,6 +251,7 @@ mod tests {
         assert_eq!(err, Some(JoinError::Rejected));
     }
 
+    /// Joining a server that does not answer fails as Unavailable.
     #[tokio::test(flavor = "multi_thread")]
     async fn unreachable_server_is_unavailable() {
         let now = unix_now();

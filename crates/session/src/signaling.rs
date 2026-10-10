@@ -358,6 +358,8 @@ mod tests {
         format!(r#"{{"error":"{code}","message":"m"}}"#).into_bytes()
     }
 
+    /// Refused WebSocket upgrades map to typed errors by status code and, for 403 and
+    /// 404, by the error code in the body.
     #[test]
     fn refused_upgrades_map_to_typed_errors() {
         let cases = [
@@ -384,6 +386,8 @@ mod tests {
         }
     }
 
+    /// A 403 or 404 without a body, with a non-JSON body, with an unknown code, or with
+    /// a code meant for the other status is a plain rejection.
     #[test]
     fn untyped_403_and_404_are_plain_rejections() {
         for status in [403, 404] {
@@ -406,6 +410,8 @@ mod tests {
         );
     }
 
+    /// Handshake error codes map to typed signaling errors, and codes that do not end
+    /// the connection map to none.
     #[test]
     fn handshake_error_frames_map_to_typed_errors() {
         use WsErrorCode as C;
@@ -423,6 +429,8 @@ mod tests {
         }
     }
 
+    /// A subscriber that fell behind the event buffer skips the lost events, keeps
+    /// receiving newer ones, and ends when the sender is dropped.
     #[tokio::test]
     async fn lagging_subscriber_keeps_receiving() {
         let (tx, rx) = broadcast::channel(EVENT_CAPACITY);

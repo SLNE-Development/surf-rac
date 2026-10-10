@@ -21,6 +21,8 @@ fn with_password(password: &str) -> RequestOptions {
     }
 }
 
+/// An attended request with password access on reaches the host as a prompt naming the viewer, its
+/// key and fingerprint, and connects once accepted.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn attended_request_reaches_host_as_prompt(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -59,6 +61,8 @@ async fn attended_request_reaches_host_as_prompt(pool: PgPool) {
     .await;
 }
 
+/// An unattended request with a password reaches the host as `PasswordReceived` with the opened
+/// password hidden from debug output, and the viewer pins the host key after accepting.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn unattended_password_is_accepted(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -112,6 +116,8 @@ async fn unattended_password_is_accepted(pool: PgPool) {
     );
 }
 
+/// A rejected password turns the unattended request into a prompt for the same session, which can
+/// then be accepted but not rejected again.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn wrong_password_falls_back_to_prompt(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -160,6 +166,8 @@ async fn wrong_password_falls_back_to_prompt(pool: PgPool) {
     .await;
 }
 
+/// An unattended request to a host without password access arrives as a prompt marked unattended
+/// rather than as a password.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn unattended_request_prompts_without_password_access(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -191,6 +199,7 @@ async fn unattended_request_prompts_without_password_access(pool: PgPool) {
     assert_eq!(pending.await.unwrap().err(), Some(RequestError::Denied));
 }
 
+/// An accepted viewer joins the host's room and receives at least ten stamped video frames.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn viewer_receives_video(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -210,6 +219,8 @@ async fn viewer_receives_video(pool: PgPool) {
     assert!(stamps.len() >= 10, "only {} stamped frames", stamps.len());
 }
 
+/// Pointer, key and clipboard messages reach the host from the viewer, and a 1 MiB clipboard image
+/// and a key reach the viewer from the host.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn data_flows_both_ways_on_all_topics(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -300,6 +311,8 @@ async fn data_flows_both_ways_on_all_topics(pool: PgPool) {
     .expect("viewer did not get host data");
 }
 
+/// A host hangup ends the viewer with `EndReason::Hangup` and reports the viewer as left on the
+/// host.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn hangup_ends_viewer(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -325,6 +338,7 @@ async fn hangup_ends_viewer(pool: PgPool) {
     .await;
 }
 
+/// A viewer hangup is reported to the host as `ViewerLeft` for that viewer.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn viewer_hangup_reaches_host(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -341,6 +355,8 @@ async fn viewer_hangup_reaches_host(pool: PgPool) {
     .await;
 }
 
+/// A viewer that does not read its events for three seconds while frames arrive still receives a
+/// data message from the host.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn slow_consumer_still_gets_data(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -364,6 +380,7 @@ async fn slow_consumer_still_gets_data(pool: PgPool) {
     feed.abort();
 }
 
+/// A session with forced TURN relay on both sides delivers at least ten stamped frames.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn forced_relay_session(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -385,6 +402,7 @@ async fn forced_relay_session(pool: PgPool) {
     );
 }
 
+/// Over at least 100 frames after a warm-up, the median one-way frame delay stays below 200 ms.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn median_frame_delay_under_200ms(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -412,6 +430,8 @@ async fn median_frame_delay_under_200ms(pool: PgPool) {
     assert!(median < 200_000, "median delay {median} us");
 }
 
+/// A key sent while a maximum-size clipboard upload is in progress returns before the upload
+/// finishes and reaches the host.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn clipboard_upload_does_not_delay_input(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -444,6 +464,8 @@ async fn clipboard_upload_does_not_delay_input(pool: PgPool) {
     upload.await.unwrap().unwrap();
 }
 
+/// The viewer receives frames at the old size and at least ten stamped frames at the new size after
+/// the host's frame size changes.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn viewer_keeps_receiving_across_size_change(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -468,6 +490,8 @@ async fn viewer_keeps_receiving_across_size_change(pool: PgPool) {
     );
 }
 
+/// With encoded video input the host refuses raw frames with `FrameError::WrongInput`, and after
+/// switching back to raw input the viewer receives stamped frames again.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn encoded_input_rejects_raw_frames_and_switches_back(pool: PgPool) {
     let env = TestEnv::start(pool).await;

@@ -29,6 +29,7 @@ async fn next_matching(
     .expect("timed out")
 }
 
+/// A connected device gets `Pong` in answer to `Ping`.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn connect_and_ping(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -38,6 +39,8 @@ async fn connect_and_ping(pool: PgPool) {
     next_matching(&mut events, |m| *m == ServerMessage::Pong).await;
 }
 
+/// Connecting with an identity key other than the registered one fails with
+/// `SignalingError::BadSignature`.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn wrong_identity_key_is_bad_signature(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -52,6 +55,8 @@ async fn wrong_identity_key_is_bad_signature(pool: PgPool) {
     );
 }
 
+/// Connecting with a fingerprint other than the registered one fails with
+/// `SignalingError::CloneDetected`.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn other_fingerprint_is_clone_detected(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -66,6 +71,7 @@ async fn other_fingerprint_is_clone_detected(pool: PgPool) {
     );
 }
 
+/// Connecting with a device ID that is not registered fails with `SignalingError::UnknownDevice`.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn unregistered_device_is_unknown(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -84,6 +90,7 @@ async fn unregistered_device_is_unknown(pool: PgPool) {
     );
 }
 
+/// Connecting as a disabled device fails with `SignalingError::DeviceDisabled`.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn disabled_device_is_refused(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -98,6 +105,8 @@ async fn disabled_device_is_refused(pool: PgPool) {
     );
 }
 
+/// Disabling a connected device ends its connection, and both the end reason and later sends report
+/// `SignalingError::DeviceDisabled`.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn device_disabled_while_connected_reports_why(pool: PgPool) {
     let env = TestEnv::start_with(pool, &common::env("LIVEKIT_URL"), |state| {
@@ -125,6 +134,7 @@ async fn device_disabled_while_connected_reports_why(pool: PgPool) {
     );
 }
 
+/// A signed session request is relayed to the target with the sender's ID, name and identity key.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn relays_signed_session_request(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -168,6 +178,8 @@ async fn relays_signed_session_request(pool: PgPool) {
     );
 }
 
+/// A second connection for the same device ends the first one's subscribers, and sends on the first
+/// client then fail with `SignalingError::Closed`.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn replaced_connection_ends_subscribers(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -208,6 +220,8 @@ async fn bare_status_server(status: &'static str) -> String {
     format!("ws://{addr}")
 }
 
+/// Bare 404 and 403 responses without an error body make the connection fail with
+/// `SignalingError::Rejected` carrying the status code.
 #[tokio::test]
 async fn bare_404_and_403_without_error_body_are_plain_rejections() {
     let identity = IdentityKey::generate();

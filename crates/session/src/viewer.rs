@@ -670,6 +670,9 @@ mod tests {
     use super::*;
     use crate::testutil::{env, mint_token, room_name, unix_now};
 
+    /// Accepted keys with a viewer-role signature are denied and pin nothing, a host
+    /// signature pins the host key and derives the shared session key, and a changed
+    /// pinned key is reported.
     #[test]
     fn accepted_keys_verify_host_signature_pin_and_derive_shared_key() {
         let (host, viewer) = (
@@ -801,6 +804,8 @@ mod tests {
         out
     }
 
+    /// A room that stays reconnecting past the window reports reconnecting and then
+    /// ends the session with a timeout.
     #[tokio::test(flavor = "multi_thread")]
     async fn reconnect_window_ends_session() {
         let (_inner, tx, mut events) = loop_on_simulated_events(Duration::from_secs(2)).await;
@@ -821,6 +826,8 @@ mod tests {
         );
     }
 
+    /// A room that reconnects inside the window reports reconnecting and then
+    /// connected, without ending.
     #[tokio::test(flavor = "multi_thread")]
     async fn reconnect_within_window_keeps_session() {
         let (_inner, tx, mut events) = loop_on_simulated_events(Duration::from_secs(2)).await;
@@ -837,6 +844,8 @@ mod tests {
         );
     }
 
+    /// The host leaving the room reports reconnecting and starts the window, its return
+    /// reports connected and cancels it, and a second absence expires after the window.
     #[tokio::test(start_paused = true)]
     async fn host_that_drops_out_counts_as_reconnecting() {
         let mut watch = ReconnectWatch::new(Duration::from_secs(30));
@@ -863,6 +872,8 @@ mod tests {
         );
     }
 
+    /// A media key with an index outside the key ring is ignored and no media key index
+    /// is set.
     #[tokio::test(flavor = "multi_thread")]
     async fn media_key_outside_key_ring_is_ignored() {
         let (inner, _tx, _events) = loop_on_simulated_events(Duration::from_secs(30)).await;
@@ -882,6 +893,8 @@ mod tests {
         assert_eq!(*lock(&inner.media_index), None);
     }
 
+    /// Undecryptable data from the host is ignored until the failure limit, which ends
+    /// the session with a crypto error.
     #[tokio::test(flavor = "multi_thread")]
     async fn ten_crypto_failures_end_session() {
         let (inner, _tx, _events) = loop_on_simulated_events(Duration::from_secs(30)).await;
@@ -899,6 +912,8 @@ mod tests {
         ));
     }
 
+    /// Data from a participant other than the host is ignored and never counts toward
+    /// the crypto failure limit.
     #[tokio::test(flavor = "multi_thread")]
     async fn data_from_other_participants_is_ignored() {
         let (inner, _tx, _events) = loop_on_simulated_events(Duration::from_secs(30)).await;

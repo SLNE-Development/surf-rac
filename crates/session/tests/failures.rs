@@ -13,6 +13,7 @@ use surf_rac_session::host::{HostEvent, HostSession, StartError};
 use surf_rac_session::viewer::RequestError;
 use surf_rac_session::{IdentityKey, MAX_VIEWERS, SessionConfig};
 
+/// A request to a registered host that is not connected fails with `RequestError::Offline`.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn offline_host(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -50,6 +51,8 @@ async fn offline_error_fails_only_its_own_request(pool: PgPool) {
     assert!(pending.await.unwrap().is_ok());
 }
 
+/// A denied request fails with `RequestError::Denied`, and the answered request cannot be accepted
+/// afterwards.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn denied(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -72,6 +75,8 @@ async fn denied(pool: PgPool) {
     );
 }
 
+/// A request the host never answers fails with `RequestError::Timeout` after the configured request
+/// timeout.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn request_times_out(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -87,6 +92,8 @@ async fn request_times_out(pool: PgPool) {
     assert!(started.elapsed() >= Duration::from_secs(2));
 }
 
+/// A viewer that has pinned another key for the host refuses the session with `KeyChanged` naming
+/// the new fingerprint, and connects once the real key is trusted.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn changed_host_key_blocks_session(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -119,6 +126,8 @@ async fn changed_host_key_blocks_session(pool: PgPool) {
     accept_next(&host, &mut host_events, pending).await;
 }
 
+/// A host that has pinned another key for the viewer reports `HostEvent::KeyChanged`, and the
+/// viewer's request fails with `KeyNotRecognised`.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn changed_viewer_key_blocks_on_host(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -140,6 +149,8 @@ async fn changed_viewer_key_blocks_on_host(pool: PgPool) {
     );
 }
 
+/// Once `MAX_VIEWERS` viewers are connected, accepting one more request fails it with
+/// `RequestError::RoomFull`.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn sixth_viewer_gets_room_full(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -165,6 +176,8 @@ async fn sixth_viewer_gets_room_full(pool: PgPool) {
     assert_eq!(pending.await.unwrap().err(), Some(RequestError::RoomFull));
 }
 
+/// A second request from an already connected viewer is denied, and the first viewer keeps
+/// receiving frames.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn duplicate_request_is_denied(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -180,6 +193,8 @@ async fn duplicate_request_is_denied(pool: PgPool) {
     assert!(stamps.len() >= 10, "first viewer lost its stream");
 }
 
+/// A viewer token obtained through another host is scoped to that host's room, so its holder never
+/// sees the first host as a participant.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn token_for_other_room_cannot_reach_host_room(pool: PgPool) {
     use livekit::prelude::*;
@@ -225,6 +240,8 @@ async fn token_for_other_room_cannot_reach_host_room(pool: PgPool) {
     lk_room.close().await.unwrap();
 }
 
+/// With LiveKit unreachable, starting a host fails with `MediaUnavailable`, an accepted request
+/// fails the same way for the viewer, and signaling keeps working.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn livekit_unreachable(pool: PgPool) {
     let env = TestEnv::start_with_livekit(pool, "ws://127.0.0.1:1").await;
@@ -292,6 +309,8 @@ async fn livekit_unreachable(pool: PgPool) {
     .expect("signaling still works");
 }
 
+/// A host flooded with 150 session requests answers at most five of them and still accepts a
+/// legitimate viewer afterwards.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn request_flood_does_not_exhaust_host(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -336,6 +355,8 @@ async fn request_flood_does_not_exhaust_host(pool: PgPool) {
     accept_next(&host, &mut host_events, pending).await;
 }
 
+/// A host whose application never reads its events still refuses a request with a changed viewer
+/// key instead of stalling it.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn unread_host_events_do_not_stall_requests(pool: PgPool) {
     use surf_rac_protocol::data::DataMessage;
@@ -397,6 +418,8 @@ async fn send_request(
         .unwrap();
 }
 
+/// Requests whose per-session key or session ID does not match the signature get no answer, raise
+/// no host event and pin no key, while a valid request still succeeds.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn tampered_session_key_is_dropped(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -474,6 +497,8 @@ async fn next_signal<T>(
     .expect("timed out waiting for a signaling message")
 }
 
+/// A host response carrying a different per-session key than the one in its password challenge
+/// fails the request with `ChallengeMismatch`.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn response_with_other_key_than_challenge_is_rejected(pool: PgPool) {
     use base64::engine::general_purpose::STANDARD;
@@ -533,6 +558,8 @@ async fn response_with_other_key_than_challenge_is_rejected(pool: PgPool) {
     );
 }
 
+/// A password challenge the viewer never answers expires: the viewer gets a refusal before the
+/// timeout ends and the host reports `RequestExpired`.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn expired_challenge_is_denied_to_viewer(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -582,6 +609,7 @@ async fn expired_challenge_is_denied_to_viewer(pool: PgPool) {
     assert!(matches!(ev, HostEvent::RequestExpired { session_id, .. } if session_id == "silent"));
 }
 
+/// A request still waiting for its password cannot be accepted by the host but can be denied.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn request_awaiting_password_cannot_be_accepted(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -615,6 +643,8 @@ async fn request_awaiting_password_cannot_be_accepted(pool: PgPool) {
     host.deny("waiting").await.unwrap();
 }
 
+/// With a limit of ten requests per minute, the eleventh request to one host fails promptly with
+/// `RequestError::RateLimited`.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn eleventh_request_to_one_host_fails_fast_as_rate_limited(pool: PgPool) {
     let env = TestEnv::start_with(pool, &common::env("LIVEKIT_URL"), |state| {

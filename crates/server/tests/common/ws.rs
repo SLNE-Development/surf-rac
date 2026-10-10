@@ -139,12 +139,6 @@ pub async fn link(ws: &mut Ws, token: &str) -> Value {
     recv(ws).await
 }
 
-/// Sends `unlink_account` with `token` and returns the server's reply.
-pub async fn unlink(ws: &mut Ws, token: &str) -> Value {
-    send(ws, json!({"type": "unlink_account", "token": token})).await;
-    recv(ws).await
-}
-
 impl Device {
     /// Returns this device's identity without the socket, for opening another connection.
     pub fn identity(&self) -> Identity {

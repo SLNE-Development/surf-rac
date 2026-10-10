@@ -91,7 +91,6 @@ impl SignalingError {
     /// refuses or ends the connection.
     fn from_ws_code(code: WsErrorCode) -> Option<Self> {
         match code {
-            WsErrorCode::UpdateRequired => Some(Self::UpdateRequired),
             WsErrorCode::DeviceDisabled => Some(Self::DeviceDisabled),
             WsErrorCode::CloneDetected => Some(Self::CloneDetected),
             WsErrorCode::BadSignature => Some(Self::BadSignature),
@@ -411,7 +410,6 @@ mod tests {
     fn handshake_error_frames_map_to_typed_errors() {
         use WsErrorCode as C;
         let cases = [
-            (C::UpdateRequired, Some(SignalingError::UpdateRequired)),
             (C::DeviceDisabled, Some(SignalingError::DeviceDisabled)),
             (C::CloneDetected, Some(SignalingError::CloneDetected)),
             (C::BadSignature, Some(SignalingError::BadSignature)),

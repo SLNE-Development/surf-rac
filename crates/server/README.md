@@ -176,9 +176,9 @@ All endpoints are under `/v1`. The wire types are defined in the
   wrong signature closes the socket with `bad_signature`, a different
   fingerprint with `clone_detected`; a valid answer is followed by `hello`.
   `link_account` with an account session `token` links the connection's device
-  to that account and is answered with `linked` and the username;
-  `unlink_account` removes that link and is answered with `unlinked`. An
-  invalid token is an `error` with code `forbidden` and changes nothing. A
+  to that account and is answered with `linked` and the username; a link is
+  removed over HTTP with `DELETE /my-devices/{id}`. An invalid token is an
+  `error` with code `forbidden` and changes nothing. A
   device receives `presence` for every device that an account linked to it has
   as a contact or linked. Besides `signal` relaying it carries session
   negotiation (`session_request`, `password_challenge`, `session_password`,

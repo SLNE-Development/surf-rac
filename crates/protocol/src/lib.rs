@@ -390,11 +390,6 @@ pub enum ClientMessage {
         /// Account session token from `POST /v1/login`.
         token: String,
     },
-    /// Remove this device from the account that issued `token`; answered with `unlinked`.
-    UnlinkAccount {
-        /// Account session token from `POST /v1/login`.
-        token: String,
-    },
     /// Ask for a LiveKit token for this device's own room; answered with `host_token`.
     HostTokenRequest,
     /// Ask the server to issue a viewer token for this device's room to `viewer_device_id`.
@@ -567,8 +562,6 @@ pub enum ServerMessage {
         /// Username of the account the device is now linked to.
         username: String,
     },
-    /// This device was removed from its account.
-    Unlinked,
 }
 
 /// Why a host refused a session request.
@@ -595,8 +588,6 @@ pub enum WsErrorCode {
     RateLimited,
     /// The device may not make this request.
     Forbidden,
-    /// The client's protocol version is not supported and it must be updated.
-    UpdateRequired,
     /// Two installations are using the same device identity.
     CloneDetected,
     /// A signature did not verify against the claimed identity key.
@@ -913,15 +904,26 @@ mod tests {
         let msg: ClientMessage = serde_json::from_value(raw.clone()).unwrap();
         assert_eq!(msg, ClientMessage::LinkAccount { token: "t".into() });
         assert_eq!(serde_json::to_value(&msg).unwrap(), raw);
-        let raw = json!({"type":"unlink_account","token":"t"});
-        let msg: ClientMessage = serde_json::from_value(raw.clone()).unwrap();
-        assert_eq!(msg, ClientMessage::UnlinkAccount { token: "t".into() });
         let linked = json!({"type":"linked","username":"bob"});
         let msg: ServerMessage = serde_json::from_value(linked.clone()).unwrap();
         assert_eq!(serde_json::to_value(&msg).unwrap(), linked);
-        assert_eq!(
-            serde_json::to_value(ServerMessage::Unlinked).unwrap(),
-            json!({"type":"unlinked"})
+    }
+
+    /// Checks that `unlink_account`, `unlinked` and the WebSocket error code
+    /// `update_required` are not part of the protocol.
+    #[test]
+    fn removed_messages_do_not_parse() {
+        assert!(
+            serde_json::from_value::<ClientMessage>(json!({"type":"unlink_account","token":"t"}))
+                .is_err()
+        );
+        assert!(serde_json::from_value::<ServerMessage>(json!({"type":"unlinked"})).is_err());
+        assert!(serde_json::from_value::<WsErrorCode>(json!("update_required")).is_err());
+        assert!(
+            serde_json::from_value::<ServerMessage>(
+                json!({"type":"error","code":"update_required","message":"m"})
+            )
+            .is_err()
         );
     }
 
@@ -972,10 +974,6 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ErrorCode::CloneDetected).unwrap(),
             json!("clone_detected")
-        );
-        assert_eq!(
-            serde_json::to_value(WsErrorCode::UpdateRequired).unwrap(),
-            json!("update_required")
         );
         assert_eq!(
             serde_json::to_value(WsErrorCode::CloneDetected).unwrap(),

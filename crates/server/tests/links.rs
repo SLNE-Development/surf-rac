@@ -5,7 +5,7 @@ mod common;
 use std::time::Duration;
 
 use common::PASSWORD;
-use common::ws::{link, recv, send, unlink};
+use common::ws::{link, recv, send};
 use serde_json::json;
 use sqlx::PgPool;
 
@@ -60,22 +60,22 @@ async fn link_with_invalid_token_fails_without_linking(pool: PgPool) {
     assert_eq!(recv(&mut device.ws).await["type"], "pong");
 }
 
+/// Checks that `unlink_account` is not a WebSocket message: it is refused as
+/// `bad_message` and the device stays linked.
 #[sqlx::test(migrations = "./migrations")]
-async fn unlink_account_removes_only_that_link(pool: PgPool) {
+async fn unlink_account_is_not_a_message(pool: PgPool) {
     let app = common::spawn(pool).await;
     let alice = app.register_and_login("alice").await;
-    let bob = app.register_and_login("bob").await;
     let mut device = app.linked_device(1, &alice).await;
-    assert_eq!(link(&mut device.ws, &bob).await["type"], "linked");
-
-    let reply = unlink(&mut device.ws, &alice).await;
-    assert_eq!(reply, json!({"type": "unlinked"}));
-    assert!(app.my_device_ids(&alice).await.is_empty());
-    assert_eq!(app.my_device_ids(&bob).await, vec![device.id.clone()]);
-
-    let reply = unlink(&mut device.ws, "garbage").await;
-    assert_eq!(reply["code"], "forbidden");
-    assert_eq!(app.my_device_ids(&bob).await, vec![device.id.clone()]);
+    send(
+        &mut device.ws,
+        json!({"type": "unlink_account", "token": alice}),
+    )
+    .await;
+    let reply = recv(&mut device.ws).await;
+    assert_eq!(reply["type"], "error", "{reply}");
+    assert_eq!(reply["code"], "bad_message");
+    assert_eq!(app.my_device_ids(&alice).await, vec![device.id.clone()]);
 }
 
 #[sqlx::test(migrations = "./migrations")]

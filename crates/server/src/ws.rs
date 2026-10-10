@@ -127,7 +127,6 @@ fn message_session_id(msg: &ClientMessage) -> Option<&str> {
         | ClientMessage::ViewerTokenRequest { session_id, .. } => session_id,
         ClientMessage::Authenticate { .. }
         | ClientMessage::LinkAccount { .. }
-        | ClientMessage::UnlinkAccount { .. }
         | ClientMessage::HostTokenRequest
         | ClientMessage::TurnRequest
         | ClientMessage::Ping => return None,
@@ -520,7 +519,6 @@ async fn dispatch(state: &AppState, sender: &Sender, msg: ClientMessage) -> Opti
             "connection is already authenticated",
         )),
         ClientMessage::LinkAccount { token } => Some(link_account(state, device, &token).await),
-        ClientMessage::UnlinkAccount { token } => Some(unlink_account(state, device, &token).await),
         ClientMessage::HostTokenRequest => {
             let room = livekit::room_for(device);
             tracing::info!(device_id = %device, "host token issued");
@@ -595,28 +593,6 @@ async fn link_account(state: &AppState, device: DeviceId, token: &str) -> Server
     ServerMessage::Linked {
         username: user.username,
     }
-}
-
-/// Removes the link between `device` and the account of the session `token` and returns the reply.
-///
-/// Answers `unlinked`, also when the device was not linked to that account.
-/// An unknown, expired or revoked token is a `forbidden` error and removes
-/// nothing; a database failure is a `forbidden` error as well.
-async fn unlink_account(state: &AppState, device: DeviceId, token: &str) -> ServerMessage {
-    let user = match sessions::authenticate(&state.db, token).await {
-        Ok(Some(user)) => user,
-        Ok(None) => return error(WsErrorCode::Forbidden, "invalid account session"),
-        Err(err) => {
-            tracing::warn!(error = %err, device_id = %device, "account unlink failed");
-            return error(WsErrorCode::Forbidden, "account unlinking failed");
-        }
-    };
-    if let Err(err) = devices::unlink(&state.db, user.user_id, device).await {
-        tracing::warn!(error = %err, device_id = %device, "account unlink failed");
-        return error(WsErrorCode::Forbidden, "account unlinking failed");
-    }
-    tracing::info!(device_id = %device, username = %user.username, "device unlinked");
-    ServerMessage::Unlinked
 }
 
 /// Queues `msg` for `to`; returns a `target_offline` error when it cannot be delivered.

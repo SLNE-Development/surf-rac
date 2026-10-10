@@ -228,6 +228,7 @@ mod tests {
         }
     }
 
+    /// Sources are matched to outputs by monitor handle regardless of their order.
     #[test]
     fn matches_by_monitor_handle() {
         let outputs = [out("DISPLAY1", 0x1001), out("DISPLAY2", 0x2002)];
@@ -235,6 +236,7 @@ mod tests {
         assert_eq!(match_sources(&outputs, &sources), [Some(0x1001), Some(0x2002)]);
     }
 
+    /// Sources whose titles name a display device are matched to the output with that device name.
     #[test]
     fn matches_by_device_name_title() {
         let outputs = [out("DISPLAY1", 1), out("DISPLAY3", 3)];
@@ -242,6 +244,7 @@ mod tests {
         assert_eq!(match_sources(&outputs, &sources), [Some(0), Some(5)]);
     }
 
+    /// Untitled sources without matching handles are matched to outputs by position.
     #[test]
     fn falls_back_to_position_without_titles() {
         let outputs = [out("DISPLAY1", 11), out("DISPLAY2", 22)];
@@ -249,6 +252,8 @@ mod tests {
         assert_eq!(match_sources(&outputs, &sources), [Some(0), Some(1)]);
     }
 
+    /// A titled source naming no known output is left unmatched instead of being matched by
+    /// position.
     #[test]
     fn titled_sources_are_never_matched_by_position() {
         let outputs = [out("DISPLAY1", 11), out("DISPLAY2", 22)];
@@ -256,6 +261,7 @@ mod tests {
         assert_eq!(match_sources(&outputs, &sources), [None, Some(8)]);
     }
 
+    /// Each source is matched to at most one output, leaving later outputs unmatched.
     #[test]
     fn a_source_is_used_once() {
         let outputs = [out("DISPLAY1", 0), out("DISPLAY2", 22)];

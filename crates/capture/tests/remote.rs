@@ -121,6 +121,9 @@ fn feed_encoded(host: HostSession, stop: Arc<AtomicBool>, requests: Arc<AtomicU3
     println!("host encoded {n} frames, {:?} per frame on average", busy / n.max(1));
 }
 
+/// Hardware-encoded frames passed through an end-to-end encrypted session via the deployed server
+/// reach the viewer as at least 100 decoded test-pattern frames in 10 s, and the host sees a
+/// keyframe request.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a deployed server, an account and a hardware H.264 encoder"]
 async fn passthrough_e2ee_reaches_viewer() {
@@ -257,6 +260,8 @@ async fn frames_for(
     (count, last)
 }
 
+/// Shares this machine's screen as a host on the deployed server for a set duration, accepting
+/// every viewer and applying their screen controls.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a deployed server and an account; shares this machine's screen"]
 async fn remote_share_host() {
@@ -311,6 +316,8 @@ async fn remote_share_host() {
     host.close().await;
 }
 
+/// Connects as a viewer to the running screen-share host, saves a frame as PNG, checks Speed mode
+/// and monitor switching, and requires at least 100 frames in 10 s.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a running remote_share_host"]
 async fn remote_share_viewer() {

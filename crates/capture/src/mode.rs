@@ -62,29 +62,34 @@ mod tests {
         assert!((a / b - 1.0).abs() < 0.01, "{w}x{h} does not keep the aspect of {ow}x{oh}");
     }
 
+    /// Quality mode keeps the native size of large monitors.
     #[test]
     fn quality_keeps_native() {
         assert_eq!(target_size(QualityMode::Quality, 2560, 1440), (2560, 1440));
         assert_eq!(target_size(QualityMode::Quality, 3840, 2160), (3840, 2160));
     }
 
+    /// Balanced mode scales large monitors down to 1920x1080.
     #[test]
     fn balanced_caps_longest_side() {
         assert_eq!(target_size(QualityMode::Balanced, 2560, 1440), (1920, 1080));
         assert_eq!(target_size(QualityMode::Balanced, 3840, 2160), (1920, 1080));
     }
 
+    /// Speed mode scales a 1920x1080 monitor down to 1280x720.
     #[test]
     fn speed_caps_longest_side() {
         assert_eq!(target_size(QualityMode::Speed, 1920, 1080), (1280, 720));
     }
 
+    /// Monitors smaller than a mode's cap keep their native size.
     #[test]
     fn never_upscales() {
         assert_eq!(target_size(QualityMode::Balanced, 1280, 720), (1280, 720));
         assert_eq!(target_size(QualityMode::Speed, 800, 600), (800, 600));
     }
 
+    /// Odd sizes are rounded to even sides while keeping the aspect ratio and the mode's cap.
     #[test]
     fn odd_sizes_round_to_even() {
         let size = target_size(QualityMode::Speed, 1366, 767);
@@ -94,6 +99,7 @@ mod tests {
         assert_eq!(target_size(QualityMode::Quality, 3, 3), (2, 2));
     }
 
+    /// Balanced mode caps the longest side of portrait monitors and keeps their aspect ratio.
     #[test]
     fn portrait_balanced() {
         assert_eq!(target_size(QualityMode::Balanced, 1080, 1920), (1080, 1920));
@@ -102,6 +108,7 @@ mod tests {
         assert_shape(size, (1440, 2560));
     }
 
+    /// Each quality mode has its fixed bitrate cap.
     #[test]
     fn bitrate_caps_per_mode() {
         assert_eq!(bitrate_cap(QualityMode::Quality), 8_000_000);

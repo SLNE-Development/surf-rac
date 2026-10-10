@@ -105,6 +105,8 @@ async fn frames_of(events: &mut Receiver<ViewerEvent>, width: u32, height: u32) 
     }
 }
 
+/// A viewer of a synthetic two-monitor share receives the initial state and frames of the first
+/// monitor, matching the share's own state.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn viewer_sees_synthetic_screen_and_state(pool: PgPool) {
     let mut s = shared(pool, vec![(1280, 720), (640, 480)]).await;
@@ -117,6 +119,7 @@ async fn viewer_sees_synthetic_screen_and_state(pool: PgPool) {
     assert_eq!(s.share.state(), state);
 }
 
+/// Viewer controls switch the shared monitor and quality mode, and frames follow at the new sizes.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn viewer_switches_monitor_and_mode(pool: PgPool) {
     let mut s = shared(pool, vec![(1920, 1080), (640, 480)]).await;
@@ -145,6 +148,8 @@ async fn viewer_switches_monitor_and_mode(pool: PgPool) {
     frames_of(&mut s.events, 1280, 720).await;
 }
 
+/// Source failures pause the share as recovering, after which it becomes active again and frames
+/// resume.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn source_failure_pauses_and_resumes(pool: PgPool) {
     let mut s = shared(pool, vec![(640, 480)]).await;

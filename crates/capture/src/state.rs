@@ -209,6 +209,8 @@ mod tests {
         DeviceId::new(100_000_000 + n).unwrap()
     }
 
+    /// The controller starts on the primary monitor unless a valid start index is given, with the
+    /// given mode and active capture.
     #[test]
     fn starts_on_primary_unless_asked() {
         assert_eq!(two().state().selected, 1);
@@ -224,12 +226,14 @@ mod tests {
         assert_eq!(c.state().selected, 0);
     }
 
+    /// A joining viewer is sent the current state.
     #[test]
     fn join_sends_state_to_viewer() {
         let c = two();
         assert_eq!(c.viewer_joined(dev(1)), Outgoing::To(dev(1), c.state().clone()));
     }
 
+    /// A viewer selecting another valid monitor changes the selection and broadcasts the state.
     #[test]
     fn select_valid_broadcasts() {
         let mut c = two();
@@ -238,6 +242,7 @@ mod tests {
         assert_eq!(out, Some(Outgoing::All(c.state().clone())));
     }
 
+    /// A viewer selecting a monitor that does not exist gets the unchanged state sent back.
     #[test]
     fn invalid_monitor_resends_state() {
         let mut c = two();
@@ -250,6 +255,7 @@ mod tests {
         assert!(matches!(out, Some(Outgoing::To(..))));
     }
 
+    /// A request that changes nothing is answered to the requester only.
     #[test]
     fn unchanged_request_answers_requester_only() {
         let mut c = two();
@@ -264,6 +270,7 @@ mod tests {
         assert!(matches!(out, Some(Outgoing::To(..))));
     }
 
+    /// A viewer changing the quality mode updates the state and broadcasts it.
     #[test]
     fn set_quality_broadcasts() {
         let mut c = two();
@@ -277,6 +284,7 @@ mod tests {
         assert_eq!(out, Some(Outgoing::All(c.state().clone())));
     }
 
+    /// A host selection broadcasts only when it names another valid monitor.
     #[test]
     fn select_ignores_invalid_and_unchanged() {
         let mut c = two();
@@ -286,6 +294,8 @@ mod tests {
         assert_eq!(c.state().selected, 0);
     }
 
+    /// Geometry reports each monitor's desktop origin and size, and a change of origins alone
+    /// updates it without a broadcast.
     #[test]
     fn geometry_tracks_origins() {
         let mut a = mon("A", 1920, 1080, true);
@@ -307,6 +317,7 @@ mod tests {
         assert_eq!(c.geometry()[0].left, 1280);
     }
 
+    /// A monitor rectangle contains its left and top edges but not its right and bottom edges.
     #[test]
     fn rect_contains_half_open() {
         let r = MonitorRect { left: -10, top: 5, width: 20, height: 10 };
@@ -316,11 +327,14 @@ mod tests {
         assert!(!r.contains(0, 15));
     }
 
+    /// Controls other than screen requests produce no answer.
     #[test]
     fn other_controls_are_not_screen_requests() {
         assert_eq!(two().handle(dev(1), &Control::Hangup), None);
     }
 
+    /// When the selected monitor disappears, the selection falls back to the primary monitor and
+    /// the new state is broadcast.
     #[test]
     fn monitor_vanished_falls_back_to_primary() {
         let mut c = two();
@@ -331,6 +345,7 @@ mod tests {
         assert_eq!(out, Some(Outgoing::All(c.state().clone())));
     }
 
+    /// The selection follows its monitor by name when the monitor order changes.
     #[test]
     fn selection_follows_monitor_by_name() {
         let mut c = two();
@@ -339,6 +354,7 @@ mod tests {
         assert_eq!(c.state().monitors[0].name, "B");
     }
 
+    /// Reporting the same monitors again sends nothing.
     #[test]
     fn unchanged_monitors_send_nothing() {
         let mut c = two();
@@ -348,6 +364,8 @@ mod tests {
         );
     }
 
+    /// Each change of the capture state is broadcast once, and setting the same state again sends
+    /// nothing.
     #[test]
     fn capture_transition_broadcasts_once() {
         let mut c = two();
@@ -363,6 +381,8 @@ mod tests {
         assert_eq!(c.set_capture(CaptureState::Active), None);
     }
 
+    /// Monitor lists are cut to `MAX_MONITORS` with sequential indices, and long names are cut to
+    /// the byte limit.
     #[test]
     fn names_and_count_are_bounded() {
         let long = "é".repeat(50);

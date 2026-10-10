@@ -30,6 +30,8 @@ fn primary(source: &mut DesktopSource) -> usize {
     monitors.iter().position(|m| m.primary).expect("a primary monitor")
 }
 
+/// The desktop source lists at least one monitor, exactly one of them primary, all with a size and
+/// a name.
 #[test]
 fn enumerates_at_least_one_monitor() {
     let mut source = DesktopSource::new().expect("desktop source");
@@ -42,6 +44,7 @@ fn enumerates_at_least_one_monitor() {
     assert!(monitors.iter().all(|m| m.width > 0 && m.height > 0 && !m.name.is_empty()));
 }
 
+/// A frame captured from the primary monitor has the monitor's size and is not a single colour.
 #[test]
 fn captures_monitor_sized_non_uniform_frame() {
     let mut source = DesktopSource::new().expect("desktop source");
@@ -57,6 +60,7 @@ fn captures_monitor_sized_non_uniform_frame() {
     );
 }
 
+/// Capturing and converting a primary-monitor frame takes under 10 ms in the median.
 #[test]
 fn capture_and_convert_median_under_10ms() {
     let mut source = DesktopSource::new().expect("desktop source");
@@ -123,6 +127,8 @@ fn drain(enc: &mut MfEncoder) -> Vec<surf_rac_capture::mf::EncodedAu> {
     out
 }
 
+/// The hardware encoder's first access unit is a keyframe with SPS and IDR, and later ones are not
+/// all keyframes.
 #[test]
 fn encodes_idr_first() {
     let Some(mut enc) = hardware(1280, 720) else { return };
@@ -139,6 +145,7 @@ fn encodes_idr_first() {
     assert!(aus[1..].iter().any(|au| !au.keyframe), "every access unit is a keyframe");
 }
 
+/// A forced keyframe arrives within two frames of the request and carries an SPS.
 #[test]
 fn forced_keyframe_within_two_frames() {
     let Some(mut enc) = hardware(1280, 720) else { return };
@@ -160,6 +167,8 @@ fn forced_keyframe_within_two_frames() {
     assert!(nal_types(&key.data).contains(&NAL_SPS));
 }
 
+/// Hardware encoding of 1080p frames takes under 15 ms in the median and yields an access unit for
+/// nearly every frame.
 #[test]
 fn encode_median_under_15ms_1080p() {
     let Some(mut enc) = hardware(1920, 1080) else { return };
@@ -179,6 +188,8 @@ fn encode_median_under_15ms_1080p() {
     assert!(median < Duration::from_millis(15), "median {median:?}");
 }
 
+/// Encoding 1080p frames paced at 30 fps keeps up, yielding an access unit for nearly every frame
+/// with encode calls under a frame interval.
 #[test]
 fn paced_frames_keep_up_with_30_fps() {
     let Some(mut enc) = hardware(1920, 1080) else { return };
@@ -201,6 +212,7 @@ fn paced_frames_keep_up_with_30_fps() {
     assert!(busy / 60 < Duration::from_millis(33), "encode calls take {:?} on average", busy / 60);
 }
 
+/// The hardware encoder accepts a bitrate change between frames.
 #[test]
 fn bitrate_change_is_accepted() {
     let Some(mut enc) = hardware(640, 480) else { return };

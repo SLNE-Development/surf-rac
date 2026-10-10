@@ -59,6 +59,7 @@ pub fn nal_types(au: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// NAL unit types are found after both three-byte and four-byte start codes, in stream order.
     #[test]
     fn finds_nal_types_after_both_start_code_lengths() {
         let au = [
@@ -69,6 +70,8 @@ mod tests {
         assert_eq!(nal_types(&au), [NAL_SPS, NAL_PPS, NAL_IDR]);
     }
 
+    /// Empty input, data without a start code and a start code with no payload contain no NAL
+    /// units.
     #[test]
     fn empty_and_garbage_have_no_units() {
         assert!(nal_types(&[]).is_empty());

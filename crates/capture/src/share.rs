@@ -987,6 +987,8 @@ mod tests {
         DeviceId::new(100_000_000 + n).unwrap()
     }
 
+    /// Stats report the median processing time and clear their samples only once the logging
+    /// interval has passed.
     #[test]
     fn stats_median_and_reset() {
         let t0 = Instant::now();
@@ -1003,6 +1005,7 @@ mod tests {
         assert_eq!(stats.since, t0 + STATS_INTERVAL);
     }
 
+    /// Backoff waits double from 250 ms up to a 5 s cap and start over after a reset.
     #[test]
     fn backoff_doubles_and_caps() {
         let mut b = Backoff::new();
@@ -1012,6 +1015,7 @@ mod tests {
         assert_eq!(b.next(), Duration::from_millis(250));
     }
 
+    /// Raw frames are published at the size of the selected monitor in the current quality mode.
     #[test]
     fn publishes_at_mode_size() {
         let (mut lp, _, rec, _, t0) = setup();
@@ -1029,6 +1033,8 @@ mod tests {
         assert_eq!(*rec.raw.lock().unwrap(), [(1920, 1080), (1280, 720), (640, 480)]);
     }
 
+    /// A joining viewer and an invalid selection get the state sent to that viewer, while a valid
+    /// selection is broadcast and updates the state.
     #[test]
     fn join_and_requests_reach_viewers() {
         let (mut lp, _, _, mut rx, t0) = setup();
@@ -1042,6 +1048,8 @@ mod tests {
         assert_eq!(lp.state_rx().borrow().selected, 1);
     }
 
+    /// Repeated capture failures broadcast the pause once and retry with capped backoff, and a
+    /// successful capture resumes, broadcasts and resets the backoff.
     #[test]
     fn pause_broadcast_once_and_backoff_caps() {
         let (mut lp, control, rec, mut rx, t0) = setup();
@@ -1080,6 +1088,8 @@ mod tests {
         wait_for(|| rec.encoded.lock().unwrap().len() >= encoded);
     }
 
+    /// With a hardware encoder, the host switches to encoded input and publishes access units
+    /// starting with a keyframe, opened at the monitor size and mode bitrate.
     #[test]
     fn hardware_publishes_encoded_with_keyframe_first() {
         let (mut lp, _, rec, _, t0) = setup();
@@ -1093,6 +1103,8 @@ mod tests {
         assert_eq!(*log.opened.lock().unwrap(), [(1920, 1080, 5_000_000)]);
     }
 
+    /// Viewer keyframe and bitrate requests reach the hardware encoder, and a quality change
+    /// reopens it at the new size and bitrate with a keyframe.
     #[test]
     fn keyframe_and_rate_requests_reach_the_encoder() {
         let (mut lp, _, rec, _, t0) = setup();
@@ -1119,6 +1131,8 @@ mod tests {
         assert_eq!(*log.bitrates.lock().unwrap(), [3_000_000]);
     }
 
+    /// Switching to a monitor of another size reopens the hardware encoder at that size and starts
+    /// with a keyframe.
     #[test]
     fn size_change_reopens_encoder_with_keyframe() {
         let (mut lp, _, rec, _, t0) = setup();
@@ -1136,6 +1150,7 @@ mod tests {
         assert_eq!(*rec.switches.lock().unwrap(), [VideoInput::Encoded]);
     }
 
+    /// Access units the encoder produces between frames are published by polling.
     #[test]
     fn polling_publishes_pending_access_units() {
         let (mut lp, _, rec, _, t0) = setup();
@@ -1146,6 +1161,8 @@ mod tests {
         wait_for(|| rec.encoded.lock().unwrap().len() == 3);
     }
 
+    /// Frames arriving while the encoder worker is busy are dropped and counted, and a keyframe
+    /// request on a dropped frame is kept for the next one.
     #[test]
     fn busy_worker_drops_frames_and_keeps_the_keyframe() {
         let (mut lp, _, rec, _, t0) = setup();
@@ -1165,6 +1182,8 @@ mod tests {
         assert_eq!(*log.forced.lock().unwrap(), [true, false, true]);
     }
 
+    /// A hardware encode error switches the host back to raw input and continues with software
+    /// frames without reopening the encoder.
     #[test]
     fn hardware_error_falls_back_to_software() {
         let (mut lp, _, rec, _, t0) = setup();
@@ -1183,6 +1202,7 @@ mod tests {
         assert!(lp.hardware.is_none() && lp.worker.is_none());
     }
 
+    /// Without a hardware encoder the loop publishes raw frames and never switches the video input.
     #[test]
     fn no_hardware_stays_software_without_switching() {
         let (mut lp, _, rec, _, t0) = setup();
@@ -1197,6 +1217,7 @@ mod tests {
         assert!(lp.hardware.is_none() && lp.worker.is_none());
     }
 
+    /// Resuming capture after a pause forces a keyframe from the hardware encoder.
     #[test]
     fn resume_forces_a_keyframe() {
         let (mut lp, control, rec, _, t0) = setup();
@@ -1211,6 +1232,8 @@ mod tests {
         assert_eq!(*log.forced.lock().unwrap(), [true, false, true]);
     }
 
+    /// A loop whose initial monitor selection fails starts paused and becomes active, captures and
+    /// broadcasts on the retry.
     #[test]
     fn failed_initial_select_recovers() {
         let (source, control) = SyntheticSource::new(vec![(640, 480)]);
@@ -1231,6 +1254,8 @@ mod tests {
         );
     }
 
+    /// A failed monitor switch pauses capture until the retry selects the new monitor and captures
+    /// from it.
     #[test]
     fn failed_monitor_switch_pauses_and_retries() {
         let (mut lp, control, rec, _, t0) = setup();
@@ -1246,6 +1271,8 @@ mod tests {
         assert_eq!(rec.raw.lock().unwrap().last(), Some(&(640, 480)));
     }
 
+    /// A host selection is not rate limited, broadcasts the new state, and sends nothing when
+    /// unchanged.
     #[test]
     fn host_select_skips_rate_limit_and_broadcasts() {
         let (mut lp, _, _, mut rx, t0) = setup();
@@ -1258,6 +1285,7 @@ mod tests {
         assert!(drain(&mut rx).is_empty());
     }
 
+    /// The geometry channel holds the desktop rectangle of every monitor.
     #[test]
     fn geometry_follows_monitors() {
         let (lp, _, _, _, _) = setup();
@@ -1270,6 +1298,7 @@ mod tests {
         );
     }
 
+    /// Viewer screen requests within 250 ms of the last applied one are ignored across all viewers.
     #[test]
     fn viewer_requests_are_rate_limited() {
         let (mut lp, _, _, _, t0) = setup();
@@ -1285,6 +1314,7 @@ mod tests {
         assert_eq!(lp.ctl.state().selected, 1);
     }
 
+    /// Dropping a loop that used the hardware encoder switches the host back to raw input.
     #[test]
     fn stopping_hardware_restores_raw_input() {
         let (mut lp, _, rec, _, t0) = setup();
@@ -1294,6 +1324,7 @@ mod tests {
         assert_eq!(*rec.switches.lock().unwrap(), [VideoInput::Encoded, VideoInput::Raw]);
     }
 
+    /// A panicking hardware encoder falls back to software frames with raw input and no worker.
     #[test]
     fn encoder_panic_falls_back_to_software() {
         let (mut lp, _, rec, _, t0) = setup();
@@ -1312,6 +1343,7 @@ mod tests {
         assert!(lp.worker.is_none());
     }
 
+    /// A source without monitors starts paused as unavailable.
     #[test]
     fn no_monitors_starts_paused_unavailable() {
         let (source, _) = SyntheticSource::new(vec![]);

@@ -158,6 +158,8 @@ mod tests {
         );
     }
 
+    /// White, black, red, green and blue BGRA pixels convert to their expected BT.601 limited-range
+    /// YUV values in a valid I420 frame carrying the timestamp.
     #[test]
     fn pure_colors_convert() {
         for (rgb, yuv) in [
@@ -175,6 +177,7 @@ mod tests {
         }
     }
 
+    /// A source with padded rows converts to the same I420 data as a tightly packed one.
     #[test]
     fn padded_stride_converts() {
         let tight = to_i420(&solid(32, 16, 128, [10, 200, 30]), 32, 16, 0);
@@ -182,6 +185,8 @@ mod tests {
         assert_eq!(tight.data, padded.data);
     }
 
+    /// An odd-sized source converted to the next smaller even size drops its last column and row
+    /// and keeps the colour.
     #[test]
     fn odd_source_drops_last_column_and_row() {
         let f = to_i420(&solid(33, 17, 33 * 4, [255, 255, 255]), 32, 16, 0);
@@ -189,6 +194,7 @@ mod tests {
         assert_near(centre_yuv(&f), (235, 128, 128));
     }
 
+    /// Downscaling produces an I420 frame of the target size and length with the colour preserved.
     #[test]
     fn scaled_output_has_target_size() {
         let f = to_i420(&solid(64, 32, 256, [0, 0, 255]), 32, 16, 0);
@@ -197,6 +203,7 @@ mod tests {
         assert_near(centre_yuv(&f), (41, 240, 110));
     }
 
+    /// NV12 output has the same luma plane as I420 and interleaves the same U and V samples.
     #[test]
     fn nv12_matches_i420_planes() {
         let mut src = solid(16, 8, 64, [0, 0, 0]);

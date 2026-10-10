@@ -7,6 +7,7 @@ use std::fmt::Write as _;
 use anyhow::{Context, anyhow, bail};
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
+use surf_rac_protocol::DeviceId;
 
 use crate::accounts::{self, RegisterError};
 use crate::crypto;
@@ -86,6 +87,45 @@ pub async fn set_disabled(db: &PgPool, username: &str, disabled: bool) -> anyhow
         Ok(format!("disabled {username}, revoked {n} sessions"))
     } else {
         Ok(format!("enabled {username}"))
+    }
+}
+
+/// Parses a 9-digit device ID, ignoring any whitespace between or around the digits.
+///
+/// Accepts both `386928003` and the grouped form `386 928 003` that clients show.
+pub fn parse_device_id(input: &str) -> anyhow::Result<DeviceId> {
+    let digits: String = input.chars().filter(|c| !c.is_whitespace()).collect();
+    digits
+        .parse()
+        .map_err(|err| anyhow!("invalid device id {input:?}: {err}"))
+}
+
+/// Disables or re-enables `device`.
+///
+/// Setting the flag to the value it already has succeeds. New connections of
+/// a disabled device are refused with `device_disabled`; a connection that is
+/// open is sent a `device_disabled` error and closed at its next periodic
+/// re-check. Fails when no device has the ID.
+pub async fn set_device_disabled(
+    db: &PgPool,
+    device: DeviceId,
+    disabled: bool,
+) -> anyhow::Result<String> {
+    let updated = sqlx::query("update devices set disabled = $2 where id = $1")
+        .bind(i64::from(device.get()))
+        .bind(disabled)
+        .execute(db)
+        .await?
+        .rows_affected();
+    if updated == 0 {
+        bail!("no device with id {device}");
+    }
+    if disabled {
+        Ok(format!(
+            "disabled device {device}; its open connection is closed within a minute"
+        ))
+    } else {
+        Ok(format!("enabled device {device}"))
     }
 }
 

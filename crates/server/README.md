@@ -105,6 +105,8 @@ surf-rac-server disable-user <username>       # also revokes sessions
 surf-rac-server enable-user <username>
 surf-rac-server reset-password <username>     # also revokes sessions
 surf-rac-server revoke-sessions <username>
+surf-rac-server disable-device <device-id>    # e.g. 386928003 or "386 928 003"
+surf-rac-server enable-device <device-id>
 ```
 
 Disabling a user or revoking sessions affects only the account: its sessions
@@ -113,18 +115,21 @@ and stay connected; a device linked to the account stays linked.
 
 ### Disabling a device
 
-There is no CLI command for devices. An operator disables or re-enables one
-installation with SQL in the Postgres resource (Coolify terminal of the
-database, or `psql "$DATABASE_URL"`), using the 9-digit device ID the client
-shows:
+An operator disables or re-enables one installation by the 9-digit device ID
+the client shows, with or without the spaces:
 
-```sql
-UPDATE devices SET disabled = true WHERE id = <id>;   -- disable
-UPDATE devices SET disabled = false WHERE id = <id>;  -- enable again
+```sh
+surf-rac-server disable-device 386928003      # disable
+surf-rac-server enable-device "386 928 003"   # enable again
 ```
 
+An unknown ID is reported as an error with a non-zero exit status. Disabling
+a device that is already disabled succeeds and changes nothing.
+
 A disabled device that is connected receives an `error` with code
-`device_disabled` at the next re-check (within a minute) and is closed. New
+`device_disabled` and is closed when the running server next re-checks the
+device in the database. Each connection re-checks every 60 seconds, so this
+happens within a minute of the command. New
 WebSocket connections of the device are refused with a 403
 `device_disabled`. The client stops connecting, shows the status "Device
 disabled" and the banner "This device is disabled. The server's administrator

@@ -38,6 +38,18 @@ enum Command {
         /// Username to enable.
         username: String,
     },
+    /// Disable a device; a connected one is closed within a minute.
+    DisableDevice {
+        /// 9-digit device ID, with or without spaces (e.g. "386 928 003").
+        #[arg(required = true, num_args = 1..)]
+        device_id: Vec<String>,
+    },
+    /// Re-enable a disabled device.
+    EnableDevice {
+        /// 9-digit device ID, with or without spaces (e.g. "386 928 003").
+        #[arg(required = true, num_args = 1..)]
+        device_id: Vec<String>,
+    },
     /// Set a new password; it comes from SURF_RAC_PASSWORD or stdin.
     ResetPassword {
         /// Username whose password is reset.
@@ -60,6 +72,13 @@ async fn main() -> anyhow::Result<()> {
         return surf_rac_server::run(config).await;
     }
 
+    let device = match &cli.command {
+        Command::DisableDevice { device_id } | Command::EnableDevice { device_id } => {
+            Some(admin::parse_device_id(&device_id.join(" "))?)
+        }
+        _ => None,
+    };
+
     let url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
     let db = surf_rac_server::connect_and_migrate(&url).await?;
     let output = match cli.command {
@@ -70,6 +89,12 @@ async fn main() -> anyhow::Result<()> {
         Command::ListUsers => admin::list_users(&db).await?,
         Command::DisableUser { username } => admin::set_disabled(&db, &username, true).await?,
         Command::EnableUser { username } => admin::set_disabled(&db, &username, false).await?,
+        Command::DisableDevice { .. } => {
+            admin::set_device_disabled(&db, device.expect("parsed above"), true).await?
+        }
+        Command::EnableDevice { .. } => {
+            admin::set_device_disabled(&db, device.expect("parsed above"), false).await?
+        }
         Command::ResetPassword { username } => {
             admin::reset_password(&db, &username, &read_password()?).await?
         }

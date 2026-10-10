@@ -216,6 +216,8 @@ fn server_row(app: &mut ClientApp, ui: &mut egui::Ui) {
 mod tests {
     use super::*;
 
+    /// Checks that usernames must be 3 to 32 lowercase letters, digits, dots,
+    /// underscores or hyphens.
     #[test]
     fn usernames_follow_the_server_rules() {
         assert!(valid_username("abc"));
@@ -229,6 +231,7 @@ mod tests {
         assert!(!valid_username("m\u{e9}lo"));
     }
 
+    /// Checks that passwords must be between 10 and 256 characters long.
     #[test]
     fn passwords_need_ten_to_256_characters() {
         assert!(!valid_password("123456789"));
@@ -238,6 +241,8 @@ mod tests {
         assert!(!valid_password(&"x".repeat(257)));
     }
 
+    /// Checks that new accounts must satisfy the username and password rules while
+    /// sign-ins only need both fields filled in.
     #[test]
     fn new_accounts_are_checked_and_sign_ins_only_need_both_fields() {
         assert_eq!(account_error(true, "mia", "1234567890"), None);
@@ -252,6 +257,8 @@ mod tests {
         assert_eq!(account_error(true, "", ""), Some(MISSING_FIELDS));
     }
 
+    /// Checks the message and busy flag shown for idle, working and failed account
+    /// tasks.
     #[test]
     fn account_messages_show_progress_and_failures() {
         assert_eq!(account_message(&AccountTask::Idle), (None, false));

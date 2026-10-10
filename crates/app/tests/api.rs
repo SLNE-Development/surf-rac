@@ -41,6 +41,9 @@ impl InstallationStore for MemoryStore {
 /// Fingerprint hash the tests register with.
 const FINGERPRINT: &str = "00000000000000000000000000000000000000000000000000000000000000a7";
 
+/// Checks registration, sign-in, account linking, devices, contacts and presence
+/// against a live server, and that signing out unlinks the installation and account
+/// deletion needs the right password.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn installation_links_to_an_account_and_unlinks_on_sign_out_without_a_socket(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -125,6 +128,8 @@ async fn installation_links_to_an_account_and_unlinks_on_sign_out_without_a_sock
     );
 }
 
+/// Checks that an installation the server no longer knows is rejected as unknown
+/// and connects again after renewing its registration.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn unknown_device_is_renewed_with_a_fresh_registration(pool: PgPool) {
     let env = TestEnv::start(pool.clone()).await;

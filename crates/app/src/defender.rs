@@ -53,6 +53,8 @@ pub fn add_exclusion() -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// Checks that the executable path is passed single-quoted with embedded quotes
+    /// doubled, as both an exclusion path and an exclusion process.
     #[test]
     fn path_is_single_quoted_and_escaped() {
         let args = exclusion_arguments(Path::new(r"C:\Users\O'Neil\Downloads\surf-rac.exe"));

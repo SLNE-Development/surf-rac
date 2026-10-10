@@ -272,6 +272,8 @@ fn visuals(p: &Palette, dark: bool) -> Visuals {
 mod tests {
     use super::*;
 
+    /// Checks that the light and dark palettes have different backgrounds and share the
+    /// same accent colour.
     #[test]
     fn palettes_differ_and_accent_is_shared() {
         assert_ne!(LIGHT.bg, DARK.bg);
@@ -279,6 +281,8 @@ mod tests {
         assert_eq!(LIGHT.accent, Color32::from_rgb(0x25, 0x63, 0xEB));
     }
 
+    /// Checks that Inter is the first proportional font with egui's fonts as fallback
+    /// and that the bold, semibold and icon families are registered.
     #[test]
     fn fonts_load_with_inter_first_and_egui_fallbacks() {
         let fonts = font_definitions();
@@ -301,6 +305,8 @@ mod tests {
         );
     }
 
+    /// Checks that installing the theme follows the system preference with dark as the
+    /// fallback.
     #[test]
     fn theme_follows_the_system_with_dark_fallback() {
         let ctx = egui::Context::default();

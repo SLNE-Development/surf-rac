@@ -82,6 +82,8 @@ mod tests {
         }
     }
 
+    /// Checks that the portable store saves, loads and clears the installation through
+    /// the state file without touching the other settings.
     #[test]
     fn portable_store_saves_loads_and_clears_through_the_state_file() {
         let dir = temp_dir("portable");

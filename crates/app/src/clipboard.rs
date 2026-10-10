@@ -259,6 +259,8 @@ mod tests {
     }
 
     impl FakeBoard {
+        /// Places an item on the fake clipboard as a local copy, advancing its sequence
+        /// number.
         fn copy(&mut self, item: Item) {
             self.seq += 1;
             self.item = Some(item);
@@ -266,18 +268,22 @@ mod tests {
     }
 
     impl Board for FakeBoard {
+        /// Returns the fake clipboard's current sequence number.
         fn sequence(&self) -> u32 {
             self.seq
         }
+        /// Returns a copy of the item on the fake clipboard, if any.
         fn read(&mut self) -> Option<Item> {
             self.item.clone()
         }
+        /// Places the item on the fake clipboard like a local copy and reports success.
         fn write(&mut self, item: &Item) -> bool {
             self.copy(item.clone());
             true
         }
     }
 
+    /// Builds an image item of the given size filled with a repeating byte pattern.
     fn image(w: u32, h: u32) -> Item {
         Item::Image {
             width: w,
@@ -286,6 +292,7 @@ mod tests {
         }
     }
 
+    /// Checks that content already on the clipboard at start is offered once.
     #[test]
     fn existing_content_is_offered_once() {
         let mut board = FakeBoard::default();
@@ -295,6 +302,7 @@ mod tests {
         assert_eq!(sync.poll(), None);
     }
 
+    /// Checks that a local clipboard change is reported once.
     #[test]
     fn local_change_is_reported_once() {
         let mut sync = ClipboardSync::new(FakeBoard::default());
@@ -304,6 +312,8 @@ mod tests {
         assert_eq!(sync.poll(), None);
     }
 
+    /// Checks that an item applied from the remote side is written to the clipboard
+    /// but not reported back, while a later local copy is.
     #[test]
     fn remote_item_is_not_echoed() {
         let mut sync = ClipboardSync::new(FakeBoard::default());
@@ -317,6 +327,8 @@ mod tests {
         assert_eq!(sync.poll(), Some(Item::Text("typed here".into())));
     }
 
+    /// Checks that non-ASCII text encodes as a text clipboard message and decodes back
+    /// unchanged.
     #[test]
     fn text_round_trips() {
         let item = Item::Text("grüße 👋".into());
@@ -331,6 +343,8 @@ mod tests {
         assert_eq!(decode(&msg), Some(item));
     }
 
+    /// Checks that an image encodes as a PNG clipboard message and decodes back to the
+    /// same pixels.
     #[test]
     fn image_round_trips_as_png() {
         let item = image(7, 5);
@@ -343,12 +357,15 @@ mod tests {
         assert_eq!(decode(&msg), Some(item));
     }
 
+    /// Checks that text larger than the clipboard limit is not encoded.
     #[test]
     fn oversize_items_are_not_encoded() {
         let text = Item::Text("x".repeat(MAX_CLIPBOARD_BYTES + 1));
         assert!(encode(&text).is_none());
     }
 
+    /// Checks that invalid PNG data, invalid UTF-8 text and non-clipboard messages
+    /// decode to nothing.
     #[test]
     fn malformed_payloads_decode_to_nothing() {
         let bad_png = DataMessage::Clipboard {
@@ -364,6 +381,8 @@ mod tests {
         assert_eq!(decode(&DataMessage::Wheel { dx: 0, dy: 1 }), None);
     }
 
+    /// Checks that an image whose pixel buffer does not match its size is not
+    /// encoded.
     #[test]
     fn image_with_wrong_buffer_size_is_not_encoded() {
         let item = Item::Image {
@@ -374,6 +393,8 @@ mod tests {
         assert!(encode(&item).is_none());
     }
 
+    /// Checks that images whose RGBA expansion would exceed the size cap are rejected
+    /// before decoding.
     #[test]
     fn rgba_size_is_capped_before_decoding() {
         assert!(rgba_fits(4096, 4096));

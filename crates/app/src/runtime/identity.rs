@@ -248,6 +248,8 @@ mod tests {
     /// Fingerprint hash the tests register with.
     const FINGERPRINT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+    /// Checks that without a stored installation a new key is registered with the
+    /// fingerprint and name and the installation is stored.
     #[tokio::test]
     async fn ensure_registers_when_no_installation_is_stored() {
         let store = MemoryStore::default();
@@ -268,6 +270,7 @@ mod tests {
         assert_eq!(restored.key.public(), identity.key.public());
     }
 
+    /// Checks that a stored installation is reused without registering again.
     #[tokio::test]
     async fn ensure_reuses_a_stored_installation_without_registering() {
         let store = MemoryStore::default();
@@ -285,6 +288,7 @@ mod tests {
         assert_eq!(second.key.public(), first.key.public());
     }
 
+    /// Checks that renewing registers a new key, gets a new device id and stores it.
     #[tokio::test]
     async fn renew_discards_the_installation_and_registers_a_new_key() {
         let store = MemoryStore::default();
@@ -303,6 +307,8 @@ mod tests {
         assert_eq!(store.load().unwrap().device_id, new.id);
     }
 
+    /// Checks that a refused registration returns the error and stores no
+    /// installation.
     #[tokio::test]
     async fn failed_registration_leaves_no_installation() {
         /// A registrar that refuses every registration.
@@ -354,6 +360,8 @@ mod tests {
         }
     }
 
+    /// Checks that a registered identity whose installation cannot be stored is
+    /// returned as unsaved and can be saved later without registering again.
     #[tokio::test]
     async fn registered_identity_that_cannot_be_stored_is_kept_and_saved_later() {
         let store = FailingStore {
@@ -385,6 +393,7 @@ mod tests {
         assert_eq!(registrar.seen.lock().unwrap().len(), 1);
     }
 
+    /// Checks that a stored identity key that is not 32 bytes gives no identity.
     #[test]
     fn stored_key_that_is_not_32_bytes_is_no_identity() {
         let state = InstallationState {
@@ -395,6 +404,7 @@ mod tests {
         assert!(Identity::from_installation(&state).is_none());
     }
 
+    /// Checks that the device name is non-empty and within the character limit.
     #[test]
     fn device_name_is_bounded() {
         let name = device_name();

@@ -337,12 +337,15 @@ impl Registrar for Api {
 mod tests {
     use super::*;
 
+    /// Builds a JSON error body with the given error code and a fixed message.
     fn body(code: &str) -> Vec<u8> {
         serde_json::json!({"error": code, "message": "msg"})
             .to_string()
             .into_bytes()
     }
 
+    /// Checks that the WebSocket URL uses wss for an https server and ws for an http
+    /// server, without a trailing slash.
     #[test]
     fn ws_url_follows_scheme() {
         assert_eq!(
@@ -355,6 +358,8 @@ mod tests {
         );
     }
 
+    /// Checks that each HTTP status and error code pair maps to the matching API
+    /// error.
     #[test]
     fn error_codes_map_to_errors() {
         assert_eq!(
@@ -408,6 +413,8 @@ mod tests {
         );
     }
 
+    /// Checks that error responses without a JSON body are mapped from the HTTP status
+    /// alone.
     #[test]
     fn non_json_bodies_map_by_status() {
         assert_eq!(error_from(401, b"<html>"), ApiError::Unauthorized);
@@ -421,6 +428,7 @@ mod tests {
         );
     }
 
+    /// Checks that the debug output of an API client does not show its session token.
     #[test]
     fn debug_hides_token() {
         let api = Api::new("http://x").with_token(Some("secret-token".into()));

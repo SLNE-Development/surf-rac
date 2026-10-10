@@ -1356,6 +1356,8 @@ mod tests {
         }
     }
 
+    /// Checks that an identity that could not be saved is used at once, shows a banner
+    /// and is saved by later retries without registering again.
     #[tokio::test(start_paused = true)]
     async fn unsaved_identity_is_used_and_saved_without_registering_again() {
         let installation = Arc::new(CountingStore::default());
@@ -1399,6 +1401,7 @@ mod tests {
         assert_eq!(stored.device_id, identity.id);
     }
 
+    /// Checks that a stored identity clears the identity-not-saved banner.
     #[tokio::test(start_paused = true)]
     async fn stored_identity_clears_the_not_saved_banner() {
         let installation = Arc::new(CountingStore::default());
@@ -1411,6 +1414,8 @@ mod tests {
         assert_eq!(actor.banner, None);
     }
 
+    /// Checks that connecting before an identity exists shows the not-connected banner
+    /// and opens no viewer.
     #[tokio::test(start_paused = true)]
     async fn connecting_without_an_identity_says_not_connected() {
         let installation = Arc::new(CountingStore::default());

@@ -314,6 +314,7 @@ fn server_dialog(app: &mut ClientApp, ctx: &egui::Context) {
 mod tests {
     use super::*;
 
+    /// Checks the status text and tone shown for every connection state.
     #[test]
     fn connection_status_covers_every_connection_state() {
         assert_eq!(connection_status(&Connection::Online), ("Online", Tone::Ok));
@@ -339,6 +340,8 @@ mod tests {
         );
     }
 
+    /// Checks that only update-required, disabled and replaced connections show a
+    /// danger banner.
     #[test]
     fn only_stopped_connections_get_a_banner() {
         for quiet in [
@@ -359,6 +362,8 @@ mod tests {
         assert_eq!(tone, Tone::Danger);
     }
 
+    /// Checks that device ids are shown in groups of three and parsed back with or
+    /// without spaces, rejecting invalid input.
     #[test]
     fn ids_are_grouped_and_parsed_back() {
         let id = DeviceId::new(123_456_789).unwrap();

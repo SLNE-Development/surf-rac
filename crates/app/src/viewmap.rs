@@ -70,6 +70,8 @@ mod tests {
         h: 600.0,
     };
 
+    /// Checks that a frame wider than the area is scaled to its width and centred
+    /// vertically.
     #[test]
     fn wide_frame_is_letterboxed_top_and_bottom() {
         let pic = fit(AREA, 1600, 900);
@@ -79,6 +81,8 @@ mod tests {
         assert_eq!(pic.y, 20.0 + 75.0);
     }
 
+    /// Checks that a frame taller than the area is scaled to its height and centred
+    /// horizontally.
     #[test]
     fn tall_frame_is_pillarboxed() {
         let pic = fit(AREA, 600, 900);
@@ -87,6 +91,8 @@ mod tests {
         assert_eq!(pic.x, 10.0 + 200.0);
     }
 
+    /// Checks that an empty frame fits to a zero-sized picture that maps no
+    /// positions.
     #[test]
     fn empty_frame_fits_to_nothing() {
         let pic = fit(AREA, 0, 0);
@@ -94,6 +100,8 @@ mod tests {
         assert_eq!(to_monitor((100.0, 100.0), pic, 1920, 1080), None);
     }
 
+    /// Checks that positions in the picture map to native monitor pixels, including
+    /// the last pixel.
     #[test]
     fn pointer_maps_to_native_monitor_pixels() {
         let pic = Rect {
@@ -113,6 +121,8 @@ mod tests {
         );
     }
 
+    /// Checks that positions map onto the monitor's size even when the frame is
+    /// smaller than the monitor.
     #[test]
     fn monitor_size_differs_from_frame_size() {
         // A Speed-mode frame drawn at 640x400 still maps onto a 2560x1600 monitor.
@@ -128,6 +138,8 @@ mod tests {
         );
     }
 
+    /// Checks that positions outside the picture, including its right edge, map to
+    /// nothing.
     #[test]
     fn positions_outside_the_picture_are_ignored() {
         let pic = fit(AREA, 1600, 900);

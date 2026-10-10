@@ -412,11 +412,13 @@ mod tests {
     use super::*;
     use crate::store::Secret;
 
+    /// Checks that a draft equal to the saved settings is not dirty.
     #[test]
     fn equal_settings_are_clean() {
         assert!(!dirty(&Settings::default(), &Settings::default()));
     }
 
+    /// Checks that changing any editable setting makes the draft dirty.
     #[test]
     fn each_edited_field_makes_the_draft_dirty() {
         let saved = Settings::default();
@@ -431,6 +433,7 @@ mod tests {
         }
     }
 
+    /// Checks that a different password hash alone does not make the draft dirty.
     #[test]
     fn a_differing_password_hash_alone_is_not_an_edit() {
         let saved = Settings::default();

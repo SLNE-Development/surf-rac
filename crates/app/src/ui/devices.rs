@@ -136,6 +136,8 @@ mod tests {
 
     use super::*;
 
+    /// Checks that online devices get no seen text and offline devices get their last
+    /// seen time or plain offline.
     #[test]
     fn seen_text_describes_offline_devices_only() {
         assert_eq!(seen_text(true, None), None);

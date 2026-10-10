@@ -154,6 +154,9 @@ unsafe extern "system" fn hook_proc(
 mod tests {
     use super::*;
 
+    /// Checks that keys pass through without a target, go to the target with the
+    /// extended bit applied once one is set, and that held keys are released when the
+    /// target is cleared.
     #[test]
     fn keys_go_to_the_target_and_are_released_when_it_changes() {
         let sent = Arc::new(Mutex::new(Vec::new()));

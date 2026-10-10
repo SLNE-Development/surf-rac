@@ -542,6 +542,8 @@ mod tests {
     use super::identity::IdentityError;
     use super::*;
 
+    /// Checks that the reconnect backoff doubles from one second and is capped at
+    /// thirty seconds.
     #[test]
     fn backoff_doubles_up_to_thirty_seconds() {
         let secs: Vec<u64> = (0..8).map(|n| backoff(n).as_secs()).collect();
@@ -549,6 +551,8 @@ mod tests {
         assert_eq!(backoff(200), MAX_BACKOFF);
     }
 
+    /// Checks that update-required and device-disabled errors stop reconnecting with
+    /// the matching connection state.
     #[test]
     fn update_required_and_disabled_stop_reconnecting() {
         assert_eq!(
@@ -561,6 +565,8 @@ mod tests {
         );
     }
 
+    /// Checks that clone and unknown-device errors renew the identity once and retry
+    /// after that.
     #[test]
     fn clone_and_unknown_device_renew_once_then_back_off() {
         for error in [SignalingError::CloneDetected, SignalingError::UnknownDevice] {
@@ -569,6 +575,7 @@ mod tests {
         }
     }
 
+    /// Checks that all other connection errors lead to a retry.
     #[test]
     fn other_connect_errors_retry() {
         for error in [
@@ -582,6 +589,8 @@ mod tests {
         }
     }
 
+    /// Checks that identity store failures and rate limits retry while an
+    /// update-required error stops.
     #[test]
     fn identity_store_failures_retry() {
         assert_eq!(
@@ -598,6 +607,8 @@ mod tests {
         );
     }
 
+    /// Checks that update-required registration errors stop and network or rate-limit
+    /// errors retry.
     #[test]
     fn registration_errors_map_to_connection_states() {
         assert_eq!(
@@ -614,6 +625,8 @@ mod tests {
         );
     }
 
+    /// Checks that a typed password is always sent and a saved password only to a host
+    /// with a pinned key.
     #[test]
     fn saved_password_is_only_sent_to_a_pinned_host() {
         assert_eq!(
@@ -628,6 +641,8 @@ mod tests {
         assert_eq!(password_to_send(None, true), None);
     }
 
+    /// Checks that forgetting the saved password is offered only after it was sent and
+    /// the request was denied or timed out.
     #[test]
     fn forget_is_offered_only_when_the_saved_password_was_sent() {
         assert!(offer_forget(true, &RequestError::Denied));
@@ -638,6 +653,7 @@ mod tests {
         assert!(!offer_forget(true, &RequestError::KeyNotRecognised));
     }
 
+    /// Checks that a non-empty typed password is offered instead of the saved one.
     #[test]
     fn typed_password_wins_over_saved() {
         assert_eq!(
@@ -655,6 +671,8 @@ mod tests {
         assert_eq!(password_offer(None, None), None);
     }
 
+    /// Checks that every request error has a full-sentence message and that a timed-out
+    /// session is described as lost.
     #[test]
     fn every_request_error_has_text() {
         for error in [

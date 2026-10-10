@@ -357,6 +357,7 @@ mod tests {
 
     use super::*;
 
+    /// Builds an online contact view with the given id and alias.
     fn contact(id: u32, alias: &str) -> ContactView {
         ContactView {
             id: DeviceId::new(id).unwrap(),
@@ -365,6 +366,7 @@ mod tests {
         }
     }
 
+    /// Returns two sample contacts used by the filter tests.
     fn contacts() -> Vec<ContactView> {
         vec![
             contact(204_551_870, "Build server"),
@@ -372,10 +374,12 @@ mod tests {
         ]
     }
 
+    /// Returns the aliases of the given contacts in order.
     fn aliases(found: Vec<&ContactView>) -> Vec<&str> {
         found.into_iter().map(|c| c.alias.as_str()).collect()
     }
 
+    /// Checks that an empty or blank query returns every contact.
     #[test]
     fn blank_query_returns_every_contact() {
         let all = contacts();
@@ -383,6 +387,7 @@ mod tests {
         assert_eq!(filter_contacts(&all, "   ").len(), 2);
     }
 
+    /// Checks that a query matches contact aliases regardless of case.
     #[test]
     fn aliases_match_ignoring_case() {
         let all = contacts();
@@ -390,6 +395,8 @@ mod tests {
         assert_eq!(aliases(filter_contacts(&all, "LAPTOP")), ["Design laptop"]);
     }
 
+    /// Checks that digit queries match parts of contact ids with or without the group
+    /// spaces.
     #[test]
     fn digits_match_ids_with_or_without_spaces() {
         let all = contacts();
@@ -398,6 +405,7 @@ mod tests {
         assert_eq!(aliases(filter_contacts(&all, "002")), ["Design laptop"]);
     }
 
+    /// Checks that a query matching no alias or id returns no contacts.
     #[test]
     fn unknown_query_matches_nothing() {
         assert!(filter_contacts(&contacts(), "zzz").is_empty());

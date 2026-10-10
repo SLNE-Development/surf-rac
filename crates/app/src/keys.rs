@@ -49,6 +49,8 @@ impl KeyTracker {
 mod tests {
     use super::*;
 
+    /// Checks that scan codes gain the extended bit when flagged and that zero or
+    /// out-of-range codes are rejected.
     #[test]
     fn scan_codes_carry_the_extended_bit() {
         assert_eq!(code(0x1E, false), Some(0x1E));
@@ -57,6 +59,7 @@ mod tests {
         assert_eq!(code(0x100, false), None);
     }
 
+    /// Checks that releasing all keys returns only keys still held, and only once.
     #[test]
     fn release_all_returns_held_keys_once() {
         let mut keys = KeyTracker::default();

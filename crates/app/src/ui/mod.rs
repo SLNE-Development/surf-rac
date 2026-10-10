@@ -228,6 +228,8 @@ mod tests {
     use super::*;
     use crate::runtime::{ViewerStatus, ViewerView};
 
+    /// Builds a viewer view of a session with the given status, keyboard grant and
+    /// lock state.
     fn view(session: u64, status: ViewerStatus, keyboard: bool, locked: bool) -> ViewerView {
         ViewerView {
             session,
@@ -249,6 +251,8 @@ mod tests {
         }
     }
 
+    /// Checks that keys go to a session only when it is connected, focused, granted the
+    /// keyboard and not locked.
     #[test]
     fn keys_go_only_to_a_focused_connected_session_with_keyboard() {
         let focused = |s: u64| s != 9;

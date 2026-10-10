@@ -75,6 +75,8 @@ fn machine_guid() -> Result<String, FingerprintError> {
 mod tests {
     use super::*;
 
+    /// Checks that the machine GUID hash is the SHA-256 of the prefixed GUID as 64
+    /// lowercase hex digits.
     #[test]
     fn hash_is_prefixed_sha256_in_lowercase_hex() {
         let guid = "1b4e28ba-2fa1-11d2-883f-0016d3cca427";
@@ -91,6 +93,8 @@ mod tests {
         );
     }
 
+    /// Checks that case and surrounding whitespace in the machine GUID do not change
+    /// the hash.
     #[test]
     fn spelling_of_guid_does_not_matter() {
         assert_eq!(
@@ -99,6 +103,7 @@ mod tests {
         );
     }
 
+    /// Checks that this machine yields a stable 64-character fingerprint hash.
     #[cfg(windows)]
     #[test]
     fn this_machine_has_a_fingerprint() {

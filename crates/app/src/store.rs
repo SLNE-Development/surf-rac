@@ -408,6 +408,7 @@ mod tests {
         dir
     }
 
+    /// Returns the device id for the given number, panicking if it is out of range.
     fn id(n: u32) -> DeviceId {
         DeviceId::new(n).unwrap()
     }
@@ -421,6 +422,7 @@ mod tests {
         }
     }
 
+    /// Checks that opening a directory without a state file gives the default state.
     #[test]
     fn missing_file_gives_default_state() {
         let store = Store::open(temp_dir("missing"));
@@ -429,6 +431,8 @@ mod tests {
         assert!(store.state().account.is_none());
     }
 
+    /// Checks that the state survives a save and reload and that tokens, identity keys
+    /// and saved passwords never appear in the file in plain text.
     #[test]
     fn state_round_trips_and_secrets_are_not_stored_in_plain_text() {
         let dir = temp_dir("round");
@@ -460,6 +464,7 @@ mod tests {
         );
     }
 
+    /// Checks that an update through one store clone is visible through the other.
     #[test]
     fn clones_share_one_state() {
         let dir = temp_dir("shared");
@@ -471,6 +476,8 @@ mod tests {
         assert_eq!(store.state().installation, Some(installation()));
     }
 
+    /// Checks that a version 1 state file keeps only its server URL and settings and
+    /// drops the account, device and key data.
     #[test]
     fn old_version_file_keeps_server_and_settings_only() {
         let dir = temp_dir("old");
@@ -515,6 +522,8 @@ mod tests {
         assert!(reloaded.state().installation.is_none());
     }
 
+    /// Checks that a version 1 file with unreadable settings keeps the server URL and
+    /// falls back to default settings.
     #[test]
     fn old_version_file_with_unreadable_settings_keeps_the_server() {
         let dir = temp_dir("oldbad");
@@ -529,6 +538,7 @@ mod tests {
         assert_eq!(state.settings, Settings::default());
     }
 
+    /// Checks that a state file without a version starts from the default state.
     #[test]
     fn file_without_version_starts_fresh() {
         let dir = temp_dir("noversion");
@@ -540,6 +550,8 @@ mod tests {
         assert_eq!(Store::open(dir).state(), State::default());
     }
 
+    /// Checks that an unparseable state file is renamed aside and the default state is
+    /// used.
     #[test]
     fn corrupt_file_is_moved_aside() {
         let dir = temp_dir("corrupt");
@@ -549,6 +561,8 @@ mod tests {
         assert!(dir.join("state.json.bad").exists());
     }
 
+    /// Checks that secrets which cannot be decrypted are dropped while the rest of the
+    /// state is kept.
     #[test]
     fn undecryptable_secrets_are_dropped() {
         let dir = temp_dir("foreign");
@@ -577,6 +591,8 @@ mod tests {
         assert!(store.state().settings.unattended);
     }
 
+    /// Checks that forgetting the server drops the installation, account, known keys
+    /// and saved passwords but keeps the settings.
     #[test]
     fn forgetting_the_server_drops_everything_bound_to_it() {
         let mut state = State {
@@ -601,6 +617,7 @@ mod tests {
         assert!(state.settings.unattended);
     }
 
+    /// Checks that the debug output of secrets and of the whole state is redacted.
     #[test]
     fn secret_debug_is_redacted() {
         assert_eq!(format!("{:?}", Secret::new("hunter22")), "Secret(..)");

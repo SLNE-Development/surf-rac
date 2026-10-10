@@ -277,6 +277,8 @@ mod tests {
         );
     }
 
+    /// Checks that a received password is correct only against its own hash, wrong
+    /// without a stored hash, and unreadable when it could not be opened.
     #[test]
     fn received_passwords_are_checked_against_the_hash() {
         let hash = hash_password("hunter22").unwrap();
@@ -292,6 +294,8 @@ mod tests {
         assert_eq!(check_password(None, Some(&hash)), PasswordCheck::Unreadable);
     }
 
+    /// Checks that a password hash verifies only the password it was made from and
+    /// that a malformed hash verifies nothing.
     #[test]
     fn hash_verifies_only_the_right_password() {
         let hash = hash_password("hunter22").unwrap();
@@ -300,6 +304,8 @@ mod tests {
         assert!(!verify_password("hunter22", "not a hash"));
     }
 
+    /// Checks that password access is available only when it is switched on, a hash is
+    /// set and the host is not locked out.
     #[test]
     fn password_access_follows_toggle_hash_and_lockout() {
         assert!(password_access_available(true, true, false));
@@ -308,6 +314,8 @@ mod tests {
         assert!(!password_access_available(true, true, true));
     }
 
+    /// Checks the host's decision for each password check result, with password access
+    /// on and off and while locked out.
     #[test]
     fn decisions() {
         let now = Instant::now();
@@ -334,6 +342,8 @@ mod tests {
         );
     }
 
+    /// Checks that failures older than the lockout window no longer count towards a
+    /// lockout.
     #[test]
     fn failures_expire_fifteen_minutes_after_they_were_recorded() {
         let mut lockout = HostLockout::default();
@@ -351,6 +361,8 @@ mod tests {
         assert!(lockout.is_locked(start + LOCKOUT));
     }
 
+    /// Checks that five failures within the window lock the host for fifteen minutes
+    /// from the last failure.
     #[test]
     fn five_failures_within_the_window_lock_for_fifteen_minutes() {
         let mut lockout = HostLockout::default();
@@ -363,6 +375,8 @@ mod tests {
         assert!(!lockout.is_locked(locked_at + LOCKOUT));
     }
 
+    /// Checks that five wrong passwords make password access unavailable until the
+    /// lockout expires.
     #[test]
     fn five_wrong_passwords_switch_password_access_off_until_expiry() {
         let now = Instant::now();
@@ -380,6 +394,9 @@ mod tests {
         assert!(available(&lockout, now + LOCKOUT));
     }
 
+    /// Checks that device names lose control and bidirectional characters, have their
+    /// whitespace collapsed, are cut to 64 characters and fall back to the device id
+    /// when nothing is left.
     #[test]
     fn device_names_are_cleaned_for_display() {
         let viewer = DeviceId::new(123_456_789).unwrap();

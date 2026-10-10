@@ -87,12 +87,15 @@ mod tests {
         }
     }
 
+    /// Checks that limited-range black and white convert to pure black and white.
     #[test]
     fn limited_range_black_and_white() {
         assert_all(&to_rgba(&i420(4, 2, 16, 128, 128)), [0, 0, 0]);
         assert_all(&to_rgba(&i420(4, 2, 235, 128, 128)), [255, 255, 255]);
     }
 
+    /// Checks that limited-range red converts to pure red in both the I420 and NV12
+    /// layouts.
     #[test]
     fn red_in_both_layouts() {
         // BT.601 limited-range red: Y 81, U 90, V 240.
@@ -100,6 +103,7 @@ mod tests {
         assert_all(&to_rgba(&nv12(4, 4, 81, 90, 240)), [255, 0, 0]);
     }
 
+    /// Checks that frames with odd dimensions convert every pixel in both layouts.
     #[test]
     fn odd_sizes_convert_every_pixel() {
         let rgba = to_rgba(&i420(5, 3, 235, 128, 128));
@@ -110,6 +114,7 @@ mod tests {
         assert_all(&rgba, [0, 0, 0]);
     }
 
+    /// Checks that a frame with too little data converts to an empty image.
     #[test]
     fn invalid_frame_gives_empty_image() {
         let mut frame = i420(4, 4, 16, 128, 128);

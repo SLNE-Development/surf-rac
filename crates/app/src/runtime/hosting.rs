@@ -718,6 +718,8 @@ impl Actor {
 mod tests {
     use super::*;
 
+    /// Checks that a viewer that has not joined expires at the end of the join window
+    /// and a joined viewer never does.
     #[test]
     fn unjoined_viewers_expire_after_the_join_window() {
         let accepted = Instant::now();

@@ -714,6 +714,7 @@ fn status_text(status: &ViewerStatus) -> String {
 mod tests {
     use super::*;
 
+    /// Checks that egui pointer buttons map to the matching protocol mouse buttons.
     #[test]
     fn every_pointer_button_maps() {
         assert_eq!(
@@ -726,6 +727,8 @@ mod tests {
         );
     }
 
+    /// Checks that the accept button's arm progress rises from zero to one over the
+    /// accept delay and stays at one after it.
     #[test]
     fn arm_progress_runs_from_zero_to_one_over_the_delay() {
         let shown = std::time::Instant::now();
@@ -735,6 +738,8 @@ mod tests {
         assert_eq!(arm_progress(shown, shown + ACCEPT_DELAY * 3), 1.0);
     }
 
+    /// Checks that the arm progress is zero when the current time is before the prompt
+    /// was shown.
     #[test]
     fn arm_progress_is_zero_when_the_clock_is_behind() {
         let now = std::time::Instant::now();
@@ -742,6 +747,8 @@ mod tests {
         assert_eq!(arm_progress(shown, now), 0.0);
     }
 
+    /// Checks that a prompt's headline is the contact alias or else the formatted
+    /// device id.
     #[test]
     fn headline_is_the_contact_alias_or_the_formatted_id() {
         let id = DeviceId::new(123_456_789).unwrap();
@@ -749,6 +756,8 @@ mod tests {
         assert_eq!(prompt_headline(None, id), format_id(id));
     }
 
+    /// Checks that every password note except none gets a callout with the matching
+    /// tone.
     #[test]
     fn every_password_note_but_none_gets_a_callout() {
         assert!(note_callout(PromptNote::None).is_none());
@@ -763,6 +772,7 @@ mod tests {
         assert_eq!(note_callout(PromptNote::LockedOut).unwrap().0, Tone::Warn);
     }
 
+    /// Checks that the accept button is armed only once the accept delay has passed.
     #[test]
     fn accept_is_armed_only_after_the_delay() {
         let shown = std::time::Instant::now();
@@ -771,6 +781,8 @@ mod tests {
         assert!(accept_armed(shown, shown + ACCEPT_DELAY));
     }
 
+    /// Checks that pointer input over foreground and tooltip layers is not forwarded to
+    /// the session.
     #[test]
     fn clicks_on_popups_are_not_forwarded() {
         assert!(!pointer_blocked(None));
@@ -779,6 +791,8 @@ mod tests {
         assert!(pointer_blocked(Some(egui::Order::Tooltip)));
     }
 
+    /// Checks the input indicator tone for each combination of grants, lock and
+    /// pointing.
     #[test]
     fn input_tone_follows_the_control_level() {
         let view = |pointer, keyboard, locked| view_with(pointer, keyboard, locked, true);
@@ -883,6 +897,7 @@ mod tests {
         ));
     }
 
+    /// Checks that monitor labels are numbered from one and include the monitor name.
     #[test]
     fn monitors_are_numbered_from_one() {
         assert_eq!(monitor_label(0, "DELL"), "Screen 1 (DELL)");

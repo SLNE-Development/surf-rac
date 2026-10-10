@@ -123,6 +123,7 @@ pub fn unprotect(_data: &[u8]) -> Result<Vec<u8>, DpapiError> {
 mod tests {
     use super::*;
 
+    /// Checks that protected data differs from the input and unprotects back to it.
     #[test]
     fn round_trips() {
         let blob = protect(b"secret").unwrap();
@@ -130,6 +131,7 @@ mod tests {
         assert_eq!(unprotect(&blob).unwrap(), b"secret");
     }
 
+    /// Checks that an altered or arbitrary blob fails to unprotect.
     #[test]
     fn altered_blob_fails() {
         let mut blob = protect(b"secret").unwrap();

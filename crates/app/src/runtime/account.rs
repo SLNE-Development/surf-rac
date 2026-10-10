@@ -130,6 +130,8 @@ mod tests {
         }
     }
 
+    /// Checks that a stray forbidden reply and other messages are skipped while
+    /// waiting for the linked reply.
     #[tokio::test]
     async fn stray_forbidden_does_not_answer_a_link() {
         let (_tx, mut replies) = source(vec![
@@ -145,6 +147,8 @@ mod tests {
         );
     }
 
+    /// Checks that waiting for the linked reply times out when only a forbidden reply
+    /// arrives.
     #[tokio::test(start_paused = true)]
     async fn link_without_linked_reply_times_out_even_after_forbidden() {
         let (_tx, mut replies) = source(vec![forbidden()]);
@@ -154,6 +158,8 @@ mod tests {
         );
     }
 
+    /// Checks that waiting for the linked reply fails as closed when the connection
+    /// ends.
     #[tokio::test]
     async fn link_fails_closed_when_the_connection_ends() {
         let (tx, mut replies) = source(vec![forbidden()]);

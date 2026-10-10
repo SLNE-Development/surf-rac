@@ -596,6 +596,7 @@ pub(super) fn dialog<R>(
 mod tests {
     use super::*;
 
+    /// Checks that initials are the uppercased first letters of the first two words.
     #[test]
     fn initials_take_the_first_letters_of_two_words() {
         assert_eq!(initials("Build server"), "BS");
@@ -603,6 +604,8 @@ mod tests {
         assert_eq!(initials("mia"), "M");
     }
 
+    /// Checks that blank names get a question mark and that initials keep whole
+    /// characters, including emoji and accented letters.
     #[test]
     fn initials_fall_back_for_blank_names_and_keep_whole_characters() {
         assert_eq!(initials(""), "?");

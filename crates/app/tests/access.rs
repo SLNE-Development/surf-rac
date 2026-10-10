@@ -17,6 +17,8 @@ use surf_rac_session::SessionConfig;
 use surf_rac_session::host::{HostEvent, Password};
 use surf_rac_session::viewer::{RequestError, RequestOptions};
 
+/// Checks over a live session that the correct password is admitted and a wrong
+/// one leads to a prompt.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn correct_password_is_admitted_and_wrong_one_prompts(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -62,6 +64,7 @@ fn id(n: u32) -> DeviceId {
     DeviceId::new(100_000_000 + n).unwrap()
 }
 
+/// Checks that five failures lock the host and four do not.
 #[test]
 fn five_failures_from_five_viewers_lock_the_host() {
     let mut lockout = HostLockout::default();
@@ -74,6 +77,8 @@ fn five_failures_from_five_viewers_lock_the_host() {
     assert!(lockout.is_locked(now));
 }
 
+/// Checks that five wrong passwords from different viewers lock the host so that a
+/// correct password then only prompts.
 #[test]
 fn wrong_passwords_from_different_viewers_lock_and_refuse_the_right_one() {
     let mut lockout = HostLockout::default();
@@ -98,6 +103,8 @@ fn wrong_passwords_from_different_viewers_lock_and_refuse_the_right_one() {
     );
 }
 
+/// Checks that the lockout lasts fifteen minutes and a correct password is accepted
+/// once it ends.
 #[test]
 fn lock_ends_after_fifteen_minutes() {
     let mut lockout = HostLockout::default();
@@ -119,6 +126,8 @@ fn lock_ends_after_fifteen_minutes() {
     );
 }
 
+/// Checks that a request without a password still prompts for attended acceptance
+/// while the host is locked.
 #[test]
 fn attended_accept_works_while_locked() {
     let mut lockout = HostLockout::default();
@@ -137,6 +146,8 @@ fn attended_accept_works_while_locked() {
     );
 }
 
+/// Checks that a second request from a viewer with a pending prompt is denied
+/// without showing a second prompt.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn second_request_from_one_viewer_leaves_one_prompt_and_is_denied(pool: PgPool) {
     let env = TestEnv::start(pool).await;
@@ -174,6 +185,8 @@ async fn second_request_from_one_viewer_leaves_one_prompt_and_is_denied(pool: Pg
     host.deny(&session_id).await.unwrap();
 }
 
+/// Checks over live sessions that the fifth wrong password switches password access
+/// off and that it comes back once the lockout expires.
 #[sqlx::test(migrations = "../server/migrations")]
 async fn fifth_wrong_password_switches_password_access_off_until_the_lock_expires(pool: PgPool) {
     let env = TestEnv::start(pool).await;

@@ -10,7 +10,7 @@ use surf_rac_input::{Grants, InputHost, InputStatus};
 use surf_rac_protocol::DeviceId;
 use surf_rac_protocol::data::{Control, DataMessage};
 use surf_rac_session::SessionConfig;
-use surf_rac_session::host::{HostEvent, HostSession, Password};
+use surf_rac_session::host::{HostEvent, HostSession, Password, PauseError};
 use tokio::sync::{mpsc, watch};
 
 use super::actor::{Actor, Internal};
@@ -36,6 +36,8 @@ struct HostViewer {
     clipboard: bool,
     /// Whether it joined the room.
     joined: bool,
+    /// Whether its view is paused, which blocks its input and clipboard sync.
+    paused: bool,
     /// When it was accepted.
     accepted: Instant,
 }
@@ -127,10 +129,33 @@ fn join_viewer(
         device_name: String::new(),
         clipboard,
         joined: false,
+        paused: false,
         accepted: Instant::now(),
     });
     entry.joined = true;
     entry
+}
+
+/// Returns the banner text for a failed pause (`paused` true) or resume.
+///
+/// A failed pause still holds, because the video is then stopped for every
+/// viewer; a failed resume leaves the viewer without video.
+fn pause_failure_text(paused: bool, error: &PauseError) -> String {
+    if paused {
+        format!("Pausing the view failed, so video is stopped for everyone: {error}")
+    } else {
+        format!("Resuming the view failed: {error}")
+    }
+}
+
+/// Returns the viewers in `viewers` that the local clipboard is sent to:
+/// joined, syncing the clipboard and not paused.
+fn clipboard_targets(viewers: &BTreeMap<DeviceId, HostViewer>) -> Vec<DeviceId> {
+    viewers
+        .iter()
+        .filter(|(_, v)| v.joined && v.clipboard && !v.paused)
+        .map(|(id, _)| *id)
+        .collect()
 }
 
 impl Actor {
@@ -273,10 +298,12 @@ impl Actor {
                 };
                 host.route(&event);
                 let entry = join_viewer(&mut host.viewers, *viewer, remembered, clipboard);
+                entry.paused = host.session.is_view_paused(*viewer);
                 if let Some(input) = &host.input {
                     let label = access::ghost_label(alias.as_deref(), &entry.device_name, *viewer);
                     input.set_label(*viewer, label);
                     input.set_grants(*viewer, entry.grants);
+                    input.set_paused(*viewer, entry.paused);
                 }
             }
             HostEvent::ViewerLeft { viewer } => {
@@ -460,11 +487,13 @@ impl Actor {
         };
         match host.session.accept(session_id).await {
             Ok(()) => {
+                let paused = host.session.is_view_paused(viewer);
                 host.viewers.entry(viewer).or_insert(HostViewer {
                     grants,
                     device_name,
                     clipboard,
                     joined: false,
+                    paused,
                     accepted: Instant::now(),
                 });
             }
@@ -544,6 +573,48 @@ impl Actor {
         }
     }
 
+    /// Pauses or resumes the view of `viewer`: while paused it gets no video,
+    /// its input is neither injected nor shown and the clipboard is not sent
+    /// to it. Its grants are kept.
+    pub(super) async fn pause_view(&mut self, viewer: DeviceId, paused: bool) {
+        let Some(host) = self.host.as_mut() else {
+            return;
+        };
+        let Some(v) = host.viewers.get_mut(&viewer) else {
+            return;
+        };
+        v.paused = paused;
+        if let Some(input) = &host.input {
+            input.set_paused(viewer, paused);
+        }
+        let result = host.session.pause_view(viewer, paused).await;
+        self.report_pause(paused, result);
+    }
+
+    /// Pauses or resumes the view of every viewer, including viewers that
+    /// join while the pause lasts.
+    pub(super) async fn pause_all(&mut self, paused: bool) {
+        let Some(host) = self.host.as_mut() else {
+            return;
+        };
+        for (viewer, v) in &mut host.viewers {
+            v.paused = paused;
+            if let Some(input) = &host.input {
+                input.set_paused(*viewer, paused);
+            }
+        }
+        let result = host.session.pause_all(paused).await;
+        self.report_pause(paused, result);
+    }
+
+    /// Shows a banner when pausing (`paused` true) or resuming a view failed.
+    fn report_pause(&mut self, paused: bool, result: Result<(), PauseError>) {
+        if let Err(e) = result {
+            tracing::warn!(paused, error = %e, "view pause failed");
+            self.banner = Some(pause_failure_text(paused, &e));
+        }
+    }
+
     /// Turns clipboard sync with `viewer` on or off.
     pub(super) fn set_host_clipboard(&mut self, viewer: DeviceId, on: bool) {
         if let Some(v) = self.host.as_mut().and_then(|h| h.viewers.get_mut(&viewer)) {
@@ -618,13 +689,7 @@ impl Actor {
     pub(super) fn host_clipboard_targets(&self) -> Vec<DeviceId> {
         self.host
             .as_ref()
-            .map(|h| {
-                h.viewers
-                    .iter()
-                    .filter(|(_, v)| v.joined && v.clipboard)
-                    .map(|(id, _)| *id)
-                    .collect()
-            })
+            .map(|h| clipboard_targets(&h.viewers))
             .unwrap_or_default()
     }
 
@@ -641,6 +706,7 @@ impl Actor {
                         name: self.name_of(*id),
                         grants: v.grants,
                         clipboard: v.clipboard,
+                        paused: v.paused,
                     })
                     .collect()
             })
@@ -681,6 +747,35 @@ mod tests {
         assert_eq!(entry.grants, revoked);
         assert!(entry.clipboard);
         assert!(entry.joined);
+    }
+
+    /// The clipboard is sent only to joined viewers that sync it and whose
+    /// view is not paused; resuming a viewer sends it again.
+    #[test]
+    fn paused_viewers_get_no_clipboard() {
+        let mut viewers = BTreeMap::new();
+        join_viewer(&mut viewers, id(1), None, true);
+        join_viewer(&mut viewers, id(2), None, true).paused = true;
+        join_viewer(&mut viewers, id(3), None, false);
+        assert_eq!(clipboard_targets(&viewers), [id(1)]);
+        viewers.get_mut(&id(2)).unwrap().paused = false;
+        assert_eq!(clipboard_targets(&viewers), [id(1), id(2)]);
+    }
+
+    /// A failed pause says the video is stopped for everyone; a failed resume says so.
+    #[test]
+    fn pause_failures_are_explained() {
+        let error = PauseError::Permissions("closed".into());
+        assert!(pause_failure_text(true, &error).starts_with("Pausing the view failed"));
+        assert!(pause_failure_text(false, &error).starts_with("Resuming the view failed"));
+    }
+
+    /// A viewer that joins again keeps its paused view.
+    #[test]
+    fn rejoining_viewer_stays_paused() {
+        let mut viewers = BTreeMap::new();
+        join_viewer(&mut viewers, id(1), None, true).paused = true;
+        assert!(join_viewer(&mut viewers, id(1), None, true).paused);
     }
 
     /// A viewer that joins without an entry gets the remembered grants, or

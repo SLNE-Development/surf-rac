@@ -184,7 +184,7 @@ impl ClientApp {
         }
         let builder = egui::ViewportBuilder::default()
             .with_title("Active connections - surf-rac")
-            .with_inner_size([540.0, 340.0])
+            .with_inner_size([660.0, 340.0])
             .with_always_on_top();
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("connections"),
@@ -285,6 +285,13 @@ impl ClientApp {
                     grants: Grants { ..grants },
                 });
             }
+            let mut paused = v.paused;
+            if widgets::toggle_chip(ui, &mut paused, icons::PAUSE, "Pause view").changed() {
+                self.send(Command::PauseView {
+                    viewer: v.id,
+                    paused,
+                });
+            }
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                 widgets::name_and_id(ui, &v.name, &format_id(v.id));
             });
@@ -325,6 +332,11 @@ impl ClientApp {
                     .clicked()
                 {
                     self.send(Command::DisconnectAll);
+                }
+                let resume = all_paused(self.snap.all_paused, &self.snap.host_viewers);
+                let label = if resume { "Resume all" } else { "Pause all" };
+                if ui.add(widgets::btn(ui, Kind::Ghost, None, label)).clicked() {
+                    self.send(Command::PauseAll(!resume));
                 }
             });
         });
@@ -630,6 +642,12 @@ fn quality_label(mode: QualityMode) -> &'static str {
     }
 }
 
+/// Returns whether the view counts as paused for everyone: the host paused
+/// all viewers, or every connected viewer is paused.
+fn all_paused(all: bool, viewers: &[HostViewerView]) -> bool {
+    all || (!viewers.is_empty() && viewers.iter().all(|v| v.paused))
+}
+
 /// Returns what the viewer may do, as shown in the toolbar.
 fn input_text(view: &ViewerView) -> &'static str {
     let input = view.input;
@@ -806,6 +824,33 @@ mod tests {
             clipboard: false,
             offer_forget: false,
         }
+    }
+
+    /// Returns a connected host viewer with offset `n` and the given pause state.
+    fn host_viewer(n: u32, paused: bool) -> HostViewerView {
+        HostViewerView {
+            id: DeviceId::new(100_000_000 + n).unwrap(),
+            name: format!("viewer {n}"),
+            grants: Grants::default(),
+            clipboard: false,
+            paused,
+        }
+    }
+
+    /// The footer offers Resume all once every viewer is paused or all were
+    /// paused at once, and Pause all otherwise.
+    #[test]
+    fn resume_all_once_everyone_is_paused() {
+        assert!(!all_paused(false, &[]));
+        assert!(all_paused(true, &[]));
+        assert!(!all_paused(
+            false,
+            &[host_viewer(1, true), host_viewer(2, false)]
+        ));
+        assert!(all_paused(
+            false,
+            &[host_viewer(1, true), host_viewer(2, true)]
+        ));
     }
 
     #[test]

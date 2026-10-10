@@ -146,6 +146,8 @@ enum Command {
     Left(DeviceId),
     /// The host changed a viewer's grants.
     Grants(DeviceId, Grants),
+    /// The host paused or resumed a viewer's view.
+    Paused(DeviceId, bool),
     /// The host named a viewer for its ghost pointer.
     Label(DeviceId, String),
     /// The host turned follow mode on or off.
@@ -254,6 +256,12 @@ impl InputHost {
     /// Sets what `viewer` may do; revoking releases what it holds.
     pub fn set_grants(&self, viewer: DeviceId, grants: Grants) {
         let _ = self.control.send(Command::Grants(viewer, grants));
+    }
+
+    /// Pauses or resumes `viewer`'s view: while paused none of its input is
+    /// injected or shown, and pausing releases what it holds. Its grants stay.
+    pub fn set_paused(&self, viewer: DeviceId, paused: bool) {
+        let _ = self.control.send(Command::Paused(viewer, paused));
     }
 
     /// Sets the name shown next to `viewer`'s ghost pointer until it leaves.
@@ -459,6 +467,7 @@ impl<P: Platform, S: Share> Runner<P, S> {
                 Vec::new()
             }
             Command::Grants(viewer, grants) => self.arbiter.set_grants(viewer, grants, now),
+            Command::Paused(viewer, paused) => self.arbiter.set_paused(viewer, paused, now),
             Command::Follow(on) => self.arbiter.set_follow(on, now),
             Command::Stop => return false,
         };

@@ -110,6 +110,15 @@ pub enum Command {
     },
     /// Turn follow mode on or off.
     SetFollow(bool),
+    /// Pause or resume the view of one connected viewer.
+    PauseView {
+        /// The viewer device.
+        viewer: DeviceId,
+        /// True to pause, false to resume.
+        paused: bool,
+    },
+    /// Pause or resume the view of every viewer, including viewers that join while paused.
+    PauseAll(bool),
     /// Turn clipboard sync with a connected viewer on or off.
     HostClipboard {
         /// The viewer device.
@@ -249,6 +258,8 @@ pub struct HostViewerView {
     pub grants: Grants,
     /// Whether the clipboard syncs with it.
     pub clipboard: bool,
+    /// Whether its view is paused.
+    pub paused: bool,
 }
 
 /// The newest decoded frame of a viewer session.
@@ -325,6 +336,8 @@ pub struct Snapshot {
     pub hosting: bool,
     /// Whether follow mode is on.
     pub follow: bool,
+    /// Whether the view is paused for every viewer, including viewers that join later.
+    pub all_paused: bool,
     /// Whether host input currently locks out remote input.
     pub input_locked: bool,
     /// A message for the user, such as an error.
@@ -354,6 +367,7 @@ impl Default for Snapshot {
             host_viewers: Vec::new(),
             hosting: false,
             follow: false,
+            all_paused: false,
             input_locked: false,
             banner: None,
             viewers: Vec::new(),

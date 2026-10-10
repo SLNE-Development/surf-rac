@@ -375,6 +375,8 @@ impl Actor {
             Command::Deny(session_id) => self.deny(&session_id).await,
             Command::SetGrants { viewer, grants } => self.set_grants(viewer, grants),
             Command::SetFollow(on) => self.set_follow(on),
+            Command::PauseView { viewer, paused } => self.pause_view(viewer, paused).await,
+            Command::PauseAll(paused) => self.pause_all(paused).await,
             Command::HostClipboard { viewer, on } => self.set_host_clipboard(viewer, on),
             Command::Disconnect(viewer) => self.disconnect(viewer).await,
             Command::DisconnectAll => self.disconnect_all().await,
@@ -1185,6 +1187,10 @@ impl Actor {
             host_viewers: self.host_viewer_views(),
             hosting: self.host.is_some(),
             follow: self.host.as_ref().is_some_and(|h| h.follow),
+            all_paused: self
+                .host
+                .as_ref()
+                .is_some_and(|h| h.session.is_all_paused()),
             input_locked: self.host.as_ref().is_some_and(|h| h.input_locked()),
             banner: self.banner.clone(),
             viewers: self

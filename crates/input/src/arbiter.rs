@@ -107,11 +107,13 @@ pub enum Action {
     SelectMonitor(u8),
 }
 
-/// A viewer's grants and ghost color slot.
+/// A viewer's grants, pause state and ghost color slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ViewerStatus {
-    /// What the viewer may do.
+    /// What the viewer may do while its view is not paused.
     pub grants: Grants,
+    /// Whether its view is paused, which blocks all of its input.
+    pub paused: bool,
     /// The color slot of its ghost pointer.
     pub slot: u8,
 }
@@ -134,6 +136,8 @@ pub struct InputStatus {
 struct Viewer {
     /// What the viewer may do.
     grants: Grants,
+    /// Whether its view is paused; its input is then neither injected nor shown.
+    paused: bool,
     /// Ghost color slot.
     slot: u8,
     /// The input state last sent to the viewer.
@@ -185,6 +189,7 @@ impl Arbiter {
                 viewer,
                 Viewer {
                     grants: Grants::default(),
+                    paused: false,
                     slot,
                     sent: None,
                     ghost_until: None,
@@ -234,6 +239,31 @@ impl Arbiter {
             old.keyboard && !grants.keyboard,
             old.controls_pointer() && !grants.controls_pointer(),
         ));
+        out.extend(self.sync(now));
+        out
+    }
+
+    /// Pauses or resumes `viewer`'s view without changing its grants.
+    ///
+    /// While paused, none of its input is injected or shown as a ghost;
+    /// pausing releases what it holds and hides its ghost at once.
+    pub fn set_paused(&mut self, viewer: DeviceId, paused: bool, now: Instant) -> Vec<Action> {
+        let Some(v) = self.viewers.get_mut(&viewer) else {
+            return Vec::new();
+        };
+        let was = std::mem::replace(&mut v.paused, paused);
+        let mut out = Vec::new();
+        if paused && !was {
+            if v.ghost_until.take().is_some() {
+                out.push(Action::Ghost {
+                    viewer,
+                    slot: v.slot,
+                    at: None,
+                    click: false,
+                });
+            }
+            out.extend(self.release_viewer(viewer, true, true));
+        }
         out.extend(self.sync(now));
         out
     }
@@ -294,12 +324,16 @@ impl Arbiter {
     /// screen state's monitors. Moves on unknown monitors, oversized key codes
     /// and input the viewer may not give are dropped. Without pointing, moves,
     /// clicks and scrolls are dropped. Moves and button presses the viewer may
-    /// not inject become ghost pointer moves and ghost clicks.
+    /// not inject become ghost pointer moves and ghost clicks. While the
+    /// viewer's view is paused its pointer, wheel and key input is dropped.
     pub fn message(&mut self, viewer: DeviceId, msg: &DataMessage, geometry: &[MonitorRect], now: Instant) -> Vec<Action> {
         let Some(v) = self.viewers.get(&viewer) else {
             self.invalid += 1;
             return Vec::new();
         };
+        if v.paused && !matches!(msg, DataMessage::Control(_)) {
+            return Vec::new();
+        }
         let grants = v.grants;
         let locked = self.locked(now);
         let pointer = grants.controls_pointer() && !locked;
@@ -409,6 +443,7 @@ impl Arbiter {
                         id,
                         ViewerStatus {
                             grants: v.grants,
+                            paused: v.paused,
                             slot: v.slot,
                         },
                     )
@@ -576,8 +611,73 @@ mod tests {
         assert_eq!(a.viewer_joined(v(1), t0), [Action::Send(v(1), state(false, false))]);
         assert_eq!(a.viewer_joined(v(1), t0), []);
         let status = a.status(t0);
-        assert_eq!(status.viewers[&v(1)], ViewerStatus { grants: Grants::default(), slot: 0 });
+        assert_eq!(status.viewers[&v(1)], ViewerStatus { grants: Grants::default(), paused: false, slot: 0 });
         assert!(Grants::default().pointer && Grants::default().keyboard && Grants::default().pointing);
+    }
+
+    /// Pausing a viewer releases what it holds and hides its ghost, while
+    /// its grants stay as the host set them.
+    #[test]
+    fn pausing_releases_holds_and_hides_ghost() {
+        let (mut a, t0) = two();
+        let grants = Grants { pointer: false, keyboard: true, pointing: true };
+        a.set_grants(v(1), grants, t0);
+        a.message(v(1), &key(0x1D, true), &geo(), t0);
+        a.message(v(1), &mv(5, 5, 0), &geo(), t0);
+        assert_eq!(
+            a.set_paused(v(1), true, t0),
+            [
+                Action::Ghost { viewer: v(1), slot: 0, at: None, click: false },
+                Action::Key { code: 0x1D, down: false },
+            ]
+        );
+        assert_eq!(a.set_paused(v(1), true, t0), []);
+        let status = a.status(t0);
+        assert_eq!(status.viewers[&v(1)], ViewerStatus { grants, paused: true, slot: 0 });
+        assert!(!status.viewers[&v(2)].paused);
+    }
+
+    /// A paused viewer's moves, clicks, scrolls and keys are neither injected
+    /// nor shown, while another viewer's input still is.
+    #[test]
+    fn paused_viewer_input_is_dropped() {
+        let (mut a, t0) = two();
+        a.set_paused(v(1), true, t0);
+        assert_eq!(a.message(v(1), &mv(5, 5, 0), &geo(), t0), []);
+        assert_eq!(a.message(v(1), &button(MouseButton::Left, true), &geo(), t0), []);
+        assert_eq!(a.message(v(1), &DataMessage::Wheel { dx: 0, dy: 120 }, &geo(), t0), []);
+        assert_eq!(a.message(v(1), &key(0x1E, true), &geo(), t0), []);
+        assert_eq!(a.message(v(2), &key(0x1E, true), &geo(), t0), [Action::Key { code: 0x1E, down: true }]);
+        assert_eq!(a.take_invalid(), 0);
+    }
+
+    /// A paused viewer without the pointer grant gets no ghost pointer or ghost click.
+    #[test]
+    fn paused_viewer_gets_no_ghost() {
+        let (mut a, t0) = two();
+        a.set_grants(v(1), Grants { pointer: false, keyboard: false, pointing: true }, t0);
+        a.message(v(1), &mv(5, 5, 0), &geo(), t0);
+        a.set_paused(v(1), true, t0);
+        assert_eq!(a.message(v(1), &mv(6, 6, 0), &geo(), t0), []);
+        assert_eq!(a.message(v(1), &button(MouseButton::Left, true), &geo(), t0), []);
+    }
+
+    /// Resuming a viewer injects its input again under its unchanged grants.
+    #[test]
+    fn resuming_injects_again() {
+        let (mut a, t0) = two();
+        a.set_paused(v(1), true, t0);
+        assert_eq!(a.set_paused(v(1), false, t0), []);
+        assert_eq!(a.message(v(1), &mv(5, 5, 0), &geo(), t0), [Action::Move { x: 5, y: 5 }]);
+        assert_eq!(a.message(v(1), &key(0x1E, true), &geo(), t0), [Action::Key { code: 0x1E, down: true }]);
+    }
+
+    /// Pausing a viewer that is not connected does nothing.
+    #[test]
+    fn pausing_unknown_viewer_does_nothing() {
+        let (mut a, t0) = two();
+        assert_eq!(a.set_paused(v(9), true, t0), []);
+        assert!(!a.status(t0).viewers.contains_key(&v(9)));
     }
 
     /// Returns grants with clicks and keyboard on and pointing off.

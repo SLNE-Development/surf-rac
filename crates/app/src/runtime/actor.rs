@@ -111,6 +111,8 @@ struct Viewing {
     clipboard: bool,
     /// Whether a saved password was refused.
     offer_forget: bool,
+    /// Whether the host paused the view.
+    paused: bool,
 }
 
 /// The clipboard of this machine, when it can be opened.
@@ -994,6 +996,7 @@ impl Actor {
                 input: InputState::default(),
                 clipboard: self.store.state().settings.clipboard_default,
                 offer_forget: false,
+                paused: false,
             },
         );
         let known = Arc::clone(&self.known);
@@ -1074,6 +1077,10 @@ impl Actor {
                 viewing.status = ViewerStatus::Ended(end_text(reason));
                 viewing.session = None;
                 viewing.input = InputState::default();
+                viewing.paused = false;
+            }
+            ViewerEvent::DataReceived(DataMessage::Control(Control::ViewPaused { paused })) => {
+                viewing.paused = paused
             }
             ViewerEvent::DataReceived(DataMessage::Control(Control::ScreenState(state))) => {
                 viewing.screen = Some(state)
@@ -1206,6 +1213,7 @@ impl Actor {
                     input: v.input,
                     clipboard: v.clipboard,
                     offer_forget: v.offer_forget,
+                    paused: v.paused,
                 })
                 .collect(),
             settings,
@@ -1222,8 +1230,9 @@ impl Actor {
 ///
 /// When the session ends, the frame is dropped before the end is reported, so
 /// the host's picture is neither drawn nor held in memory afterwards, and no
-/// later frame can replace it. Returns once the session ended or the actor is
-/// gone.
+/// later frame can replace it. When the host pauses the view, the frame is
+/// dropped before the pause is reported and frames are ignored until the host
+/// resumes it. Returns once the session ended or the actor is gone.
 async fn pump_viewer_events(
     session: u64,
     mut events: mpsc::Receiver<ViewerEvent>,
@@ -1232,8 +1241,10 @@ async fn pump_viewer_events(
     repaint: Repaint,
 ) {
     let mut seq = 0;
+    let mut paused = false;
     while let Some(event) = events.recv().await {
         match event {
+            ViewerEvent::VideoFrame(_) if paused => {}
             ViewerEvent::VideoFrame(f) => {
                 let rgba = yuv::to_rgba(&f);
                 if rgba.is_empty() {
@@ -1252,6 +1263,18 @@ async fn pump_viewer_events(
                 *lock(&frame) = None;
                 let _ = tx.send(Internal::Viewer(session, event));
                 return;
+            }
+            ViewerEvent::DataReceived(DataMessage::Control(Control::ViewPaused {
+                paused: now,
+            })) => {
+                paused = now;
+                if paused {
+                    *lock(&frame) = None;
+                }
+                repaint();
+                if tx.send(Internal::Viewer(session, event)).is_err() {
+                    return;
+                }
             }
             event => {
                 if tx.send(Internal::Viewer(session, event)).is_err() {
@@ -1423,5 +1446,66 @@ mod tests {
             Ok(Internal::Viewer(7, ViewerEvent::Ended { .. }))
         ));
         assert!(internal.try_recv().is_err());
+    }
+
+    /// Returns a 2x2 I420 frame.
+    fn tiny_frame() -> surf_rac_session::Frame {
+        surf_rac_session::Frame {
+            width: 2,
+            height: 2,
+            timestamp_us: 0,
+            format: surf_rac_session::PixelFormat::I420,
+            data: vec![128; 6],
+        }
+    }
+
+    /// A paused view drops the stored frame before the pause is reported and
+    /// ignores frames until the view is resumed; frames then show again.
+    #[tokio::test]
+    async fn paused_view_drops_and_ignores_frames_until_resumed() {
+        let (events_tx, events) = mpsc::channel(8);
+        let (tx, mut internal) = mpsc::unbounded_channel();
+        let frame = Arc::new(Mutex::new(Some(FrameImage {
+            width: 1,
+            height: 1,
+            rgba: Arc::new(vec![1, 2, 3, 4]),
+            seq: 1,
+        })));
+        let pause = |paused| {
+            ViewerEvent::DataReceived(DataMessage::Control(Control::ViewPaused { paused }))
+        };
+        let pump = tokio::spawn(pump_viewer_events(
+            3,
+            events,
+            Arc::clone(&frame),
+            tx,
+            Arc::new(|| {}),
+        ));
+        events_tx.send(pause(true)).await.unwrap();
+        events_tx
+            .send(ViewerEvent::VideoFrame(tiny_frame()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            internal.recv().await,
+            Some(Internal::Viewer(3, ViewerEvent::DataReceived(_)))
+        ));
+        events_tx.send(ViewerEvent::Connected).await.unwrap();
+        assert!(matches!(
+            internal.recv().await,
+            Some(Internal::Viewer(3, ViewerEvent::Connected))
+        ));
+        assert!(frame.lock().unwrap().is_none());
+        events_tx.send(pause(false)).await.unwrap();
+        events_tx
+            .send(ViewerEvent::VideoFrame(tiny_frame()))
+            .await
+            .unwrap();
+        events_tx.send(ViewerEvent::Connected).await.unwrap();
+        internal.recv().await;
+        internal.recv().await;
+        assert_eq!(frame.lock().unwrap().as_ref().map(|f| f.seq), Some(1));
+        drop(events_tx);
+        pump.await.unwrap();
     }
 }

@@ -309,6 +309,8 @@ pub struct ViewerView {
     pub clipboard: bool,
     /// Whether a saved password was refused, so the UI offers to forget it.
     pub offer_forget: bool,
+    /// Whether the host paused the view; no picture is kept while it is.
+    pub paused: bool,
 }
 
 /// Everything the UI draws, as of the runtime's last change.

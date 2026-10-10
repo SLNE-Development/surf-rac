@@ -380,11 +380,12 @@ impl ClientApp {
             .show(ui, |ui| {
                 let area = ui.max_rect();
                 let frame = view.frame.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let frame = frame.filter(|_| !view.paused);
                 let Some(frame) = frame else {
                     state.picture = None;
                     state.texture = None;
                     ui.centered_and_justified(|ui| {
-                        ui.label(RichText::new(status_text(&view.status)).color(p.muted));
+                        ui.label(RichText::new(picture_text(view)).color(p.muted));
                     });
                     return;
                 };
@@ -686,6 +687,19 @@ fn input_tone(view: &ViewerView) -> Tone {
     }
 }
 
+/// Returns the text shown in place of the picture: the pause notice while
+/// the host paused the view of a connected session, otherwise the status.
+fn picture_text(view: &ViewerView) -> String {
+    if view.paused && matches!(view.status, ViewerStatus::Connected) {
+        PAUSED_TEXT.into()
+    } else {
+        status_text(&view.status)
+    }
+}
+
+/// Text shown in place of the picture while the host paused the view.
+const PAUSED_TEXT: &str = "The host paused the view";
+
 /// Returns the text shown for a session's status.
 fn status_text(status: &ViewerStatus) -> String {
     match status {
@@ -823,7 +837,23 @@ mod tests {
             },
             clipboard: false,
             offer_forget: false,
+            paused: false,
         }
+    }
+
+    /// A connected, paused session shows the pause notice in place of the
+    /// picture; other sessions show their status.
+    #[test]
+    fn paused_view_shows_the_pause_notice() {
+        let mut view = view_with(true, true, false, true);
+        assert_eq!(picture_text(&view), status_text(&ViewerStatus::Connected));
+        view.paused = true;
+        assert_eq!(picture_text(&view), PAUSED_TEXT);
+        view.status = ViewerStatus::Reconnecting;
+        assert_eq!(
+            picture_text(&view),
+            status_text(&ViewerStatus::Reconnecting)
+        );
     }
 
     /// Returns a connected host viewer with offset `n` and the given pause state.

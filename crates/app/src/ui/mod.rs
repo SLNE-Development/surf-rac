@@ -245,6 +245,7 @@ mod tests {
             },
             clipboard: false,
             offer_forget: false,
+            paused: false,
         }
     }
 

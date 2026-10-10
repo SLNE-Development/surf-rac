@@ -394,6 +394,8 @@ fn decode_input_state_without_pointing(body: &[u8]) -> Option<DataMessage> {
 mod tests {
     use super::*;
 
+    /// Checks that every data message variant encodes with the current version byte
+    /// and decodes back to an equal message.
     #[test]
     fn round_trip_every_variant() {
         for m in [
@@ -427,6 +429,8 @@ mod tests {
         }
     }
 
+    /// Checks that the screen-state, monitor-selection and quality control messages
+    /// decode back to the messages they were encoded from.
     #[test]
     fn screen_control_round_trips() {
         let state = ScreenState {
@@ -465,6 +469,8 @@ mod tests {
         }
     }
 
+    /// Checks that the hangup and media-key control messages keep their fixed byte
+    /// encodings.
     #[test]
     fn existing_variant_bytes_unchanged() {
         assert_eq!(DataMessage::Control(Control::Hangup).encode(), [1, 4, 1]);
@@ -478,6 +484,8 @@ mod tests {
         );
     }
 
+    /// Checks that the input-state and follow control messages round-trip, use their
+    /// fixed byte encodings and travel reliably on the input topic.
     #[test]
     fn input_control_variants_round_trip_and_append() {
         let state = DataMessage::Control(Control::InputState(InputState {
@@ -553,11 +561,14 @@ mod tests {
         }
     }
 
+    /// Checks that the default quality mode is balanced.
     #[test]
     fn default_quality_mode_is_balanced() {
         assert_eq!(QualityMode::default(), QualityMode::Balanced);
     }
 
+    /// Checks that the debug output of a media-key message shows its index but not the
+    /// key bytes.
     #[test]
     fn debug_hides_media_key() {
         let msg = DataMessage::Control(Control::MediaKey {
@@ -569,6 +580,8 @@ mod tests {
         assert!(!text.contains("171"), "{text}");
     }
 
+    /// Checks that the debug output of a clipboard message shows its length but not its
+    /// contents.
     #[test]
     fn debug_hides_clipboard_contents() {
         let msg = DataMessage::Clipboard {
@@ -580,6 +593,8 @@ mod tests {
         assert!(!text.contains("104"), "{text}");
     }
 
+    /// Checks that decoding a message with an unknown version byte reports that
+    /// version.
     #[test]
     fn unknown_version_is_reported() {
         let mut b = DataMessage::Key {
@@ -594,6 +609,7 @@ mod tests {
         );
     }
 
+    /// Checks that empty input, an unknown tag and trailing bytes are all rejected.
     #[test]
     fn empty_and_garbage_fail() {
         assert_eq!(DataMessage::decode(&[]), Err(DecodeError::Empty));
@@ -610,6 +626,9 @@ mod tests {
         assert_eq!(DataMessage::decode(&trailing), Err(DecodeError::Malformed));
     }
 
+    /// Checks that pointer moves are unreliable on the pointer topic, clipboard
+    /// messages are reliable on the clipboard topic and keys and hangups use the input
+    /// topic.
     #[test]
     fn topics_and_reliability() {
         let pointer = DataMessage::PointerMove {

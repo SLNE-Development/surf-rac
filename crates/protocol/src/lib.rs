@@ -601,6 +601,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Checks that device ids outside the nine-digit range are rejected and the range
+    /// bounds are accepted.
     #[test]
     fn device_id_rejects_out_of_range() {
         assert!(DeviceId::new(99_999_999).is_none());
@@ -609,6 +611,7 @@ mod tests {
         assert_eq!(DeviceId::new(999_999_999).unwrap().get(), 999_999_999);
     }
 
+    /// Checks that a device id serializes to and parses from a JSON string.
     #[test]
     fn device_id_serializes_as_string() {
         let id = DeviceId::new(123_456_789).unwrap();
@@ -617,6 +620,8 @@ mod tests {
         assert_eq!(back, id);
     }
 
+    /// Checks that device ids with non-digit characters, a sign, a leading zero or a
+    /// JSON number are rejected.
     #[test]
     fn device_id_parse_rejects_non_digits() {
         assert!("12345678a".parse::<DeviceId>().is_err());
@@ -625,6 +630,8 @@ mod tests {
         assert!(serde_json::from_value::<DeviceId>(json!(123456789)).is_err());
     }
 
+    /// Checks that a client signal message parses into its fields and serializes back to
+    /// the same JSON.
     #[test]
     fn client_signal_round_trip() {
         let raw = json!({"type":"signal","to":"123456789","session_id":"s1","kind":"offer","data":{"sdp":"x"}});
@@ -646,6 +653,7 @@ mod tests {
         assert_eq!(serde_json::to_value(&msg).unwrap(), raw);
     }
 
+    /// Checks that the field-less turn request and ping client messages parse.
     #[test]
     fn unit_client_messages_parse() {
         let turn: ClientMessage = serde_json::from_value(json!({"type":"turn_request"})).unwrap();
@@ -683,6 +691,8 @@ mod tests {
         assert_eq!(serde_json::to_value(&msg).unwrap(), untagged);
     }
 
+    /// Checks that server error and replaced messages serialize with snake-case type
+    /// and code names and omit an absent session id.
     #[test]
     fn server_error_serializes_snake_case() {
         let msg = ServerMessage::Error {
@@ -700,6 +710,7 @@ mod tests {
         );
     }
 
+    /// Checks that an HTTP error body serializes its code in snake case.
     #[test]
     fn http_error_code_serializes_snake_case() {
         let body = ErrorBody {
@@ -712,12 +723,15 @@ mod tests {
         );
     }
 
+    /// Checks that client messages with an unknown or missing type fail to parse.
     #[test]
     fn unknown_type_fails() {
         assert!(serde_json::from_value::<ClientMessage>(json!({"type":"nope"})).is_err());
         assert!(serde_json::from_value::<ClientMessage>(json!({"to":"123456789"})).is_err());
     }
 
+    /// Checks that host and viewer token requests parse and a viewer token message
+    /// serializes with its type tag.
     #[test]
     fn token_messages_round_trip() {
         let req: ClientMessage =
@@ -738,6 +752,8 @@ mod tests {
         assert_eq!(serde_json::to_value(&t).unwrap()["type"], "viewer_token");
     }
 
+    /// Checks that presence info serializes to exactly the device id and the online
+    /// flag.
     #[test]
     fn presence_info_has_id_and_online_only() {
         let p = PresenceInfo {
@@ -750,12 +766,15 @@ mod tests {
         );
     }
 
+    /// Checks the protocol version number and the name of its HTTP header.
     #[test]
     fn protocol_version_is_two() {
         assert_eq!(PROTOCOL_VERSION, 2);
         assert_eq!(HEADER_PROTOCOL_VERSION, "x-protocol-version");
     }
 
+    /// Checks the exact domain separation tags for challenge, session and registration
+    /// signatures.
     #[test]
     fn domain_tags_are_fixed() {
         assert_eq!(CHALLENGE_DOMAIN, b"surf-rac/challenge/v1");
@@ -763,6 +782,8 @@ mod tests {
         assert_eq!(REGISTER_DOMAIN, b"surf-rac/register/v1");
     }
 
+    /// Checks that the registration message is the domain tag, the public key, the
+    /// fingerprint hash, a zero byte and the device name.
     #[test]
     fn register_message_layout_is_fixed() {
         let key = [7u8; 32];
@@ -775,6 +796,8 @@ mod tests {
         assert_eq!(msg, expected);
     }
 
+    /// Checks that a device registration request without a signature parses with an
+    /// empty signature and that the bad-signature code serializes in snake case.
     #[test]
     fn register_request_without_signature_reads_as_empty() {
         let missing: RegisterDeviceRequest = serde_json::from_value(json!({
@@ -788,6 +811,8 @@ mod tests {
         );
     }
 
+    /// Checks that a server challenge message parses and serializes back to the same
+    /// JSON.
     #[test]
     fn challenge_round_trip() {
         let raw = json!({"type":"challenge","nonce":"AAAA"});
@@ -801,6 +826,8 @@ mod tests {
         assert_eq!(serde_json::to_value(&msg).unwrap(), raw);
     }
 
+    /// Checks that a client authenticate message parses and serializes back to the same
+    /// JSON.
     #[test]
     fn authenticate_round_trip() {
         let raw = json!({"type":"authenticate","signature":"c2ln","fingerprint_hash":"ab"});
@@ -815,6 +842,8 @@ mod tests {
         assert_eq!(serde_json::to_value(&msg).unwrap(), raw);
     }
 
+    /// Checks that signed session requests round-trip in both the client and the
+    /// relayed server form and never carry a password field.
     #[test]
     fn signed_session_request_round_trip() {
         let raw = json!({"type":"session_request","to":"123456789","session_id":"s1",
@@ -850,6 +879,8 @@ mod tests {
         assert_eq!(serde_json::to_value(&msg).unwrap(), relayed);
     }
 
+    /// Checks that password challenge and session password messages round-trip in both
+    /// the client and the relayed server form.
     #[test]
     fn password_challenge_and_session_password_round_trip() {
         let challenge = json!({"type":"password_challenge","to":"123456789","session_id":"s1",
@@ -878,6 +909,8 @@ mod tests {
         assert_eq!(serde_json::to_value(&msg).unwrap(), relayed);
     }
 
+    /// Checks that accepted and denied session responses round-trip in the client form
+    /// and an accepted response round-trips in the relayed server form.
     #[test]
     fn signed_session_response_round_trip() {
         let accepted = json!({"type":"session_response","to":"123456789","session_id":"s1",
@@ -898,6 +931,8 @@ mod tests {
         assert_eq!(serde_json::to_value(&msg).unwrap(), relayed);
     }
 
+    /// Checks that the link-account client message and the linked server message
+    /// round-trip through JSON.
     #[test]
     fn link_account_messages_round_trip() {
         let raw = json!({"type":"link_account","token":"t"});
@@ -927,6 +962,8 @@ mod tests {
         );
     }
 
+    /// Checks that an account registration request serializes only the username and
+    /// password fields.
     #[test]
     fn register_request_has_no_invite() {
         let value = serde_json::to_value(RegisterRequest {
@@ -939,6 +976,8 @@ mod tests {
         assert_eq!(keys, ["password", "username"]);
     }
 
+    /// Checks that a device registration request parses its signature and protocol
+    /// version and that the response serializes the device id as a string.
     #[test]
     fn register_device_bodies_round_trip() {
         let req: RegisterDeviceRequest = serde_json::from_value(json!({
@@ -956,6 +995,8 @@ mod tests {
         );
     }
 
+    /// Checks the account deletion and device info bodies and the snake-case names of
+    /// the update, clone, signature and unknown-device error codes.
     #[test]
     fn account_bodies_and_new_error_codes() {
         let del: DeleteAccountRequest = serde_json::from_value(json!({"password":"pw"})).unwrap();

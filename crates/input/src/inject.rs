@@ -178,6 +178,8 @@ mod platform {
 mod tests {
     use super::*;
 
+    /// Checks that normalizing every pixel of common desktop widths yields a value in
+    /// range that maps back to the same pixel.
     #[test]
     fn normalize_lands_on_every_pixel() {
         for size in [1280, 1920, 3840, 5760, 7680] {
@@ -189,6 +191,8 @@ mod tests {
         }
     }
 
+    /// Checks that points outside the desktop are clamped to its edges and a zero-width
+    /// desktop normalizes to zero.
     #[test]
     fn normalize_clamps_outside_points() {
         assert_eq!(normalize(-50, 0, 1920), 0);

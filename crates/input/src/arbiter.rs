@@ -604,6 +604,8 @@ mod tests {
         (a, t0)
     }
 
+    /// Checks that a joining viewer is sent the input state once, a repeated join sends
+    /// nothing, and the viewer starts with every grant on.
     #[test]
     fn join_sends_state_and_grants_default_on() {
         let t0 = Instant::now();
@@ -794,6 +796,8 @@ mod tests {
         assert_eq!(a.message(v(2), &button(MouseButton::Left, true), &geo(), t0), []);
     }
 
+    /// Checks that pointer moves are offset onto the virtual desktop and clamped to the
+    /// target monitor's bounds.
     #[test]
     fn move_maps_to_desktop_and_clamps() {
         let (mut a, t0) = two();
@@ -802,6 +806,8 @@ mod tests {
         assert_eq!(a.message(v(1), &mv(99999, -1, 0), &geo(), t0), [Action::Move { x: 1919, y: 0 }]);
     }
 
+    /// Checks that a pointer move naming a monitor outside the current layout is
+    /// dropped.
     #[test]
     fn move_on_unknown_monitor_dropped() {
         let (mut a, t0) = two();
@@ -809,12 +815,15 @@ mod tests {
         assert_eq!(a.message(v(1), &mv(1, 1, 1), &geo()[..1], t0), []);
     }
 
+    /// Checks that input from a viewer that has not joined is dropped.
     #[test]
     fn unknown_viewer_dropped() {
         let (mut a, t0) = two();
         assert_eq!(a.message(v(9), &key(0x1E, true), &geo(), t0), []);
     }
 
+    /// Checks that a key held by two viewers is pressed once and released only when the
+    /// last holder lets go.
     #[test]
     fn shared_key_released_by_last_holder() {
         let (mut a, t0) = two();
@@ -829,6 +838,8 @@ mod tests {
         assert_eq!(a.message(v(2), &key(0x2A, false), &geo(), t0), []);
     }
 
+    /// Checks that a repeated key-down from the viewer already holding the key is
+    /// injected again as auto-repeat.
     #[test]
     fn repeat_down_from_same_viewer_injected() {
         let (mut a, t0) = two();
@@ -837,6 +848,8 @@ mod tests {
         assert_eq!(a.message(v(1), &key(0x11E, true), &geo(), t0), [down]);
     }
 
+    /// Checks that a leaving viewer's held keys and buttons are released and the viewer
+    /// is removed from the status.
     #[test]
     fn leave_releases_holds() {
         let (mut a, t0) = two();
@@ -853,6 +866,8 @@ mod tests {
         assert!(!a.status(t0).viewers.contains_key(&v(1)));
     }
 
+    /// Checks that revoking the pointer grant releases held buttons, turns moves and
+    /// clicks into ghost actions, drops wheel input and still lets keys through.
     #[test]
     fn revoke_pointer_releases_buttons_and_ghosts_moves() {
         let (mut a, t0) = two();
@@ -879,6 +894,8 @@ mod tests {
         assert_eq!(a.message(v(1), &key(0x10, false), &geo(), t0), [Action::Key { code: 0x10, down: false }]);
     }
 
+    /// Checks that revoking the keyboard grant releases held keys and blocks further
+    /// keys, and that changing grants of an unknown viewer does nothing.
     #[test]
     fn revoke_keyboard_releases_keys() {
         let (mut a, t0) = two();
@@ -889,6 +906,8 @@ mod tests {
         assert_eq!(a.set_grants(v(9), Grants::default(), t0), []);
     }
 
+    /// Checks that the first real move after the pointer grant returns hides the
+    /// viewer's ghost before moving the cursor.
     #[test]
     fn real_move_clears_ghost() {
         let (mut a, t0) = two();
@@ -901,6 +920,8 @@ mod tests {
         );
     }
 
+    /// Checks that host input releases held buttons, locks every viewer, swallows the
+    /// late button-up, blocks keys and turns moves into ghosts.
     #[test]
     fn lockout_releases_and_swallows_late_up() {
         let (mut a, t0) = two();
@@ -922,6 +943,8 @@ mod tests {
         );
     }
 
+    /// Checks that the lockout lasts exactly five seconds after the last host input and
+    /// that stale host input does not lock again.
     #[test]
     fn lockout_ends_after_exactly_five_seconds() {
         let (mut a, t0) = two();
@@ -956,6 +979,7 @@ mod tests {
         assert_eq!(a.viewer_left(v(1), t0), [Action::Ghost { viewer: v(1), slot: 0, at: None, click: false }]);
     }
 
+    /// Checks that wheel deltas are clamped and an all-zero wheel event is dropped.
     #[test]
     fn wheel_clamped() {
         let (mut a, t0) = two();
@@ -966,6 +990,8 @@ mod tests {
         assert_eq!(a.message(v(1), &DataMessage::Wheel { dx: 0, dy: 0 }, &geo(), t0), []);
     }
 
+    /// Checks that key codes above the maximum are dropped and counted as invalid, and
+    /// that taking the count resets it.
     #[test]
     fn oversized_key_dropped() {
         let (mut a, t0) = two();
@@ -976,6 +1002,8 @@ mod tests {
         assert_eq!(a.take_invalid(), 0);
     }
 
+    /// Checks that unknown viewers and unknown monitors count as invalid while a key
+    /// without the keyboard grant does not.
     #[test]
     fn invalid_messages_counted() {
         let (mut a, t0) = two();
@@ -986,6 +1014,7 @@ mod tests {
         assert_eq!(a.take_invalid(), 2, "a key without the grant is not invalid");
     }
 
+    /// Checks that the input state is sent only when the grants actually change.
     #[test]
     fn input_state_only_on_change() {
         let (mut a, t0) = two();
@@ -997,6 +1026,8 @@ mod tests {
         assert_eq!(a.tick(t0), []);
     }
 
+    /// Checks that enabling follow notifies every viewer and that host focus then
+    /// selects the monitor containing it, ignoring points outside every monitor.
     #[test]
     fn follow_selects_containing_monitor() {
         let (mut a, t0) = two();
@@ -1010,6 +1041,8 @@ mod tests {
         assert_eq!(a.host_focus(-1, 0, &geo(), 0), [], "outside every monitor");
     }
 
+    /// Checks that follow selects a monitor only when the focused monitor changes and
+    /// that re-enabling follow sends nothing.
     #[test]
     fn follow_only_on_change() {
         let (mut a, t0) = two();
@@ -1018,6 +1051,8 @@ mod tests {
         assert_eq!(a.set_follow(true, t0), []);
     }
 
+    /// Checks that degrading releases held keys, locks every viewer once and keeps input
+    /// locked past the lockout period.
     #[test]
     fn degraded_locks_and_releases() {
         let (mut a, t0) = two();
@@ -1037,6 +1072,7 @@ mod tests {
         assert!(a.status(later).locked);
     }
 
+    /// Checks that a new viewer gets the lowest free ghost slot.
     #[test]
     fn ghost_slots_reuse_lowest_free() {
         let (mut a, t0) = two();
@@ -1049,6 +1085,7 @@ mod tests {
         assert_eq!(status.viewers[&v(3)].slot, 2);
     }
 
+    /// Checks that control messages the arbiter does not handle produce no actions.
     #[test]
     fn other_controls_ignored() {
         let (mut a, t0) = two();

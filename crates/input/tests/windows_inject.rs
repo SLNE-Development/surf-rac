@@ -36,6 +36,8 @@ fn cursor() -> (i32, i32) {
     (p.x, p.y)
 }
 
+/// Checks that injected moves put the cursor exactly on the corners and an inner
+/// point of every monitor, then restores the cursor.
 #[test]
 #[ignore = "moves the real cursor"]
 fn injected_move_lands_on_pixel() {

@@ -29,6 +29,9 @@ fn wait_for(cond: impl Fn() -> bool) -> bool {
     true
 }
 
+/// Checks that injected keys and moves are seen by the hook as injected rather than
+/// host input, that extended keys are reported, and that dropping the UI thread
+/// marks the signals dead.
 #[test]
 #[ignore = "injects keys on the real desktop"]
 fn injected_key_is_not_host_input() {
@@ -49,6 +52,8 @@ fn injected_key_is_not_host_input() {
     assert!(!signals.alive());
 }
 
+/// Checks that the overlay window appears when ghosts are set and hides when they
+/// are cleared.
 #[test]
 #[ignore = "shows a window on the real desktop"]
 fn overlay_shows_and_hides() {
@@ -60,6 +65,8 @@ fn overlay_shows_and_hides() {
     assert!(wait_for(|| !ui.overlay_visible()));
 }
 
+/// Checks that a ghost drawn by the overlay shows up in a desktop capture in its
+/// palette colour.
 #[test]
 #[ignore = "captures the real desktop"]
 fn ghost_visible_in_capture() {

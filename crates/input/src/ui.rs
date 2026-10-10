@@ -806,6 +806,8 @@ mod tests {
         assert!(ghosts.pulsing(t0 + PULSE).is_empty());
     }
 
+    /// Checks that packing a position into one word and unpacking it returns the same
+    /// coordinates, including negative and extreme values.
     #[test]
     fn pack_round_trips_negative_positions() {
         for (x, y) in [(0, 0), (-1920, -100), (5119, 1439), (i32::MIN, i32::MAX)] {
@@ -813,6 +815,8 @@ mod tests {
         }
     }
 
+    /// Checks that fresh signals report nothing and not alive, and that recording host
+    /// input makes it observable.
     #[test]
     fn signals_report_nothing_until_observed() {
         let s = Signals::new(Instant::now());

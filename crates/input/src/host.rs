@@ -776,6 +776,8 @@ mod tests {
         h.outbox.take().into_iter().collect()
     }
 
+    /// Checks that host input observed before a viewer's button press blocks the press
+    /// and reports the lockout to viewers and the status.
     #[tokio::test(start_paused = true)]
     async fn host_input_before_message_blocks_it() {
         let mut h = harness();
@@ -791,6 +793,8 @@ mod tests {
         assert!(h.status.borrow().locked);
     }
 
+    /// Checks that the periodic tick ends the lockout and tells viewers input is
+    /// unlocked again.
     #[tokio::test(start_paused = true)]
     async fn lockout_ends_via_tick() {
         let mut h = harness();
@@ -805,6 +809,8 @@ mod tests {
         assert!(!h.status.borrow().locked);
     }
 
+    /// Checks that a join is applied before input that was queued ahead of it, so the
+    /// input is performed.
     #[tokio::test(start_paused = true)]
     async fn join_applies_before_queued_input() {
         let h = harness();
@@ -814,6 +820,8 @@ mod tests {
         assert_eq!(h.fake.0.lock().unwrap().performed, [Action::Key { code: 0x1E, down: true }]);
     }
 
+    /// Checks that viewers leaving through the task release their held buttons, hide
+    /// their ghosts and disappear from the status.
     #[tokio::test(start_paused = true)]
     async fn leave_through_task_releases_and_hides() {
         let h = harness();
@@ -833,6 +841,8 @@ mod tests {
         assert!(h.status.borrow().viewers.is_empty());
     }
 
+    /// Checks that a flood of follow toggles leaves one coalesced input state per
+    /// viewer reflecting the final setting.
     #[tokio::test(start_paused = true)]
     async fn follow_flood_is_bounded_and_coalesced() {
         let mut h = harness();
@@ -850,6 +860,8 @@ mod tests {
         assert!(sent.iter().all(|(_, s)| !s.follow));
     }
 
+    /// Checks that with follow on, host mouse movement onto another monitor selects
+    /// that monitor through the share handle.
     #[tokio::test(start_paused = true)]
     async fn follow_selects_through_share() {
         let h = harness();
@@ -866,6 +878,8 @@ mod tests {
         assert_eq!(*h.share.0.lock().unwrap(), [1]);
     }
 
+    /// Checks that a dead platform degrades the task, locks input and stops injecting
+    /// viewer input.
     #[tokio::test(start_paused = true)]
     async fn dead_platform_degrades() {
         let h = harness();
@@ -882,6 +896,8 @@ mod tests {
         assert!(h.fake.0.lock().unwrap().performed.is_empty());
     }
 
+    /// Checks that ghosts reach the platform, and that stopping the task hides them,
+    /// releases held keys, tells viewers input is locked and closes the outbox.
     #[tokio::test(start_paused = true)]
     async fn ghosts_reach_platform_and_stop_releases() {
         let mut h = harness();
@@ -926,6 +942,7 @@ mod tests {
         assert_eq!(h.fake.0.lock().unwrap().ghosts, [ghost("Grace", false)]);
     }
 
+    /// Checks that aborting the task still releases keys held by viewers.
     #[tokio::test(start_paused = true)]
     async fn cancelled_task_releases_holds() {
         let h = harness();
@@ -941,6 +958,8 @@ mod tests {
         );
     }
 
+    /// Checks that enqueueing into a full input channel fails and counts the dropped
+    /// message.
     #[tokio::test]
     async fn full_channel_drops() {
         let (tx, _rx) = mpsc::channel(INPUT_CAPACITY);

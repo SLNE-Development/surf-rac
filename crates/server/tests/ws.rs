@@ -14,6 +14,8 @@ use sqlx::PgPool;
 use surf_rac_protocol::DeviceId;
 use tokio_tungstenite::tungstenite::Message;
 
+/// A correctly signed challenge gets `hello`, registers the device as online and records its
+/// last-seen time.
 #[sqlx::test(migrations = "./migrations")]
 async fn valid_signature_gets_hello_and_device_is_online(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -28,6 +30,8 @@ async fn valid_signature_gets_hello_and_device_is_online(pool: PgPool) {
     assert!(seen.is_some());
 }
 
+/// A challenge signed with a different key is answered with `bad_signature`, the socket is
+/// closed and the device stays offline.
 #[sqlx::test(migrations = "./migrations")]
 async fn wrong_signature_closes_with_bad_signature(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -47,6 +51,8 @@ async fn wrong_signature_closes_with_bad_signature(pool: PgPool) {
     assert!(!app.state.hub.is_online(dev.id.parse().unwrap()));
 }
 
+/// A signature that is not base64 or has the wrong length is answered with `bad_signature` and
+/// the socket is closed.
 #[sqlx::test(migrations = "./migrations")]
 async fn malformed_signature_closes_with_bad_signature(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -63,6 +69,8 @@ async fn malformed_signature_closes_with_bad_signature(pool: PgPool) {
     }
 }
 
+/// A signature captured from one connection is refused with `bad_signature` on a new
+/// connection, which gets a fresh nonce, and the first connection stays usable.
 #[sqlx::test(migrations = "./migrations")]
 async fn replayed_signature_on_new_connection_is_rejected(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -83,6 +91,7 @@ async fn replayed_signature_on_new_connection_is_rejected(pool: PgPool) {
     assert_eq!(recv(&mut first).await["type"], "pong");
 }
 
+/// Each new connection for the same device receives a different challenge nonce.
 #[sqlx::test(migrations = "./migrations")]
 async fn successive_connections_get_different_nonces(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -95,6 +104,8 @@ async fn successive_connections_get_different_nonces(pool: PgPool) {
     }
 }
 
+/// An `authenticate` message after a completed handshake is answered with `bad_message` and the
+/// connection stays open.
 #[sqlx::test(migrations = "./migrations")]
 async fn authenticate_after_handshake_is_refused(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -109,6 +120,8 @@ async fn authenticate_after_handshake_is_refused(pool: PgPool) {
     assert_eq!(recv(&mut dev.ws).await["type"], "pong");
 }
 
+/// A valid signature with a fingerprint that differs from the registered one is answered with
+/// `clone_detected`, the socket is closed and the device stays offline.
 #[sqlx::test(migrations = "./migrations")]
 async fn mismatched_fingerprint_closes_with_clone_detected(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -127,6 +140,8 @@ async fn mismatched_fingerprint_closes_with_clone_detected(pool: PgPool) {
     assert!(!app.state.hub.is_online(dev.id.parse().unwrap()));
 }
 
+/// A connection that does not authenticate within the authentication timeout is closed and the
+/// device stays offline.
 #[sqlx::test(migrations = "./migrations")]
 async fn no_authenticate_in_time_closes_socket(pool: PgPool) {
     let app = common::spawn_with(pool, |s| {
@@ -139,12 +154,15 @@ async fn no_authenticate_in_time_closes_socket(pool: PgPool) {
     assert!(!app.state.hub.is_online(dev.id.parse().unwrap()));
 }
 
+/// The WebSocket authentication timeout defaults to ten seconds.
 #[sqlx::test(migrations = "./migrations")]
 async fn auth_timeout_defaults_to_ten_seconds(pool: PgPool) {
     let app = common::spawn(pool).await;
     assert_eq!(app.state.ws_auth_timeout, Duration::from_secs(10));
 }
 
+/// A first message other than `authenticate` is answered with `bad_message` and the socket is
+/// closed.
 #[sqlx::test(migrations = "./migrations")]
 async fn other_first_message_closes_with_bad_message(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -155,6 +173,8 @@ async fn other_first_message_closes_with_bad_message(pool: PgPool) {
     expect_closed(&mut ws).await;
 }
 
+/// An upgrade with a wrong, unparsable or missing protocol version is refused with status 426
+/// and `update_required`.
 #[sqlx::test(migrations = "./migrations")]
 async fn wrong_or_missing_protocol_version_is_update_required(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -170,6 +190,7 @@ async fn wrong_or_missing_protocol_version_is_update_required(pool: PgPool) {
     }
 }
 
+/// An upgrade with a missing or malformed device ID is refused with status 401.
 #[sqlx::test(migrations = "./migrations")]
 async fn missing_or_malformed_device_id_is_unauthorized(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -180,6 +201,7 @@ async fn missing_or_malformed_device_id_is_unauthorized(pool: PgPool) {
     }
 }
 
+/// An upgrade for an unregistered device ID is refused with status 404 and `unknown_device`.
 #[sqlx::test(migrations = "./migrations")]
 async fn unknown_device_is_not_found(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -196,6 +218,7 @@ async fn unknown_device_is_not_found(pool: PgPool) {
     );
 }
 
+/// An upgrade for a disabled device is refused with status 403 and `device_disabled`.
 #[sqlx::test(migrations = "./migrations")]
 async fn disabled_device_is_forbidden(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -217,6 +240,8 @@ async fn disabled_device_is_forbidden(pool: PgPool) {
     );
 }
 
+/// Offer, ICE, answer and hangup signals are relayed in both directions with the sender's
+/// device ID and their data intact.
 #[sqlx::test(migrations = "./migrations")]
 async fn offer_answer_ice_hangup_relayed(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -253,6 +278,7 @@ async fn offer_answer_ice_hangup_relayed(pool: PgPool) {
     }
 }
 
+/// A `from` field supplied by the sender is replaced with the sender's authenticated device ID.
 #[sqlx::test(migrations = "./migrations")]
 async fn from_is_stamped_by_server(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -267,6 +293,8 @@ async fn from_is_stamped_by_server(pool: PgPool) {
     assert_eq!(got["from"], a.id.as_str());
 }
 
+/// A signal to a registered but offline device, or to an unknown device, is answered with
+/// `target_offline`.
 #[sqlx::test(migrations = "./migrations")]
 async fn target_offline_error(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -284,6 +312,8 @@ async fn target_offline_error(pool: PgPool) {
     }
 }
 
+/// Invalid JSON, an unknown message type and an empty or overlong session ID are each answered
+/// with `bad_message`, and the connection stays open.
 #[sqlx::test(migrations = "./migrations")]
 async fn malformed_message_bad_message_and_socket_stays_open(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -302,6 +332,7 @@ async fn malformed_message_bad_message_and_socket_stays_open(pool: PgPool) {
     assert_eq!(recv(&mut a.ws).await, json!({"type":"pong"}));
 }
 
+/// A message larger than the frame limit closes the socket.
 #[sqlx::test(migrations = "./migrations")]
 async fn oversized_message_closes_socket(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -311,6 +342,8 @@ async fn oversized_message_closes_socket(pool: PgPool) {
     expect_closed(&mut a.ws).await;
 }
 
+/// A second authenticated connection for the same device gets `hello`, and the first is sent
+/// `replaced` and closed.
 #[sqlx::test(migrations = "./migrations")]
 async fn second_connection_replaces_first(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -321,6 +354,8 @@ async fn second_connection_replaces_first(pool: PgPool) {
     expect_closed(&mut first.ws).await;
 }
 
+/// A connection that fails authentication for a device does not replace that device's live
+/// connection.
 #[sqlx::test(migrations = "./migrations")]
 async fn unauthenticated_connection_does_not_replace_live_one(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -337,6 +372,8 @@ async fn unauthenticated_connection_does_not_replace_live_one(pool: PgPool) {
     assert_eq!(recv(&mut live.ws).await["type"], "pong");
 }
 
+/// Closing a replaced connection does not unregister the new one, which still receives signals
+/// for the device.
 #[sqlx::test(migrations = "./migrations")]
 async fn replaced_connection_cleanup_keeps_new(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -355,6 +392,8 @@ async fn replaced_connection_cleanup_keeps_new(pool: PgPool) {
     assert_eq!(got["from"], b.id.as_str());
 }
 
+/// Disabling a connected device sends it `device_disabled` and closes its socket on the next
+/// revalidation, while other devices stay connected.
 #[sqlx::test(migrations = "./migrations")]
 async fn disabled_device_closes_socket(pool: PgPool) {
     let app = common::spawn_with(pool, |s| {
@@ -375,6 +414,8 @@ async fn disabled_device_closes_socket(pool: PgPool) {
     assert_eq!(recv(&mut b.ws).await["type"], "pong");
 }
 
+/// Deleting a connected device closes its socket on the next revalidation without sending
+/// `device_disabled`.
 #[sqlx::test(migrations = "./migrations")]
 async fn deleted_device_closes_socket_without_device_disabled(pool: PgPool) {
     let app = common::spawn_with(pool, |s| {
@@ -401,6 +442,8 @@ async fn deleted_device_closes_socket_without_device_disabled(pool: PgPool) {
     }
 }
 
+/// A flood of messages gets an error from the message rate limit, and the connection accepts
+/// messages again after a short pause.
 #[sqlx::test(migrations = "./migrations")]
 async fn flood_gets_rate_limited(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -421,6 +464,7 @@ async fn flood_gets_rate_limited(pool: PgPool) {
     let _ = recv_type(&mut a.ws, "pong").await;
 }
 
+/// An idle authenticated connection receives no messages.
 #[sqlx::test(migrations = "./migrations")]
 async fn idle_socket_receives_nothing_unexpected(pool: PgPool) {
     let app = common::spawn(pool).await;

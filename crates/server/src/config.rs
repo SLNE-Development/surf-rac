@@ -167,6 +167,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    /// Returns a variable lookup function that answers from the given key/value pairs.
     fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let map: HashMap<String, String> = pairs
             .iter()
@@ -194,6 +195,7 @@ mod tests {
         v
     }
 
+    /// A missing `LIVEKIT_URL` or `LIVEKIT_API_KEY` is reported as a missing variable.
     #[test]
     fn config_requires_livekit() {
         let err = Config::from_vars(vars(&with("LIVEKIT_URL", None))).unwrap_err();
@@ -202,6 +204,7 @@ mod tests {
         assert!(matches!(err, ConfigError::Missing("LIVEKIT_API_KEY")));
     }
 
+    /// A LiveKit API secret that is too short is rejected as invalid.
     #[test]
     fn config_rejects_short_livekit_secret() {
         let err = Config::from_vars(vars(&with("LIVEKIT_API_SECRET", Some("short")))).unwrap_err();
@@ -214,6 +217,7 @@ mod tests {
         ));
     }
 
+    /// A LiveKit URL without a `ws`/`wss` scheme is rejected as invalid.
     #[test]
     fn config_rejects_non_ws_livekit_url() {
         let err = Config::from_vars(vars(&with("LIVEKIT_URL", Some("https://x")))).unwrap_err();
@@ -226,6 +230,7 @@ mod tests {
         ));
     }
 
+    /// The LiveKit URL, API key and API secret are read from their variables.
     #[test]
     fn config_reads_livekit() {
         let c = Config::from_vars(vars(BASE)).unwrap();
@@ -234,12 +239,14 @@ mod tests {
         assert_eq!(c.livekit_api_secret, "0123456789abcdef0123456789abcdef");
     }
 
+    /// A missing `DATABASE_URL` is reported as a missing variable.
     #[test]
     fn config_requires_database_url() {
         let err = Config::from_vars(vars(&with("DATABASE_URL", None))).unwrap_err();
         assert!(matches!(err, ConfigError::Missing("DATABASE_URL")));
     }
 
+    /// A TURN secret that is too short is rejected as invalid.
     #[test]
     fn config_rejects_short_turn_secret() {
         let mut v = BASE.to_vec();
@@ -254,6 +261,7 @@ mod tests {
         ));
     }
 
+    /// A `TURN_URLS` value with no non-empty entries is rejected as invalid.
     #[test]
     fn config_requires_turn_urls() {
         let mut v = BASE.to_vec();
@@ -268,6 +276,8 @@ mod tests {
         ));
     }
 
+    /// Without overrides the bind address, TURN TTL, forwarding trust and log format take their
+    /// defaults, and TURN URLs are split and trimmed.
     #[test]
     fn config_defaults_bind_and_ttl() {
         let c = Config::from_vars(vars(BASE)).unwrap();
@@ -278,6 +288,8 @@ mod tests {
         assert_eq!(c.turn_urls, vec!["turn:a:3478", "turns:b:5349"]);
     }
 
+    /// Bind address, TURN TTL, forwarding trust and log format are taken from their variables
+    /// when set.
     #[test]
     fn config_parses_overrides() {
         let mut v = BASE.to_vec();
@@ -292,6 +304,7 @@ mod tests {
         assert!(!c.log_json);
     }
 
+    /// An unparsable boolean for `TRUST_FORWARDED_FOR` and a zero TURN TTL are both rejected.
     #[test]
     fn config_rejects_bad_bool_and_ttl() {
         let mut v = BASE.to_vec();
@@ -302,6 +315,8 @@ mod tests {
         assert!(Config::from_vars(vars(&v)).is_err());
     }
 
+    /// The registration and session-request rate limits have defaults and are overridden by
+    /// their variables.
     #[test]
     fn config_defaults_and_parses_rate_limits() {
         let c = Config::from_vars(vars(BASE)).unwrap();
@@ -315,6 +330,8 @@ mod tests {
         assert_eq!(c.session_requests_per_minute, 3);
     }
 
+    /// Zero, negative and non-numeric rate limit values are rejected as invalid for the named
+    /// variable.
     #[test]
     fn config_rejects_bad_rate_limits() {
         for name in ["REGISTER_PER_HOUR", "SESSION_REQUESTS_PER_MINUTE"] {

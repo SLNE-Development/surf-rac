@@ -24,6 +24,8 @@ async fn error_code(res: reqwest::Response) -> String {
     body["error"].as_str().unwrap().to_owned()
 }
 
+/// Registration needs no invite, answers 201 with the username, and the new non-admin account can
+/// log in and receive a token with an expiry.
 #[sqlx::test(migrations = "./migrations")]
 async fn open_registration_then_login(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -44,6 +46,7 @@ async fn open_registration_then_login(pool: PgPool) {
     assert!(!is_admin);
 }
 
+/// A registration body that carries an `invite_code` field still succeeds.
 #[sqlx::test(migrations = "./migrations")]
 async fn registration_ignores_an_invite_code(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -58,6 +61,7 @@ async fn registration_ignores_an_invite_code(pool: PgPool) {
     assert_eq!(res.status(), 201);
 }
 
+/// Registering a taken username answers 409 `conflict`, while a different name still registers.
 #[sqlx::test(migrations = "./migrations")]
 async fn duplicate_username_conflict(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -68,6 +72,8 @@ async fn duplicate_username_conflict(pool: PgPool) {
     assert_eq!(app.register("bob", PASSWORD).await.status(), 201);
 }
 
+/// Two simultaneous registrations of one username yield exactly one 201 and one 409, leaving a
+/// single user.
 #[sqlx::test(migrations = "./migrations")]
 async fn concurrent_registration_of_one_name_single_winner(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -81,6 +87,8 @@ async fn concurrent_registration_of_one_name_single_winner(pool: PgPool) {
     assert_eq!(app.count("users", "true").await, 1);
 }
 
+/// Malformed usernames, too-short or too-long passwords and non-JSON bodies are rejected with 400
+/// `bad_request`, while valid edge-case names and a ten-character password register.
 #[sqlx::test(migrations = "./migrations")]
 async fn invalid_username_and_password_rejected(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -118,6 +126,7 @@ async fn invalid_username_and_password_rejected(pool: PgPool) {
     assert_eq!(app.count("users", "true").await, 4);
 }
 
+/// Logging in with a wrong password answers 401 with the message `invalid credentials`.
 #[sqlx::test(migrations = "./migrations")]
 async fn login_wrong_password_401(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -128,6 +137,8 @@ async fn login_wrong_password_401(pool: PgPool) {
     assert_eq!(body["message"], "invalid credentials");
 }
 
+/// Logging in as an unknown user answers 401 with the same `invalid credentials` message as a wrong
+/// password.
 #[sqlx::test(migrations = "./migrations")]
 async fn login_unknown_user_401(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -137,6 +148,8 @@ async fn login_unknown_user_401(pool: PgPool) {
     assert_eq!(body["message"], "invalid credentials");
 }
 
+/// Five failed logins from different addresses lock the account, so even the correct password then
+/// gets 429 `locked` with a Retry-After header.
 #[sqlx::test(migrations = "./migrations")]
 async fn account_locks_after_five_failures(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -154,6 +167,8 @@ async fn account_locks_after_five_failures(pool: PgPool) {
     assert_eq!(error_code(res).await, "locked");
 }
 
+/// Of ten simultaneous wrong-password logins at most five reach the password check; the rest are
+/// refused with 429.
 #[sqlx::test(migrations = "./migrations")]
 async fn concurrent_failures_cannot_exceed_lockout(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -177,6 +192,8 @@ async fn concurrent_failures_cannot_exceed_lockout(pool: PgPool) {
     );
 }
 
+/// Failed logins to a disabled account take comparable time to wrong-password logins, so timing
+/// does not reveal that the account is disabled.
 #[sqlx::test(migrations = "./migrations")]
 async fn disabled_account_login_costs_a_password_check(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -204,6 +221,8 @@ async fn disabled_account_login_costs_a_password_check(pool: PgPool) {
     );
 }
 
+/// Logins with syntactically invalid usernames fail with 401 without creating any lockout tracking
+/// entries.
 #[sqlx::test(migrations = "./migrations")]
 async fn invalid_username_login_is_not_tracked(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -215,6 +234,8 @@ async fn invalid_username_login_is_not_tracked(pool: PgPool) {
     assert_eq!(app.state.limits.unknown_lockout.tracked_keys(), 0);
 }
 
+/// An unknown username is locked after five failed logins with 429 `locked`, exactly like an
+/// existing account.
 #[sqlx::test(migrations = "./migrations")]
 async fn unknown_username_locks_like_a_real_one(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -227,6 +248,8 @@ async fn unknown_username_locks_like_a_real_one(pool: PgPool) {
     assert_eq!(error_code(res).await, "locked");
 }
 
+/// A successful login clears the failure count, so four failures before and four after it never
+/// lock the account.
 #[sqlx::test(migrations = "./migrations")]
 async fn successful_login_resets_failures(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -241,6 +264,8 @@ async fn successful_login_resets_failures(pool: PgPool) {
     assert_eq!(app.login("alice", PASSWORD, "10.2.0.4").await.status(), 200);
 }
 
+/// Ten logins from one address exhaust its rate limit and the next gets 429 `rate_limited`, while
+/// another address is unaffected.
 #[sqlx::test(migrations = "./migrations")]
 async fn login_ip_rate_limited(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -254,6 +279,8 @@ async fn login_ip_rate_limited(pool: PgPool) {
     assert_eq!(app.login("ghost", PASSWORD, "10.3.0.2").await.status(), 401);
 }
 
+/// Five registrations from one address exhaust its rate limit and the sixth gets 429
+/// `rate_limited`, while another address can still register.
 #[sqlx::test(migrations = "./migrations")]
 async fn register_ip_rate_limited(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -274,6 +301,7 @@ async fn register_ip_rate_limited(pool: PgPool) {
     );
 }
 
+/// Logging out answers 204 and the same token is refused with 401 afterwards.
 #[sqlx::test(migrations = "./migrations")]
 async fn logout_revokes_token(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -282,6 +310,7 @@ async fn logout_revokes_token(pool: PgPool) {
     assert_eq!(probe(&app, &token).await, 401);
 }
 
+/// An authenticated route answers 401 when the bearer token is missing or garbage.
 #[sqlx::test(migrations = "./migrations")]
 async fn missing_or_garbage_token_401(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -290,6 +319,7 @@ async fn missing_or_garbage_token_401(pool: PgPool) {
     assert_eq!(probe(&app, "garbage").await, 401);
 }
 
+/// A token whose session has expired is refused with 401.
 #[sqlx::test(migrations = "./migrations")]
 async fn expired_session_rejected(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -311,6 +341,7 @@ async fn days_left(app: &TestApp) -> f64 {
     .unwrap()
 }
 
+/// Authenticating with a session close to expiry extends it to about thirty days from now.
 #[sqlx::test(migrations = "./migrations")]
 async fn session_use_slides_expiry(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -327,6 +358,7 @@ async fn session_use_slides_expiry(pool: PgPool) {
     assert!(days > 29.9, "{days}");
 }
 
+/// Authenticating with a session extended less than an hour ago leaves its expiry unchanged.
 #[sqlx::test(migrations = "./migrations")]
 async fn session_used_within_the_hour_keeps_expiry(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -345,6 +377,7 @@ async fn session_used_within_the_hour_keeps_expiry(pool: PgPool) {
     assert!(days < 29.99, "{days}");
 }
 
+/// Disabling a user blocks new logins and invalidates the existing token.
 #[sqlx::test(migrations = "./migrations")]
 async fn disabled_user_cannot_login(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -357,6 +390,8 @@ async fn disabled_user_cannot_login(pool: PgPool) {
     assert_eq!(probe(&app, &token).await, 401);
 }
 
+/// Contacts can be stored for unregistered device IDs and are listed with their alias and online
+/// state.
 #[sqlx::test(migrations = "./migrations")]
 async fn contacts_may_name_unknown_ids(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -390,6 +425,8 @@ async fn contacts_may_name_unknown_ids(pool: PgPool) {
     );
 }
 
+/// Putting a contact again renames it per account, invalid IDs, empty aliases and bad tokens are
+/// refused, and deleting removes only the caller's contact.
 #[sqlx::test(migrations = "./migrations")]
 async fn contacts_rename_delete_and_validate(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -431,6 +468,8 @@ async fn contacts_rename_delete_and_validate(pool: PgPool) {
     assert_eq!(app.count("contacts", "true").await, 1);
 }
 
+/// The presence lookup reports an online device for a logged-in caller, refuses a caller without a
+/// token, and answers 404 for an unknown device.
 #[sqlx::test(migrations = "./migrations")]
 async fn presence_lookup_needs_a_session(pool: PgPool) {
     let app = common::spawn(pool).await;

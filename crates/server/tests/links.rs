@@ -9,6 +9,8 @@ use common::ws::{link, recv, send};
 use serde_json::json;
 use sqlx::PgPool;
 
+/// Linking an account over the device WebSocket answers `linked` with the username and lists the
+/// device online under My devices.
 #[sqlx::test(migrations = "./migrations")]
 async fn link_account_links_device_and_answers_linked(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -23,6 +25,7 @@ async fn link_account_links_device_and_answers_linked(pool: PgPool) {
     assert_eq!(listed[0]["online"], true);
 }
 
+/// Linking an already linked device again answers `linked` and leaves a single link.
 #[sqlx::test(migrations = "./migrations")]
 async fn link_twice_is_idempotent(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -33,6 +36,8 @@ async fn link_twice_is_idempotent(pool: PgPool) {
     assert_eq!(app.my_device_ids(&alice).await, vec![device.id.clone()]);
 }
 
+/// Linking with a garbage, empty or revoked token answers `forbidden`, creates no link and keeps
+/// the connection usable.
 #[sqlx::test(migrations = "./migrations")]
 async fn link_with_invalid_token_fails_without_linking(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -78,6 +83,7 @@ async fn unlink_account_is_not_a_message(pool: PgPool) {
     assert_eq!(app.my_device_ids(&alice).await, vec![device.id.clone()]);
 }
 
+/// A device linked to two accounts appears in the device list of both.
 #[sqlx::test(migrations = "./migrations")]
 async fn device_linked_to_two_accounts_is_listed_for_both(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -89,6 +95,8 @@ async fn device_linked_to_two_accounts_is_listed_for_both(pool: PgPool) {
     assert_eq!(app.my_device_ids(&bob).await, vec![device.id.clone()]);
 }
 
+/// Deleting an account needs the correct password and removes its user, sessions, contacts and
+/// links while keeping every device and other accounts' data.
 #[sqlx::test(migrations = "./migrations")]
 async fn account_deletion_removes_contacts_and_links_but_never_devices(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -133,6 +141,8 @@ async fn account_deletion_removes_contacts_and_links_but_never_devices(pool: PgP
     assert_eq!(res.status(), 401);
 }
 
+/// Five wrong passwords on account deletion lock it, so the correct password then gets 429 `locked`
+/// and the account remains.
 #[sqlx::test(migrations = "./migrations")]
 async fn delete_account_locks_after_five_wrong_passwords(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -149,6 +159,7 @@ async fn delete_account_locks_after_five_wrong_passwords(pool: PgPool) {
     assert_eq!(app.count("users", "username = 'alice'").await, 1);
 }
 
+/// Account deletion with an invalid token answers 401 and deletes nothing.
 #[sqlx::test(migrations = "./migrations")]
 async fn delete_account_requires_session(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -158,6 +169,8 @@ async fn delete_account_requires_session(pool: PgPool) {
     assert_eq!(app.count("users", "true").await, 1);
 }
 
+/// Removing a device from My devices unlinks it for the caller only, keeps the device and its
+/// connection, and answers 404, 400 or 401 for a repeated, malformed or unauthenticated request.
 #[sqlx::test(migrations = "./migrations")]
 async fn delete_my_device_unlinks_only(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -205,6 +218,8 @@ async fn delete_my_device_unlinks_only(pool: PgPool) {
     assert_eq!(res.status(), 401);
 }
 
+/// A disconnected linked device is listed offline with a last-seen time, and the list needs a
+/// session.
 #[sqlx::test(migrations = "./migrations")]
 async fn my_devices_shows_offline_devices_and_needs_a_session(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -233,6 +248,8 @@ async fn my_devices_shows_offline_devices_and_needs_a_session(pool: PgPool) {
     assert_eq!(res.status(), 401);
 }
 
+/// Listing devices under `/v1/devices` answers 405 and deleting one there answers 404, leaving
+/// links untouched.
 #[sqlx::test(migrations = "./migrations")]
 async fn old_device_list_routes_are_gone(pool: PgPool) {
     let app = common::spawn(pool).await;

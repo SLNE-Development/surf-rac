@@ -703,6 +703,8 @@ async fn check_active(state: &AppState, device: DeviceId) -> Option<Standing> {
 mod tests {
     use super::*;
 
+    /// The token bucket allows a full burst, then refuses until tokens refill at the configured
+    /// rate, never exceeding its capacity.
     #[test]
     fn token_bucket_allows_burst_then_limits() {
         let t0 = Instant::now();
@@ -720,6 +722,7 @@ mod tests {
         assert!(!b.try_take(later));
     }
 
+    /// Keys must decode to 32 bytes and signatures to 64 bytes, and invalid base64 is rejected.
     #[test]
     fn base64_lengths_are_checked() {
         assert!(valid_key(&STANDARD.encode([1u8; 32])));
@@ -734,6 +737,8 @@ mod tests {
 mod revalidation_tests {
     use super::*;
 
+    /// Revalidation keeps the connection through lookup errors until the consecutive count
+    /// reaches the maximum, and an active result resets that count.
     #[test]
     fn revalidation_closes_after_repeated_errors() {
         let mut r = Revalidation::default();
@@ -747,6 +752,7 @@ mod revalidation_tests {
         assert!(!r.keep(None));
     }
 
+    /// Revalidation closes the connection when the device is disabled or missing.
     #[test]
     fn revalidation_closes_when_inactive() {
         let mut r = Revalidation::default();

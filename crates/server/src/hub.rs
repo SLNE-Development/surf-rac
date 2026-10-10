@@ -106,10 +106,12 @@ impl Hub {
 mod tests {
     use super::*;
 
+    /// Returns the device ID for `n`, which must be a valid device number.
     fn id(n: u32) -> DeviceId {
         DeviceId::new(n).unwrap()
     }
 
+    /// Sending to a connection whose outbound queue is full fails instead of blocking.
     #[test]
     fn send_to_full_queue_fails() {
         let hub = Hub::default();
@@ -120,6 +122,8 @@ mod tests {
         assert!(!hub.send(id(100_000_001), ServerMessage::Pong));
     }
 
+    /// Disconnecting a device with a full outbound queue still ends its receiver and marks the
+    /// device offline.
     #[tokio::test]
     async fn disconnect_closes_even_when_queue_full() {
         let hub = Hub::default();

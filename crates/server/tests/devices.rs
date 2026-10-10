@@ -8,6 +8,8 @@ use common::{fingerprint, identity_key, public_key_b64, sign_registration};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
+/// Registering a device without an account returns a nine-digit ID with no leading zero and stores
+/// its key, fingerprint and name.
 #[sqlx::test(migrations = "./migrations")]
 async fn register_returns_9_digit_id_without_account(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -28,6 +30,7 @@ async fn register_returns_9_digit_id_without_account(pool: PgPool) {
     assert_eq!(name, "pc");
 }
 
+/// Two devices with different identity keys receive different IDs.
 #[sqlx::test(migrations = "./migrations")]
 async fn distinct_keys_get_distinct_ids(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -36,6 +39,8 @@ async fn distinct_keys_get_distinct_ids(pool: PgPool) {
     assert_ne!(a.id, b.id);
 }
 
+/// Re-registering with the same key and fingerprint returns the existing ID and updates the stored
+/// name.
 #[sqlx::test(migrations = "./migrations")]
 async fn same_key_and_fingerprint_returns_existing_id_and_updates_name(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -57,6 +62,8 @@ async fn same_key_and_fingerprint_returns_existing_id_and_updates_name(pool: PgP
     assert_eq!(rows, vec![("new name".to_owned(),)]);
 }
 
+/// Registering a known key with a different fingerprint answers 409 `clone_detected` and leaves the
+/// stored device unchanged.
 #[sqlx::test(migrations = "./migrations")]
 async fn same_key_other_fingerprint_is_clone_detected_and_never_rebinds(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -80,6 +87,8 @@ async fn same_key_other_fingerprint_is_clone_detected_and_never_rebinds(pool: Pg
     assert_eq!(rows, vec![(id, fingerprint(1), "pc".to_owned())]);
 }
 
+/// A registration with an unsupported protocol version answers 426 `update_required` and stores
+/// nothing.
 #[sqlx::test(migrations = "./migrations")]
 async fn wrong_protocol_version_is_update_required(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -105,6 +114,8 @@ async fn wrong_protocol_version_is_update_required(pool: PgPool) {
     assert_eq!(count, 0);
 }
 
+/// Malformed fingerprints, names and public keys, including a weak or missing key, answer 400
+/// `bad_request` and store nothing.
 #[sqlx::test(migrations = "./migrations")]
 async fn invalid_registration_input_400(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -135,6 +146,8 @@ async fn invalid_registration_input_400(pool: PgPool) {
     assert_eq!(count, 0);
 }
 
+/// Two simultaneous registrations of one key both succeed with the same ID and create a single
+/// device.
 #[sqlx::test(migrations = "./migrations")]
 async fn concurrent_registration_of_one_key_creates_one_device(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -156,6 +169,7 @@ async fn concurrent_registration_of_one_key_creates_one_device(pool: PgPool) {
     assert_eq!(count, 1);
 }
 
+/// Looking up a registered device returns its identity key, and an unknown device returns none.
 #[sqlx::test(migrations = "./migrations")]
 async fn identity_key_lookup_returns_registered_key(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -182,6 +196,7 @@ async fn device_count(pool: &PgPool) -> i64 {
         .unwrap()
 }
 
+/// A registration without a signature answers 401 `bad_signature` and stores nothing.
 #[sqlx::test(migrations = "./migrations")]
 async fn registration_without_signature_is_unauthorized_and_writes_nothing(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -200,6 +215,8 @@ async fn registration_without_signature_is_unauthorized_and_writes_nothing(pool:
     assert_eq!(device_count(&app.pool).await, 0);
 }
 
+/// Signatures by another key, over another name or fingerprint, or malformed ones answer 401
+/// `bad_signature` and store nothing.
 #[sqlx::test(migrations = "./migrations")]
 async fn registration_with_wrong_signature_is_unauthorized_and_writes_nothing(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -226,6 +243,8 @@ async fn registration_with_wrong_signature_is_unauthorized_and_writes_nothing(po
     assert_eq!(device_count(&app.pool).await, 0);
 }
 
+/// Renaming a device with a forged signature or one over the old name is refused and keeps the old
+/// name, while a valid signature renames it.
 #[sqlx::test(migrations = "./migrations")]
 async fn renaming_needs_a_valid_signature(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -251,6 +270,8 @@ async fn renaming_needs_a_valid_signature(pool: PgPool) {
     assert_eq!(name, "new");
 }
 
+/// Five registrations from one address, re-registrations included, exhaust its limit and the sixth
+/// gets 429 `rate_limited`, while another address can register.
 #[sqlx::test(migrations = "./migrations")]
 async fn registration_is_limited_per_ip_including_re_registration(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -273,6 +294,8 @@ async fn registration_is_limited_per_ip_including_re_registration(pool: PgPool) 
     assert_eq!(other.status(), 200);
 }
 
+/// Addresses within one IPv6 /64 share a registration limit, so the sixth registration from that
+/// prefix gets 429.
 #[sqlx::test(migrations = "./migrations")]
 async fn registration_limit_shares_one_ipv6_64_prefix(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -294,6 +317,8 @@ async fn registration_limit_shares_one_ipv6_64_prefix(pool: PgPool) {
     assert_eq!(res.status(), 429);
 }
 
+/// Rejected registration bodies do not count toward the address limit, so a valid registration
+/// still succeeds afterwards.
 #[sqlx::test(migrations = "./migrations")]
 async fn invalid_registration_bodies_do_not_use_the_limit(pool: PgPool) {
     let app = common::spawn(pool).await;

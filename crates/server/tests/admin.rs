@@ -23,6 +23,7 @@ async fn probe(app: &TestApp, token: &str) -> u16 {
         .as_u16()
 }
 
+/// An admin created through the admin operations can log in and is stored with the admin flag.
 #[sqlx::test(migrations = "./migrations")]
 async fn create_admin_then_login(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -37,6 +38,7 @@ async fn create_admin_then_login(pool: PgPool) {
     assert!(is_admin);
 }
 
+/// Creating an admin rejects an invalid username, a too-short password and a taken username.
 #[sqlx::test(migrations = "./migrations")]
 async fn create_admin_validates_input(pool: PgPool) {
     assert!(admin::create_admin(&pool, "Root", PASSWORD).await.is_err());
@@ -45,6 +47,7 @@ async fn create_admin_validates_input(pool: PgPool) {
     assert!(admin::create_admin(&pool, "root", PASSWORD).await.is_err());
 }
 
+/// The user listing shows the admin flag and the number of linked devices for each account.
 #[sqlx::test(migrations = "./migrations")]
 async fn list_users_shows_flags_and_linked_devices(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -77,6 +80,8 @@ fn cli(args: &[&str]) -> (bool, String, String) {
     )
 }
 
+/// The CLI help lists every admin command and mentions no invites, and the invite subcommands are
+/// rejected as unrecognized.
 #[test]
 fn cli_has_no_invite_commands() {
     let (ok, help, _) = cli(&["--help"]);
@@ -101,6 +106,7 @@ fn cli_has_no_invite_commands() {
     }
 }
 
+/// Disabling a user deletes all of its sessions, invalidates its token and blocks login.
 #[sqlx::test(migrations = "./migrations")]
 async fn disable_user_revokes_sessions_and_blocks_login(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -115,6 +121,7 @@ async fn disable_user_revokes_sessions_and_blocks_login(pool: PgPool) {
     assert_eq!(app.login("alice", PASSWORD, "10.9.1.1").await.status(), 401);
 }
 
+/// Re-enabling a disabled user lets it log in again.
 #[sqlx::test(migrations = "./migrations")]
 async fn enable_user_restores_login(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -126,6 +133,8 @@ async fn enable_user_restores_login(pool: PgPool) {
     assert_eq!(app.login("alice", PASSWORD, "10.9.2.1").await.status(), 200);
 }
 
+/// Resetting a password revokes existing sessions and replaces the old password with the new one,
+/// and a too-short new password is rejected.
 #[sqlx::test(migrations = "./migrations")]
 async fn reset_password_revokes_sessions(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -148,6 +157,7 @@ async fn reset_password_revokes_sessions(pool: PgPool) {
     );
 }
 
+/// Revoking a user's sessions reports the revoked count and invalidates its token.
 #[sqlx::test(migrations = "./migrations")]
 async fn revoke_sessions_logs_out_everywhere(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -157,6 +167,7 @@ async fn revoke_sessions_logs_out_everywhere(pool: PgPool) {
     assert_eq!(probe(&app, &token).await, 401);
 }
 
+/// Disabling, resetting the password of, or revoking the sessions of an unknown user fails.
 #[sqlx::test(migrations = "./migrations")]
 async fn unknown_user_errors(pool: PgPool) {
     assert!(admin::set_disabled(&pool, "ghost", true).await.is_err());

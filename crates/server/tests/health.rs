@@ -4,6 +4,7 @@ mod common;
 
 use sqlx::PgPool;
 
+/// The health endpoint answers 200.
 #[sqlx::test(migrations = "./migrations")]
 async fn healthz_ok(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -11,6 +12,7 @@ async fn healthz_ok(pool: PgPool) {
     assert_eq!(res.status(), 200);
 }
 
+/// The migrations create every expected table, each empty.
 #[sqlx::test(migrations = "./migrations")]
 async fn migrations_create_tables(pool: PgPool) {
     for table in ["users", "sessions", "devices", "device_links", "contacts"] {
@@ -22,6 +24,7 @@ async fn migrations_create_tables(pool: PgPool) {
     }
 }
 
+/// An unknown route answers 404.
 #[sqlx::test(migrations = "./migrations")]
 async fn unknown_route_404(pool: PgPool) {
     let app = common::spawn(pool).await;

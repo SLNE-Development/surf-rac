@@ -31,10 +31,13 @@ mod tests {
     use super::*;
     use axum::http::HeaderValue;
 
+    /// Returns the fixed socket peer address used by these tests.
     fn peer() -> SocketAddr {
         "192.0.2.1:5000".parse().unwrap()
     }
 
+    /// With forwarding trusted, the rightmost address across all `X-Forwarded-For` headers is
+    /// taken as the client IP.
     #[test]
     fn client_ip_uses_rightmost_forwarded_when_trusted() {
         let mut h = HeaderMap::new();
@@ -49,6 +52,7 @@ mod tests {
         assert_eq!(client_ip(&h, peer(), true).to_string(), "4.4.4.4");
     }
 
+    /// An unparsable or absent `X-Forwarded-For` header falls back to the socket peer address.
     #[test]
     fn client_ip_falls_back_to_peer_on_garbage() {
         let mut h = HeaderMap::new();
@@ -60,6 +64,8 @@ mod tests {
         );
     }
 
+    /// With forwarding untrusted, `X-Forwarded-For` is ignored and the socket peer address is
+    /// used.
     #[test]
     fn client_ip_ignores_forwarded_when_untrusted() {
         let mut h = HeaderMap::new();

@@ -57,6 +57,8 @@ pub fn verify_dummy(password: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// A 32-byte random token encodes to 43 URL-safe base64 characters and differs between
+    /// calls.
     #[test]
     fn random_token_length_and_charset() {
         let t = random_token(32);
@@ -68,6 +70,8 @@ mod tests {
         assert_ne!(random_token(32), t);
     }
 
+    /// SHA-256 yields a 32-byte digest that is equal for equal input and differs for different
+    /// input.
     #[test]
     fn sha256_is_stable() {
         assert_eq!(sha256("abc").len(), 32);
@@ -75,6 +79,8 @@ mod tests {
         assert_ne!(sha256("abc"), sha256("abd"));
     }
 
+    /// A hashed password is an Argon2id hash that verifies only the original password, and a
+    /// malformed hash verifies nothing.
     #[test]
     fn password_round_trip() {
         let h = hash_password("correct horse battery").unwrap();

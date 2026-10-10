@@ -65,10 +65,13 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
+    /// Decodes one base64url segment of a JWT into JSON.
     fn decode_part(p: &str) -> Value {
         serde_json::from_slice(&URL_SAFE_NO_PAD.decode(p).unwrap()).unwrap()
     }
 
+    /// A viewer token is an HS256 JWT for the device, valid for 60 seconds, that may join and
+    /// subscribe to the room and publish data but not media.
     #[test]
     fn viewer_token_claims() {
         let id = DeviceId::new(223_456_789).unwrap();
@@ -96,6 +99,8 @@ mod tests {
         assert_eq!(c["video"]["canPublishData"], true);
     }
 
+    /// A host token's HMAC-SHA256 signature verifies with the secret and the token grants media
+    /// publishing.
     #[test]
     fn token_signature_verifies() {
         let secret = "s".repeat(32);
@@ -118,6 +123,7 @@ mod tests {
         );
     }
 
+    /// A host's room is named `host-` followed by its device ID.
     #[test]
     fn room_name() {
         assert_eq!(

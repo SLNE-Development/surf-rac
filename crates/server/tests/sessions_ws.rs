@@ -32,6 +32,8 @@ fn claims(token: &str) -> Value {
     serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap()
 }
 
+/// A session request is relayed to the target with the sender's device ID, identity key and
+/// device name added.
 #[sqlx::test(migrations = "./migrations")]
 async fn session_request_is_relayed_with_sender(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -47,6 +49,8 @@ async fn session_request_is_relayed_with_sender(pool: PgPool) {
     );
 }
 
+/// A relayed session request and response carry the sender's registered identity key, not one
+/// the sender supplied.
 #[sqlx::test(migrations = "./migrations")]
 async fn relayed_identity_key_is_the_registered_key(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -68,6 +72,8 @@ async fn relayed_identity_key_is_the_registered_key(pool: PgPool) {
     );
 }
 
+/// A password challenge is relayed to the target with the sender's device ID and identity key
+/// added.
 #[sqlx::test(migrations = "./migrations")]
 async fn password_challenge_is_relayed_with_sender(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -88,6 +94,8 @@ async fn password_challenge_is_relayed_with_sender(pool: PgPool) {
     );
 }
 
+/// A password challenge with a malformed session key, signature or host nonce is refused with
+/// `bad_message`.
 #[sqlx::test(migrations = "./migrations")]
 async fn password_challenge_rejects_bad_fields(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -111,6 +119,7 @@ async fn password_challenge_rejects_bad_fields(pool: PgPool) {
     }
 }
 
+/// A sealed session password is relayed to the target with the sender's device ID.
 #[sqlx::test(migrations = "./migrations")]
 async fn session_password_is_relayed_with_sender(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -128,6 +137,8 @@ async fn session_password_is_relayed_with_sender(pool: PgPool) {
     );
 }
 
+/// A sealed password one byte over the maximum length is refused with `bad_message` and not
+/// relayed, while one at the maximum is relayed.
 #[sqlx::test(migrations = "./migrations")]
 async fn session_password_rejects_oversized_password(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -153,6 +164,8 @@ async fn session_password_rejects_oversized_password(pool: PgPool) {
     );
 }
 
+/// A session request whose session key is too short, not base64 or empty is refused with
+/// `bad_message`.
 #[sqlx::test(migrations = "./migrations")]
 async fn session_request_rejects_bad_key(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -167,6 +180,7 @@ async fn session_request_rejects_bad_key(pool: PgPool) {
     }
 }
 
+/// A session request whose signature is not 64 bytes is refused with `bad_message`.
 #[sqlx::test(migrations = "./migrations")]
 async fn session_request_rejects_bad_signature_format(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -290,6 +304,8 @@ async fn flood_rate_limit_names_the_dropped_session(pool: PgPool) {
     assert_eq!(err["session_id"], "flood", "{err}");
 }
 
+/// An accepted session response is relayed with the sender's ID and identity key, and a refusal
+/// is relayed with its reason but no keys.
 #[sqlx::test(migrations = "./migrations")]
 async fn session_response_is_relayed(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -317,6 +333,7 @@ async fn session_response_is_relayed(pool: PgPool) {
     );
 }
 
+/// An accepted session response with a malformed session key is refused with `bad_message`.
 #[sqlx::test(migrations = "./migrations")]
 async fn session_response_rejects_bad_host_key(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -331,6 +348,8 @@ async fn session_response_rejects_bad_host_key(pool: PgPool) {
     );
 }
 
+/// A host token request returns the LiveKit URL and a signed token that lets the device publish
+/// in its own room.
 #[sqlx::test(migrations = "./migrations")]
 async fn host_token_is_for_own_room(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -347,6 +366,8 @@ async fn host_token_is_for_own_room(pool: PgPool) {
     assert_eq!(c["video"]["canPublish"], true);
 }
 
+/// A viewer token requested by a host is delivered to the viewer, scoped to the host's room,
+/// without media publishing and valid for 60 seconds.
 #[sqlx::test(migrations = "./migrations")]
 async fn viewer_token_goes_to_viewer(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -369,6 +390,7 @@ async fn viewer_token_goes_to_viewer(pool: PgPool) {
     assert_eq!(c["exp"].as_u64().unwrap() - c["nbf"].as_u64().unwrap(), 60);
 }
 
+/// Requesting a viewer token for the requesting device itself is refused with `forbidden`.
 #[sqlx::test(migrations = "./migrations")]
 async fn viewer_token_for_self_is_forbidden(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -381,6 +403,7 @@ async fn viewer_token_for_self_is_forbidden(pool: PgPool) {
     assert_eq!(recv_type(&mut alice.ws, "error").await["code"], "forbidden");
 }
 
+/// A viewer token is always scoped to the requesting host's own room, never another host's.
 #[sqlx::test(migrations = "./migrations")]
 async fn viewer_token_cannot_target_other_room(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -398,6 +421,7 @@ async fn viewer_token_cannot_target_other_room(pool: PgPool) {
     assert_ne!(c["video"]["room"], format!("host-{}", alice.id).as_str());
 }
 
+/// A viewer token request for an offline viewer is answered with `target_offline`.
 #[sqlx::test(migrations = "./migrations")]
 async fn viewer_token_to_offline_viewer(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -413,6 +437,7 @@ async fn viewer_token_to_offline_viewer(pool: PgPool) {
     );
 }
 
+/// An accepted session response with a malformed host nonce is refused with `bad_message`.
 #[sqlx::test(migrations = "./migrations")]
 async fn session_response_rejects_bad_nonce(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -462,6 +487,8 @@ async fn session_requests_are_limited_per_target(pool: PgPool) {
     assert_eq!(got["session_id"], "to-bob", "another target is not limited");
 }
 
+/// A session password sent after the per-target session request limit is reached is still
+/// relayed.
 #[sqlx::test(migrations = "./migrations")]
 async fn password_messages_do_not_count_against_the_target_limit(pool: PgPool) {
     let app = common::spawn(pool).await;

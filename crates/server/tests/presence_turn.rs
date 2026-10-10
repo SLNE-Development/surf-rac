@@ -12,6 +12,8 @@ use serde_json::json;
 use sha1::Sha1;
 use sqlx::PgPool;
 
+/// A TURN request over the WebSocket returns one-hour credentials whose username names the device
+/// and expiry and whose password is the HMAC-SHA1 of the username.
 #[sqlx::test(migrations = "./migrations")]
 async fn ws_turn_request_returns_credentials(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -32,6 +34,8 @@ async fn ws_turn_request_returns_credentials(pool: PgPool) {
     assert_eq!(creds["password"], expected);
 }
 
+/// A device of an account that has a contact receives presence when that contact connects and
+/// disconnects.
 #[sqlx::test(migrations = "./migrations")]
 async fn contact_sees_presence_online_and_offline(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -56,6 +60,7 @@ async fn contact_sees_presence_online_and_offline(pool: PgPool) {
     );
 }
 
+/// Presence of a contact reaches every online device of the watching account.
 #[sqlx::test(migrations = "./migrations")]
 async fn presence_reaches_every_online_device_of_a_watcher(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -71,6 +76,8 @@ async fn presence_reaches_every_online_device_of_a_watcher(pool: PgPool) {
     assert_eq!(recv_type(&mut second.ws, "presence").await, expected);
 }
 
+/// A device linked to an account is watched by that account's other devices without being a
+/// contact.
 #[sqlx::test(migrations = "./migrations")]
 async fn linked_device_is_watched_by_its_account(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -91,6 +98,7 @@ async fn linked_device_is_watched_by_its_account(pool: PgPool) {
     );
 }
 
+/// After a device is unlinked, its disconnect sends no presence to the account's other devices.
 #[sqlx::test(migrations = "./migrations")]
 async fn presence_stops_after_unlink(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -109,6 +117,8 @@ async fn presence_stops_after_unlink(pool: PgPool) {
     expect_silence(&mut watcher.ws, Duration::from_millis(400)).await;
 }
 
+/// Devices that are neither contacts nor linked to the same account receive no presence about each
+/// other.
 #[sqlx::test(migrations = "./migrations")]
 async fn stranger_gets_no_presence(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -119,6 +129,7 @@ async fn stranger_gets_no_presence(pool: PgPool) {
     expect_silence(&mut bob.ws, Duration::from_millis(100)).await;
 }
 
+/// A reconnecting device receives no presence about itself.
 #[sqlx::test(migrations = "./migrations")]
 async fn device_gets_no_presence_about_itself(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -130,6 +141,7 @@ async fn device_gets_no_presence_about_itself(pool: PgPool) {
     expect_silence(&mut again.ws, Duration::from_millis(300)).await;
 }
 
+/// A connection replaced by a new one for the same device sends no offline presence to watchers.
 #[sqlx::test(migrations = "./migrations")]
 async fn replacement_does_not_broadcast_offline(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -144,6 +156,8 @@ async fn replacement_does_not_broadcast_offline(pool: PgPool) {
     expect_silence(&mut watcher.ws, Duration::from_millis(400)).await;
 }
 
+/// A device linked to two accounts that both have a contact receives that contact's presence only
+/// once.
 #[sqlx::test(migrations = "./migrations")]
 async fn device_of_two_watching_accounts_gets_presence_once(pool: PgPool) {
     let app = common::spawn(pool).await;

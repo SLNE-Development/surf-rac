@@ -309,6 +309,8 @@ pub async fn touch_last_seen(db: &PgPool, device: DeviceId) -> Result<(), sqlx::
 mod tests {
     use super::*;
 
+    /// The all-zero and identity points are rejected as public keys while a real Ed25519 key is
+    /// accepted.
     #[test]
     fn small_order_keys_are_invalid() {
         assert!(!valid_public_key(&[0u8; 32]));
@@ -319,6 +321,7 @@ mod tests {
         assert!(valid_public_key(key.verifying_key().as_bytes()));
     }
 
+    /// A fingerprint is valid only as exactly 64 lowercase hex characters.
     #[test]
     fn fingerprint_must_be_lowercase_hex() {
         assert!(valid_fingerprint(&"a".repeat(64)));

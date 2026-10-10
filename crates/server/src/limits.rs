@@ -287,6 +287,8 @@ impl Limits {
 mod tests {
     use super::*;
 
+    /// The rate limiter refuses a key after its maximum within the window, counts keys
+    /// separately and allows the key again once the window has passed.
     #[test]
     fn rate_limiter_blocks_after_max_and_resets_after_window() {
         let rl = RateLimiter::new(3, Duration::from_secs(60));
@@ -299,6 +301,8 @@ mod tests {
         assert!(rl.check("a", t0 + Duration::from_secs(60)));
     }
 
+    /// Five failures lock a key for the lockout duration, a success clears earlier failures,
+    /// and the lock expires after the duration.
     #[test]
     fn lockout_after_five_failures_and_success_resets() {
         let lo = Lockout::new(5, Duration::from_secs(900));
@@ -321,6 +325,8 @@ mod tests {
         assert!(lo.is_locked("u", t0 + Duration::from_secs(901)).is_none());
     }
 
+    /// When the rate limiter tracks the maximum number of keys, a new key is still admitted
+    /// without growing the table, and expired keys are dropped.
     #[test]
     fn rate_limiter_evicts_when_full() {
         let rl = RateLimiter::new(3, Duration::from_secs(60));
@@ -334,6 +340,8 @@ mod tests {
         assert!(rl.tracked_keys() <= 2);
     }
 
+    /// When the lockout tracks the maximum number of keys, a new key is still admitted without
+    /// growing the table.
     #[test]
     fn lockout_evicts_when_full() {
         let lo = Lockout::new(5, Duration::from_secs(900));
@@ -345,6 +353,8 @@ mod tests {
         assert_eq!(lo.tracked_keys(), MAX_KEYS);
     }
 
+    /// A flood of attempts against unknown names does not evict the failure count of a real
+    /// account, which is still refused after its fifth attempt.
     #[test]
     fn unknown_name_flood_keeps_account_failures() {
         let config = Config::from_vars(|k| {
@@ -372,6 +382,8 @@ mod tests {
         assert!(limits.account_lockout.try_attempt("victim", t0).is_err());
     }
 
+    /// IPv6 addresses share a rate key per /64 prefix, while IPv4 and IPv4-mapped addresses use
+    /// the plain IPv4 address.
     #[test]
     fn rate_key_groups_ipv6_by_64() {
         let a: IpAddr = "2001:db8:1:2:aaaa::1".parse().unwrap();
@@ -385,6 +397,8 @@ mod tests {
         assert_eq!(rate_key(mapped), "10.0.0.1");
     }
 
+    /// Each attempt counts as a failure before its outcome is known, so the sixth attempt is
+    /// refused until a success resets the count.
     #[test]
     fn try_attempt_counts_up_front() {
         let lo = Lockout::new(5, Duration::from_secs(900));
@@ -397,6 +411,8 @@ mod tests {
         assert!(lo.try_attempt("u", t0).is_ok());
     }
 
+    /// A flood of other keys that triggers pruning keeps a key's recent failures, so its fifth
+    /// failure still locks it.
     #[test]
     fn lockout_survives_pruning_flood() {
         let lo = Lockout::new(5, Duration::from_secs(900));
@@ -411,6 +427,7 @@ mod tests {
         assert!(lo.is_locked("victim", t0).is_some());
     }
 
+    /// Once failures are older than the lockout duration, pruning removes their entries.
     #[test]
     fn lockout_prunes_stale_entries() {
         let lo = Lockout::new(5, Duration::from_secs(900));

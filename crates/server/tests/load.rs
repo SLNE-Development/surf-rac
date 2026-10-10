@@ -128,6 +128,8 @@ fn common_b64(len: usize) -> String {
     base64::engine::general_purpose::STANDARD.encode(vec![7u8; len])
 }
 
+/// A thousand registrations spread over 200 IPv6 /64 prefixes all succeed within the p95 latency
+/// budget.
 #[ignore = "load test"]
 #[sqlx::test(migrations = "./migrations")]
 async fn register_1000_devices_from_200_distinct_64s(pool: PgPool) {
@@ -147,6 +149,8 @@ async fn register_1000_devices_from_200_distinct_64s(pool: PgPool) {
     );
 }
 
+/// A thousand registrations from one IPv6 /64 accept exactly the hourly limit, refuse the rest, and
+/// stay within the p95 latency budget.
 #[ignore = "load test"]
 #[sqlx::test(migrations = "./migrations")]
 async fn register_1000_devices_from_one_64(pool: PgPool) {
@@ -170,6 +174,8 @@ async fn register_1000_devices_from_one_64(pool: PgPool) {
     );
 }
 
+/// A flood of a thousand session requests from fifty senders relays at most the per-minute limit to
+/// the target and refuses the rest.
 #[ignore = "load test"]
 #[sqlx::test(migrations = "./migrations")]
 async fn session_request_flood_relays_at_most_the_per_minute_limit(pool: PgPool) {

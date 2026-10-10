@@ -28,6 +28,8 @@ pub fn credentials(
 mod tests {
     use super::*;
 
+    /// TURN credentials for a known secret, device, TTL and time match the expected username
+    /// and HMAC password.
     #[test]
     fn turn_credentials_known_vector() {
         let id = DeviceId::new(123_456_789).unwrap();

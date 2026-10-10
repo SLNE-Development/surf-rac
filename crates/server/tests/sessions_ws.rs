@@ -178,24 +178,116 @@ async fn session_request_rejects_bad_signature_format(pool: PgPool) {
     assert_eq!(recv_type(&mut bob.ws, "error").await["code"], "bad_message");
 }
 
+/// Checks that a session request with an invalid session ID is refused with an
+/// error that names no session.
 #[sqlx::test(migrations = "./migrations")]
 async fn session_request_rejects_bad_session_id(pool: PgPool) {
     let app = common::spawn(pool).await;
     let alice = app.online_device(1).await;
     let mut bob = app.online_device(2).await;
     send(&mut bob.ws, session_request(&alice.id, "")).await;
-    assert_eq!(recv_type(&mut bob.ws, "error").await["code"], "bad_message");
+    let err = recv_type(&mut bob.ws, "error").await;
+    assert_eq!(err["code"], "bad_message");
+    assert!(err.get("session_id").is_none(), "{err}");
 }
 
+/// Checks that a session request to an offline host is answered with a
+/// `target_offline` error naming the request's session.
 #[sqlx::test(migrations = "./migrations")]
 async fn session_request_to_offline_host(pool: PgPool) {
     let app = common::spawn(pool).await;
     let mut bob = app.online_device(2).await;
     send(&mut bob.ws, session_request("123456789", "s1")).await;
-    assert_eq!(
-        recv_type(&mut bob.ws, "error").await["code"],
-        "target_offline"
-    );
+    let err = recv_type(&mut bob.ws, "error").await;
+    assert_eq!(err["code"], "target_offline");
+    assert_eq!(err["session_id"], "s1");
+}
+
+/// Checks that every relayed session message to an offline device, and a
+/// malformed one, is answered with an error naming the message's session.
+#[sqlx::test(migrations = "./migrations")]
+async fn session_message_errors_name_their_session(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let mut alice = app.online_device(1).await;
+    let offline = "123456789";
+    let mut bad_key = session_request(offline, "bad-key");
+    bad_key["session_key"] = json!("AAAA");
+    let cases = [
+        (
+            json!({"type":"password_challenge","to":offline,"session_id":"pc",
+                   "session_key":key_b64(),"signature":signature_b64(),"host_nonce":key_b64()}),
+            "target_offline",
+            "pc",
+        ),
+        (
+            json!({"type":"session_password","to":offline,"session_id":"pw","password":"c2VhbGVk"}),
+            "target_offline",
+            "pw",
+        ),
+        (accepted_response(offline, "resp"), "target_offline", "resp"),
+        (
+            json!({"type":"viewer_token_request","session_id":"vt","viewer_device_id":offline}),
+            "target_offline",
+            "vt",
+        ),
+        (
+            json!({"type":"signal","to":offline,"session_id":"sig","kind":"offer","data":{}}),
+            "target_offline",
+            "sig",
+        ),
+        (bad_key, "bad_message", "bad-key"),
+    ];
+    for (msg, code, session_id) in cases {
+        send(&mut alice.ws, msg).await;
+        let err = recv_type(&mut alice.ws, "error").await;
+        assert_eq!(err["code"], code, "{err}");
+        assert_eq!(err["session_id"], session_id, "{err}");
+    }
+}
+
+/// Checks that an error answering a message outside any session names no session.
+#[sqlx::test(migrations = "./migrations")]
+async fn errors_outside_a_session_name_none(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let mut alice = app.online_device(1).await;
+    send(
+        &mut alice.ws,
+        json!({"type":"link_account","token":"garbage"}),
+    )
+    .await;
+    let err = recv_type(&mut alice.ws, "error").await;
+    assert_eq!(err["code"], "forbidden");
+    assert!(err.get("session_id").is_none(), "{err}");
+    common::ws::send_raw(&mut alice.ws, "not json").await;
+    let err = recv_type(&mut alice.ws, "error").await;
+    assert_eq!(err["code"], "bad_message");
+    assert!(err.get("session_id").is_none(), "{err}");
+}
+
+/// Checks that a message dropped by the connection's message rate limit is
+/// answered with a `rate_limited` error naming the message's session.
+#[sqlx::test(migrations = "./migrations")]
+async fn flood_rate_limit_names_the_dropped_session(pool: PgPool) {
+    let app = common::spawn(pool).await;
+    let mut alice = app.online_device(1).await;
+    for _ in 0..300 {
+        send(
+            &mut alice.ws,
+            json!({"type":"signal","to":"123456789","session_id":"flood","kind":"ice","data":{}}),
+        )
+        .await;
+    }
+    let err = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let err = recv_type(&mut alice.ws, "error").await;
+            if err["code"] == "rate_limited" {
+                return err;
+            }
+        }
+    })
+    .await
+    .expect("no rate_limited error");
+    assert_eq!(err["session_id"], "flood", "{err}");
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -347,6 +439,9 @@ fn accepted_response(to: &str, session_id: &str) -> Value {
            "session_key":key_b64(),"signature":signature_b64(),"host_nonce":key_b64()})
 }
 
+/// Checks that the eleventh session request to one host within a minute is
+/// refused with a `rate_limited` error naming its session, while requests to
+/// another host still pass.
 #[sqlx::test(migrations = "./migrations")]
 async fn session_requests_are_limited_per_target(pool: PgPool) {
     let app = common::spawn(pool).await;
@@ -358,10 +453,9 @@ async fn session_requests_are_limited_per_target(pool: PgPool) {
         assert_eq!(got["session_id"], format!("s{i}").as_str());
     }
     send(&mut bob.ws, session_request(&alice.id, "s10")).await;
-    assert_eq!(
-        recv_type(&mut bob.ws, "error").await["code"],
-        "rate_limited"
-    );
+    let err = recv_type(&mut bob.ws, "error").await;
+    assert_eq!(err["code"], "rate_limited");
+    assert_eq!(err["session_id"], "s10");
     common::ws::expect_silence(&mut alice.ws, std::time::Duration::from_millis(300)).await;
     send(&mut alice.ws, session_request(&bob.id, "to-bob")).await;
     let got = recv_type(&mut bob.ws, "session_request").await;

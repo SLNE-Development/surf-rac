@@ -555,6 +555,10 @@ pub enum ServerMessage {
         code: WsErrorCode,
         /// Human-readable description.
         message: String,
+        /// Session identifier of the client message this error answers, when
+        /// that message named a valid one; absent for errors outside a session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
     },
     /// This connection was superseded and is about to be closed.
     Replaced,
@@ -659,11 +663,41 @@ mod tests {
         assert_eq!(ping, ClientMessage::Ping);
     }
 
+    /// Checks that an error naming a session round-trips with its `session_id`
+    /// and that an error without one omits the field and reads back as `None`.
+    #[test]
+    fn server_error_session_id_round_trips() {
+        let tagged = json!({"type":"error","code":"rate_limited","message":"slow down",
+                            "session_id":"s1"});
+        let msg: ServerMessage = serde_json::from_value(tagged.clone()).unwrap();
+        assert_eq!(
+            msg,
+            ServerMessage::Error {
+                code: WsErrorCode::RateLimited,
+                message: "slow down".into(),
+                session_id: Some("s1".into()),
+            }
+        );
+        assert_eq!(serde_json::to_value(&msg).unwrap(), tagged);
+
+        let untagged = json!({"type":"error","code":"forbidden","message":"no"});
+        let msg: ServerMessage = serde_json::from_value(untagged.clone()).unwrap();
+        assert!(matches!(
+            msg,
+            ServerMessage::Error {
+                session_id: None,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(&msg).unwrap(), untagged);
+    }
+
     #[test]
     fn server_error_serializes_snake_case() {
         let msg = ServerMessage::Error {
             code: WsErrorCode::TargetOffline,
             message: "offline".into(),
+            session_id: None,
         };
         assert_eq!(
             serde_json::to_value(&msg).unwrap(),
@@ -757,14 +791,22 @@ mod tests {
         }))
         .unwrap();
         assert!(missing.signature.is_empty());
-        assert_eq!(serde_json::to_value(ErrorCode::BadSignature).unwrap(), json!("bad_signature"));
+        assert_eq!(
+            serde_json::to_value(ErrorCode::BadSignature).unwrap(),
+            json!("bad_signature")
+        );
     }
 
     #[test]
     fn challenge_round_trip() {
         let raw = json!({"type":"challenge","nonce":"AAAA"});
         let msg: ServerMessage = serde_json::from_value(raw.clone()).unwrap();
-        assert_eq!(msg, ServerMessage::Challenge { nonce: "AAAA".into() });
+        assert_eq!(
+            msg,
+            ServerMessage::Challenge {
+                nonce: "AAAA".into()
+            }
+        );
         assert_eq!(serde_json::to_value(&msg).unwrap(), raw);
     }
 
@@ -787,15 +829,29 @@ mod tests {
         let raw = json!({"type":"session_request","to":"123456789","session_id":"s1",
                          "session_key":"a2V5","signature":"c2ln","unattended":true});
         let msg: ClientMessage = serde_json::from_value(raw.clone()).unwrap();
-        assert!(matches!(msg, ClientMessage::SessionRequest { unattended: true, .. }));
+        assert!(matches!(
+            msg,
+            ClientMessage::SessionRequest {
+                unattended: true,
+                ..
+            }
+        ));
         assert_eq!(serde_json::to_value(&msg).unwrap(), raw);
-        assert!(serde_json::to_value(&msg).unwrap().get("password").is_none());
+        assert!(
+            serde_json::to_value(&msg)
+                .unwrap()
+                .get("password")
+                .is_none()
+        );
 
         let relayed = json!({"type":"session_request","from":"123456789","session_id":"s1",
                              "session_key":"a2V5","signature":"c2ln","identity_key":"aWQ=",
                              "name":"pc","unattended":false});
         let msg: ServerMessage = serde_json::from_value(relayed.clone()).unwrap();
-        let ServerMessage::SessionRequest { identity_key, name, .. } = &msg else {
+        let ServerMessage::SessionRequest {
+            identity_key, name, ..
+        } = &msg
+        else {
             panic!("not a session request");
         };
         assert_eq!(identity_key, "aWQ=");
@@ -889,7 +945,9 @@ mod tests {
         .unwrap();
         assert_eq!(req.signature, "c2ln");
         assert_eq!(req.protocol_version, PROTOCOL_VERSION);
-        let resp = RegisterDeviceResponse { device_id: DeviceId::new(123_456_789).unwrap() };
+        let resp = RegisterDeviceResponse {
+            device_id: DeviceId::new(123_456_789).unwrap(),
+        };
         assert_eq!(
             serde_json::to_value(&resp).unwrap(),
             json!({"device_id":"123456789"})
@@ -907,13 +965,37 @@ mod tests {
             last_seen_at: None,
         };
         assert_eq!(serde_json::to_value(&info).unwrap()["name"], "pc");
-        assert_eq!(serde_json::to_value(ErrorCode::UpdateRequired).unwrap(), json!("update_required"));
-        assert_eq!(serde_json::to_value(ErrorCode::CloneDetected).unwrap(), json!("clone_detected"));
-        assert_eq!(serde_json::to_value(WsErrorCode::UpdateRequired).unwrap(), json!("update_required"));
-        assert_eq!(serde_json::to_value(WsErrorCode::CloneDetected).unwrap(), json!("clone_detected"));
-        assert_eq!(serde_json::to_value(WsErrorCode::BadSignature).unwrap(), json!("bad_signature"));
-        assert_eq!(serde_json::to_value(ErrorCode::UnknownDevice).unwrap(), json!("unknown_device"));
-        assert_eq!(serde_json::to_value(ErrorCode::DeviceDisabled).unwrap(), json!("device_disabled"));
-        assert_eq!(serde_json::to_value(WsErrorCode::DeviceDisabled).unwrap(), json!("device_disabled"));
+        assert_eq!(
+            serde_json::to_value(ErrorCode::UpdateRequired).unwrap(),
+            json!("update_required")
+        );
+        assert_eq!(
+            serde_json::to_value(ErrorCode::CloneDetected).unwrap(),
+            json!("clone_detected")
+        );
+        assert_eq!(
+            serde_json::to_value(WsErrorCode::UpdateRequired).unwrap(),
+            json!("update_required")
+        );
+        assert_eq!(
+            serde_json::to_value(WsErrorCode::CloneDetected).unwrap(),
+            json!("clone_detected")
+        );
+        assert_eq!(
+            serde_json::to_value(WsErrorCode::BadSignature).unwrap(),
+            json!("bad_signature")
+        );
+        assert_eq!(
+            serde_json::to_value(ErrorCode::UnknownDevice).unwrap(),
+            json!("unknown_device")
+        );
+        assert_eq!(
+            serde_json::to_value(ErrorCode::DeviceDisabled).unwrap(),
+            json!("device_disabled")
+        );
+        assert_eq!(
+            serde_json::to_value(WsErrorCode::DeviceDisabled).unwrap(),
+            json!("device_disabled")
+        );
     }
 }

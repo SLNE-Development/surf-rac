@@ -59,7 +59,8 @@ Device registration and session requests use the limits configured above:
 - Session requests are limited per target device to
   `SESSION_REQUESTS_PER_MINUTE` per minute. Password challenges and session
   passwords do not count. A request over the limit is not relayed and the
-  sender receives a WebSocket error `rate_limited`.
+  sender receives a WebSocket error `rate_limited` with the request's
+  `session_id`.
 
 All limits are kept in memory and reset when the server restarts.
 
@@ -184,3 +185,8 @@ All endpoints are under `/v1`. The wire types are defined in the
   `session_response`) and LiveKit tokens: `host_token_request` returns a token
   for the device's own room `host-<device_id>`; `viewer_token_request` sends a
   60-second subscribe-only token for that room to the named viewer.
+  An `error` that answers a message carrying a valid `session_id` (`signal`,
+  a session negotiation message or `viewer_token_request`) repeats that
+  `session_id`, so a client can tell which of its sessions failed: for
+  example `target_offline` when the target device is not connected, or
+  `rate_limited`. Every other `error` carries no `session_id`.

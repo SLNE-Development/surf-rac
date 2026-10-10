@@ -178,9 +178,10 @@ impl ViewerSession {
     /// differs from the pin with [`RequestError::KeyChanged`]. After a
     /// challenge, an accepted response must carry the challenge's per-session
     /// key, signature and host nonce, or the request fails with
-    /// [`RequestError::ChallengeMismatch`]. When the server refuses to relay
-    /// the request because of its rate limits before the host answered, the
-    /// request fails at once with [`RequestError::RateLimited`].
+    /// [`RequestError::ChallengeMismatch`]. When the server answers a message
+    /// of this request with an error naming the request's session, the
+    /// request fails at once as [`request_failure`] maps it; errors naming
+    /// another session or none leave the request pending.
     pub async fn request_with(
         signaling: SignalingClient,
         identity: Arc<IdentityKey>,
@@ -213,17 +214,10 @@ impl ViewerSession {
             loop {
                 match sig_events.recv().await {
                     None => return Err(RequestError::Signaling(SignalingError::Closed)),
-                    Some(ServerMessage::Error {
-                        code: WsErrorCode::TargetOffline,
-                        ..
-                    }) if key.is_none() => {
-                        return Err(RequestError::Offline);
-                    }
-                    Some(ServerMessage::Error {
-                        code: WsErrorCode::RateLimited,
-                        ..
-                    }) if key.is_none() && challenge.is_none() => {
-                        return Err(RequestError::RateLimited);
+                    Some(msg @ ServerMessage::Error { .. }) => {
+                        if let Some(err) = request_failure(&msg, &session_id) {
+                            return Err(err);
+                        }
                     }
                     Some(ServerMessage::PasswordChallenge {
                         from,
@@ -632,6 +626,31 @@ impl AcceptedKeys<'_> {
     }
 }
 
+/// Returns the error that fails the request for `session_id` when `msg` is a
+/// server error naming that session.
+///
+/// `target_offline` is [`RequestError::Offline`] and `rate_limited` is
+/// [`RequestError::RateLimited`]. Any other message, an error with another
+/// code, and an error naming another session or none yield `None`.
+fn request_failure(msg: &ServerMessage, session_id: &str) -> Option<RequestError> {
+    let ServerMessage::Error {
+        code,
+        session_id: Some(sid),
+        ..
+    } = msg
+    else {
+        return None;
+    };
+    if sid != session_id {
+        return None;
+    }
+    match code {
+        WsErrorCode::TargetOffline => Some(RequestError::Offline),
+        WsErrorCode::RateLimited => Some(RequestError::RateLimited),
+        _ => None,
+    }
+}
+
 /// Returns a new random 128-bit session ID as 32 hex characters.
 fn new_session_id() -> String {
     let mut bytes = [0u8; 16];
@@ -699,6 +718,37 @@ mod tests {
 
         lock(&known).trust_key(host, IdentityKey::generate().public());
         assert!(matches!(keys(&host_sig), Err(RequestError::KeyChanged(_))));
+    }
+
+    /// Returns a server error with `code` that names `session_id`, or no session for `None`.
+    fn ws_error(code: WsErrorCode, session_id: Option<&str>) -> ServerMessage {
+        ServerMessage::Error {
+            code,
+            message: "m".into(),
+            session_id: session_id.map(str::to_owned),
+        }
+    }
+
+    /// Checks that with two requests in flight, an error naming one request's
+    /// session fails only that request and an error naming none fails neither.
+    #[test]
+    fn errors_fail_only_the_request_they_name() {
+        let (a, b) = ("aaaa", "bbbb");
+        let offline_a = ws_error(WsErrorCode::TargetOffline, Some(a));
+        assert_eq!(request_failure(&offline_a, a), Some(RequestError::Offline));
+        assert_eq!(request_failure(&offline_a, b), None);
+        let limited_b = ws_error(WsErrorCode::RateLimited, Some(b));
+        assert_eq!(request_failure(&limited_b, a), None);
+        assert_eq!(
+            request_failure(&limited_b, b),
+            Some(RequestError::RateLimited)
+        );
+        for code in [WsErrorCode::TargetOffline, WsErrorCode::RateLimited] {
+            let untagged = ws_error(code, None);
+            assert_eq!(request_failure(&untagged, a), None, "{code:?}");
+            assert_eq!(request_failure(&untagged, b), None, "{code:?}");
+        }
+        assert_eq!(request_failure(&ServerMessage::Pong, a), None);
     }
 
     /// Joins a fresh room and starts the viewer loop on simulated room events.

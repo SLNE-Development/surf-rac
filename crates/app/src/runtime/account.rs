@@ -126,6 +126,7 @@ mod tests {
         ServerMessage::Error {
             code: WsErrorCode::Forbidden,
             message: "database error".into(),
+            session_id: None,
         }
     }
 

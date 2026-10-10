@@ -288,7 +288,7 @@ async fn handshake(
                     .map_err(|e| SignalingError::Connect(e.to_string()))?;
             }
             Ok(ServerMessage::Hello { device_id: id }) if id == device_id => return Ok(()),
-            Ok(ServerMessage::Error { code, message }) => {
+            Ok(ServerMessage::Error { code, message, .. }) => {
                 return Err(SignalingError::from_ws_code(code).unwrap_or_else(|| {
                     SignalingError::Connect(format!(
                         "server refused the connection ({code:?}): {message}"

@@ -1,8 +1,8 @@
 //! Raw video frames and their conversion to and from LiveKit frames.
 
 use livekit::webrtc::prelude::{
-    BoxVideoBuffer, BoxVideoFrame, I420Buffer, NV12Buffer, VideoBuffer, VideoFrame, VideoResolution,
-    VideoRotation,
+    BoxVideoBuffer, BoxVideoFrame, I420Buffer, NV12Buffer, VideoBuffer, VideoFrame,
+    VideoResolution, VideoRotation,
 };
 use livekit::webrtc::video_frame::{EncodedFrameType, EncodedVideoCodec, EncodedVideoFrame};
 

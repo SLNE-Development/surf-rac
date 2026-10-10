@@ -17,6 +17,7 @@ use base64::engine::general_purpose::STANDARD;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use rand::RngCore;
+use serde::Deserialize;
 use surf_rac_protocol::{
     ClientMessage, DeviceId, MAX_SEALED_PASSWORD_LEN, ServerMessage, WsErrorCode,
 };
@@ -80,12 +81,58 @@ impl TokenBucket {
     }
 }
 
-/// Builds an error message for the client.
+/// Builds an error message for the client that names no session.
 fn error(code: WsErrorCode, message: &str) -> ServerMessage {
     ServerMessage::Error {
         code,
         message: message.to_owned(),
+        session_id: None,
     }
+}
+
+/// Names `session_id` on `reply` when it is an error that names no session yet.
+///
+/// Every other reply, and every reply when `session_id` is `None`, is returned unchanged.
+fn tag_session(reply: ServerMessage, session_id: Option<String>) -> ServerMessage {
+    match reply {
+        ServerMessage::Error {
+            code,
+            message,
+            session_id: None,
+        } => ServerMessage::Error {
+            code,
+            message,
+            session_id,
+        },
+        other => other,
+    }
+}
+
+/// The session identifier of a client message, read without parsing the rest.
+#[derive(Deserialize)]
+struct SessionTag {
+    /// The message's `session_id` field, when it has one that is a string.
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+/// Returns the valid session identifier `msg` carries, if any.
+fn message_session_id(msg: &ClientMessage) -> Option<&str> {
+    let session_id = match msg {
+        ClientMessage::Signal { session_id, .. }
+        | ClientMessage::SessionRequest { session_id, .. }
+        | ClientMessage::PasswordChallenge { session_id, .. }
+        | ClientMessage::SessionPassword { session_id, .. }
+        | ClientMessage::SessionResponse { session_id, .. }
+        | ClientMessage::ViewerTokenRequest { session_id, .. } => session_id,
+        ClientMessage::Authenticate { .. }
+        | ClientMessage::LinkAccount { .. }
+        | ClientMessage::UnlinkAccount { .. }
+        | ClientMessage::HostTokenRequest
+        | ClientMessage::TurnRequest
+        | ClientMessage::Ping => return None,
+    };
+    valid_session_id(session_id).then_some(session_id.as_str())
 }
 
 /// Serializes `msg` into a text frame.
@@ -288,6 +335,10 @@ async fn next_text(stream: &mut SplitStream<WebSocket>) -> Option<String> {
 }
 
 /// Handles one text frame from `sender` and returns the reply to send, if any.
+///
+/// An error reply names the session of the message it answers when that
+/// message carries a valid session identifier, including a message dropped
+/// by the connection's rate limit.
 async fn handle_text(
     state: &AppState,
     sender: &Sender,
@@ -295,12 +346,26 @@ async fn handle_text(
     text: &str,
 ) -> Option<ServerMessage> {
     if !bucket.try_take(Instant::now()) {
-        return Some(error(WsErrorCode::RateLimited, "too many messages"));
+        let session_id = serde_json::from_str::<SessionTag>(text)
+            .ok()
+            .and_then(|tag| tag.session_id)
+            .filter(|id| valid_session_id(id));
+        return Some(tag_session(
+            error(WsErrorCode::RateLimited, "too many messages"),
+            session_id,
+        ));
     }
     let msg: ClientMessage = match serde_json::from_str(text) {
         Ok(m) => m,
         Err(_) => return Some(error(WsErrorCode::BadMessage, "malformed message")),
     };
+    let session_id = message_session_id(&msg).map(str::to_owned);
+    let reply = dispatch(state, sender, msg).await?;
+    Some(tag_session(reply, session_id))
+}
+
+/// Handles the parsed message `msg` from `sender` and returns the reply to send, if any.
+async fn dispatch(state: &AppState, sender: &Sender, msg: ClientMessage) -> Option<ServerMessage> {
     let device = sender.device;
     match msg {
         ClientMessage::Signal {

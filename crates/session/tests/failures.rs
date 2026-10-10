@@ -24,6 +24,32 @@ async fn offline_host(pool: PgPool) {
     assert_eq!(result.err(), Some(RequestError::Offline));
 }
 
+/// Checks that a request to an offline host fails on its own while another
+/// request of the same viewer stays pending and is then accepted.
+#[sqlx::test(migrations = "../server/migrations")]
+async fn offline_error_fails_only_its_own_request(pool: PgPool) {
+    let env = TestEnv::start(pool).await;
+    let offline_id = env.register("offline", 3).await.id;
+    let (h, v) = (env.device("host", 1).await, env.device("viewer", 2).await);
+    let (host, mut host_events) = start_host(&h, SessionConfig::default()).await;
+    let pending = request(&v, h.id, SessionConfig::default());
+    let HostEvent::ViewerRequested { session_id, .. } =
+        host_event(&mut host_events, Duration::from_secs(10), |e| {
+            matches!(e, HostEvent::ViewerRequested { .. })
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    let offline = request(&v, offline_id, SessionConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(offline.err(), Some(RequestError::Offline));
+    assert!(!pending.is_finished(), "the other request was failed too");
+    host.accept(&session_id).await.unwrap();
+    assert!(pending.await.unwrap().is_ok());
+}
+
 #[sqlx::test(migrations = "../server/migrations")]
 async fn denied(pool: PgPool) {
     let env = TestEnv::start(pool).await;

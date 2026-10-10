@@ -9,4 +9,4 @@ pub mod inject;
 pub mod ui;
 
 pub use arbiter::{Action, Arbiter, Grants, InputStatus, ViewerStatus};
-pub use host::{InputError, InputHost, route};
+pub use host::{Ghost, InputError, InputHost, route};

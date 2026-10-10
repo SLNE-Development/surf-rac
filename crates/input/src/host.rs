@@ -35,12 +35,27 @@ pub enum InputError {
     Platform(String),
 }
 
+/// A ghost pointer as the host shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ghost {
+    /// The viewer's color slot.
+    pub slot: u8,
+    /// Horizontal desktop position of the pointer's tip.
+    pub x: i32,
+    /// Vertical desktop position of the pointer's tip.
+    pub y: i32,
+    /// The viewer's name, shown next to the pointer.
+    pub label: String,
+    /// Whether the viewer just clicked, which shows a short pulse at the tip.
+    pub pulse: bool,
+}
+
 /// What the host machine provides: injection, ghost drawing and host input signals.
 pub trait Platform: Send + 'static {
     /// Injects an input action; failures are logged by the platform.
     fn perform(&mut self, action: &Action);
-    /// Replaces the ghost pointers shown: color slot and desktop position each.
-    fn ghosts(&mut self, ghosts: Vec<(u8, i32, i32)>);
+    /// Replaces the ghost pointers shown.
+    fn ghosts(&mut self, ghosts: Vec<Ghost>);
     /// Returns when the last physical host input happened.
     fn host_input(&self) -> Option<Instant>;
     /// Returns the sequence number and position of the last physical host mouse event.
@@ -131,6 +146,8 @@ enum Command {
     Left(DeviceId),
     /// The host changed a viewer's grants.
     Grants(DeviceId, Grants),
+    /// The host named a viewer for its ghost pointer.
+    Label(DeviceId, String),
     /// The host turned follow mode on or off.
     Follow(bool),
     /// End arbitration and release everything held.
@@ -239,6 +256,13 @@ impl InputHost {
         let _ = self.control.send(Command::Grants(viewer, grants));
     }
 
+    /// Sets the name shown next to `viewer`'s ghost pointer until it leaves.
+    ///
+    /// A viewer without a name is shown by its device ID.
+    pub fn set_label(&self, viewer: DeviceId, label: String) {
+        let _ = self.control.send(Command::Label(viewer, label));
+    }
+
     /// Turns follow mode on or off for every viewer.
     pub fn set_follow(&self, on: bool) {
         let _ = self.control.send(Command::Follow(on));
@@ -308,7 +332,9 @@ struct Runner<P: Platform, S: Share> {
     /// Monitor geometry, refreshed every tick.
     geometry: Vec<MonitorRect>,
     /// Shown ghosts by viewer.
-    ghosts: BTreeMap<DeviceId, (u8, i32, i32)>,
+    ghosts: BTreeMap<DeviceId, Ghost>,
+    /// The name of each viewer that was given one.
+    labels: BTreeMap<DeviceId, String>,
     /// Input states to send.
     outbox: Arc<Outbox>,
     /// Publishes the status.
@@ -371,12 +397,17 @@ impl<P: Platform, S: Share> Runner<P, S> {
         let mut ghosts_changed = false;
         for action in actions {
             match action {
-                Action::Ghost { viewer, slot, at, .. } => {
+                Action::Ghost { viewer, slot, at, click } => {
                     ghosts_changed = true;
                     match at {
-                        Some((x, y)) => self.ghosts.insert(viewer, (slot, x, y)),
-                        None => self.ghosts.remove(&viewer),
-                    };
+                        Some((x, y)) => {
+                            let label = self.labels.get(&viewer).cloned().unwrap_or_else(|| viewer.to_string());
+                            self.ghosts.insert(viewer, Ghost { slot, x, y, label, pulse: click });
+                        }
+                        None => {
+                            self.ghosts.remove(&viewer);
+                        }
+                    }
                 }
                 Action::Send(viewer, state) => self.outbox.push(viewer, state),
                 Action::SelectMonitor(index) => self.share.select_monitor(index),
@@ -384,7 +415,7 @@ impl<P: Platform, S: Share> Runner<P, S> {
             }
         }
         if ghosts_changed {
-            self.platform.ghosts(self.ghosts.values().copied().collect());
+            self.show_ghosts();
         }
         let mut status = self.arbiter.status(now);
         status.degraded = self.degraded.clone();
@@ -397,12 +428,36 @@ impl<P: Platform, S: Share> Runner<P, S> {
         });
     }
 
+    /// Hands the shown ghosts to the platform; each click pulse is handed over once.
+    fn show_ghosts(&mut self) {
+        self.platform.ghosts(self.ghosts.values().cloned().collect());
+        for ghost in self.ghosts.values_mut() {
+            ghost.pulse = false;
+        }
+    }
+
+    /// Names `viewer`, renaming its ghost when one is shown.
+    fn label(&mut self, viewer: DeviceId, label: String) {
+        if let Some(ghost) = self.ghosts.get_mut(&viewer) {
+            ghost.label.clone_from(&label);
+            self.show_ghosts();
+        }
+        self.labels.insert(viewer, label);
+    }
+
     /// Applies a lifecycle or control command; returns false for [`Command::Stop`].
     fn command(&mut self, cmd: Command, now: Instant) -> bool {
         self.poll(now);
         let out = match cmd {
             Command::Joined(viewer) => self.arbiter.viewer_joined(viewer, now),
-            Command::Left(viewer) => self.arbiter.viewer_left(viewer, now),
+            Command::Left(viewer) => {
+                self.labels.remove(&viewer);
+                self.arbiter.viewer_left(viewer, now)
+            }
+            Command::Label(viewer, label) => {
+                self.label(viewer, label);
+                Vec::new()
+            }
             Command::Grants(viewer, grants) => self.arbiter.set_grants(viewer, grants, now),
             Command::Follow(on) => self.arbiter.set_follow(on, now),
             Command::Stop => return false,
@@ -486,6 +541,7 @@ async fn run<P: Platform, S: Share>(
         arbiter: Arbiter::new(),
         geometry,
         ghosts: BTreeMap::new(),
+        labels: BTreeMap::new(),
         outbox,
         status,
         host_input: None,
@@ -555,7 +611,7 @@ impl Platform for WindowsPlatform {
     }
 
     /// Forwards to [`crate::ui::UiThread::set_ghosts`].
-    fn ghosts(&mut self, ghosts: Vec<(u8, i32, i32)>) {
+    fn ghosts(&mut self, ghosts: Vec<Ghost>) {
         self.ui.set_ghosts(ghosts);
     }
 
@@ -594,7 +650,7 @@ mod tests {
         /// Injected actions.
         performed: Vec<Action>,
         /// The last ghost list shown.
-        ghosts: Vec<(u8, i32, i32)>,
+        ghosts: Vec<Ghost>,
         /// Reported host input.
         host_input: Option<Instant>,
         /// Reported host mouse event.
@@ -613,7 +669,7 @@ mod tests {
             self.0.lock().unwrap().performed.push(action.clone());
         }
         /// Records the ghosts.
-        fn ghosts(&mut self, ghosts: Vec<(u8, i32, i32)>) {
+        fn ghosts(&mut self, ghosts: Vec<Ghost>) {
             self.0.lock().unwrap().ghosts = ghosts;
         }
         /// Returns the configured host input.
@@ -826,7 +882,8 @@ mod tests {
         h.input.send((v(1), DataMessage::PointerMove { x: 10, y: 20, monitor: 1 })).await.unwrap();
         h.input.send((v(1), DataMessage::Key { code: 0x2A, down: true })).await.unwrap();
         settle().await;
-        assert_eq!(h.fake.0.lock().unwrap().ghosts, [(0, 1930, 20)]);
+        let shown = Ghost { slot: 0, x: 1930, y: 20, label: v(1).to_string(), pulse: false };
+        assert_eq!(h.fake.0.lock().unwrap().ghosts, [shown]);
         drain(&mut h);
         h.control.send(Command::Stop).unwrap();
         (&mut h.task).await.unwrap();
@@ -837,6 +894,27 @@ mod tests {
         }
         assert!(drain(&mut h).iter().all(|(_, s)| s.locked), "viewers not told input is locked");
         assert!(h.outbox.next().await.is_none(), "outbox not closed");
+    }
+
+    /// Checks that ghosts carry the viewer's label, that a click pulses once,
+    /// and that a label set while the ghost shows renames it.
+    #[tokio::test(start_paused = true)]
+    async fn ghosts_carry_labels_and_pulse_once() {
+        let h = harness();
+        h.control.send(Command::Joined(v(1))).unwrap();
+        h.control.send(Command::Label(v(1), "Ada".into())).unwrap();
+        h.control.send(Command::Grants(v(1), Grants { pointer: false, keyboard: true, pointing: true })).unwrap();
+        settle().await;
+        h.input.send((v(1), DataMessage::PointerMove { x: 3, y: 4, monitor: 0 })).await.unwrap();
+        settle().await;
+        let ghost = |label: &str, pulse| Ghost { slot: 0, x: 3, y: 4, label: label.into(), pulse };
+        assert_eq!(h.fake.0.lock().unwrap().ghosts, [ghost("Ada", false)]);
+        h.input.send((v(1), DataMessage::PointerButton { button: MouseButton::Left, down: true })).await.unwrap();
+        settle().await;
+        assert_eq!(h.fake.0.lock().unwrap().ghosts, [ghost("Ada", true)]);
+        h.control.send(Command::Label(v(1), "Grace".into())).unwrap();
+        settle().await;
+        assert_eq!(h.fake.0.lock().unwrap().ghosts, [ghost("Grace", false)]);
     }
 
     #[tokio::test(start_paused = true)]

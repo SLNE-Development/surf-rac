@@ -8,9 +8,14 @@ use std::time::{Duration, Instant};
 
 use surf_rac_capture::FrameSource;
 use surf_rac_capture::desktop::DesktopSource;
-use surf_rac_input::Action;
+use surf_rac_input::{Action, Ghost};
 use surf_rac_input::inject::perform;
 use surf_rac_input::ui::{PALETTE, UiThread};
+
+/// Returns an unlabelled ghost of `slot` with its tip at `(x, y)`.
+fn ghost(slot: u8, x: i32, y: i32) -> Ghost {
+    Ghost { slot, x, y, label: String::new(), pulse: false }
+}
 
 /// Waits up to 2 s for `cond` to hold.
 fn wait_for(cond: impl Fn() -> bool) -> bool {
@@ -49,7 +54,7 @@ fn injected_key_is_not_host_input() {
 fn overlay_shows_and_hides() {
     let ui = UiThread::start(Instant::now()).expect("UI thread");
     assert!(!ui.overlay_visible());
-    ui.set_ghosts(vec![(0, 300, 300)]);
+    ui.set_ghosts(vec![ghost(0, 300, 300)]);
     assert!(wait_for(|| ui.overlay_visible()));
     ui.set_ghosts(Vec::new());
     assert!(wait_for(|| !ui.overlay_visible()));
@@ -64,7 +69,7 @@ fn ghost_visible_in_capture() {
     let index = monitors.iter().position(|m| m.primary).unwrap_or(0);
     let m = &monitors[index];
     let (cx, cy) = (m.left + m.width as i32 / 2, m.top + m.height as i32 / 2);
-    ui.set_ghosts(vec![(0, cx, cy)]);
+    ui.set_ghosts(vec![ghost(0, cx, cy)]);
     assert!(wait_for(|| ui.overlay_visible()));
     std::thread::sleep(Duration::from_millis(300));
     source.select(index).expect("select");
@@ -76,8 +81,8 @@ fn ghost_visible_in_capture() {
         assert!(Instant::now() < deadline, "no frame");
         std::thread::sleep(Duration::from_millis(33));
     };
-    // The ring's right edge, on its centre line, relative to the monitor.
-    let (px, py) = ((cx - m.left + 12) as usize, (cy - m.top) as usize);
+    // A point inside the arrow's fill, relative to the monitor.
+    let (px, py) = ((cx - m.left + 3) as usize, (cy - m.top + 9) as usize);
     let at = py * frame.stride as usize + px * 4;
     let (b, g, r) = (frame.data[at], frame.data[at + 1], frame.data[at + 2]);
     let (er, eg, eb) = PALETTE[0];

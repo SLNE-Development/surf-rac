@@ -25,8 +25,14 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+      # The test image and a workspace target directory with libwebrtc exceed the runner's free disk.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af
+          df -h /
       - name: Run the workspace tests against Postgres and LiveKit
-        run: docker compose -f compose.test.yaml run --rm test
+        run: docker compose -f compose.test.yaml run --rm -e CARGO_PROFILE_DEV_DEBUG=0 test
       - name: Stop the harness
         if: always()
         run: docker compose -f compose.test.yaml down -v

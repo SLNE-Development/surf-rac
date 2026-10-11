@@ -10,6 +10,10 @@ use surf_rac_app::runtime::Runtime;
 use surf_rac_app::single_instance;
 use surf_rac_app::store::{Store, default_dir};
 use surf_rac_app::ui::ClientApp;
+use surf_rac_app::update;
+
+/// How long a freshly installed process waits for the process it replaces to exit.
+const AFTER_UPDATE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Makes the process per-monitor DPI aware before any window exists, so
 /// window, capture and input coordinates are all physical pixels.
@@ -35,6 +39,10 @@ fn main() -> eframe::Result {
     let _log = surf_rac_app::logging::init();
     set_dpi_awareness();
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "surf-rac starting");
+    if let Some(pid) = update::parse_after_update(std::env::args()) {
+        tracing::info!(pid, "waiting for the replaced process to exit");
+        update::wait_for_exit(pid, AFTER_UPDATE_WAIT);
+    }
     let state_dir = default_dir();
     let _instance = match single_instance::acquire(&state_dir) {
         single_instance::Acquired::First(guard) => guard,
@@ -43,6 +51,10 @@ fn main() -> eframe::Result {
             return Ok(());
         }
     };
+    match std::env::current_exe() {
+        Ok(exe) => update::cleanup_leftovers(&exe),
+        Err(e) => tracing::warn!(error = %e, "executable path unknown; update leftovers kept"),
+    }
     let store = Store::open(state_dir);
     let installation: Arc<dyn InstallationStore> = Arc::new(PortableStore::new(store.clone()));
     let options = eframe::NativeOptions {

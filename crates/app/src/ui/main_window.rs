@@ -8,6 +8,7 @@ use super::widgets::{self, Kind, Tone};
 use super::{ClientApp, Tab, connect, devices, icons, login, settings, theme};
 pub(super) use crate::access::format_id;
 use crate::runtime::{Command, Connection};
+use crate::update::{UpdateState, status_text};
 
 /// Draws the main window and its open dialogs.
 pub(super) fn show(app: &mut ClientApp, ui: &mut egui::Ui) {
@@ -34,8 +35,7 @@ pub(super) fn connection_status(connection: &Connection) -> (&'static str, Tone)
 pub(super) fn connection_banner(connection: &Connection) -> Option<(&'static str, Tone)> {
     match connection {
         Connection::UpdateRequired => Some((
-            "Update required: this version of surf-rac is too old for the server. \
-             Install the latest version to connect.",
+            "Update required: this version of surf-rac is too old for the server.",
             Tone::Danger,
         )),
         Connection::Disabled => Some((
@@ -76,7 +76,10 @@ fn main_layout(app: &mut ClientApp, ui: &mut egui::Ui) {
                 .inner_margin(Margin::symmetric(20, 10)),
         )
         .show(ui, |ui| app_bar(app, ui));
-    if connection_banner(&app.snap.connection).is_some() || app.snap.banner.is_some() {
+    if connection_banner(&app.snap.connection).is_some()
+        || app.snap.banner.is_some()
+        || matches!(app.update, UpdateState::Ready(_))
+    {
         egui::Panel::top("banners")
             .frame(Frame::NONE)
             .show_separator_line(false)
@@ -177,8 +180,25 @@ fn account_menu(app: &mut ClientApp, ui: &mut egui::Ui, account: &str) {
 /// disabled, signed in elsewhere) and the runtime's banner message.
 fn banners(app: &mut ClientApp, ui: &mut egui::Ui) {
     let connection = app.snap.connection.clone();
+    if let UpdateState::Ready(version) = &app.update {
+        let text =
+            format!("surf-rac {version} is ready to install. Restarting ends active sessions.");
+        widgets::banner(ui, Tone::Accent, icons::REFRESH, &text, |ui| {
+            if ui
+                .add(widgets::btn(ui, Kind::Primary, None, "Restart to update"))
+                .clicked()
+            {
+                app.restart_to_update(ui.ctx());
+            }
+        });
+    }
     if let Some((text, tone)) = connection_banner(&connection) {
-        widgets::banner(ui, tone, icons::TRIANGLE_ALERT, text, |ui| {
+        let text = if connection == Connection::UpdateRequired {
+            format!("{text} {}.", status_text(&app.update))
+        } else {
+            text.to_string()
+        };
+        widgets::banner(ui, tone, icons::TRIANGLE_ALERT, &text, |ui| {
             if connection == Connection::Replaced
                 && ui
                     .add(widgets::btn(ui, Kind::Secondary, None, "Reconnect"))

@@ -1,5 +1,5 @@
 //! The Settings tab: the account, incoming connections, the unattended
-//! password, saved passwords, the Defender exclusion and the server.
+//! password, saved passwords, updates, the Defender exclusion and the server.
 
 use eframe::egui::{self, Align, Frame, Layout, Margin, RichText, Ui};
 
@@ -9,6 +9,7 @@ use super::{ClientApp, icons};
 use crate::access::MIN_PASSWORD_LEN;
 use crate::runtime::Command;
 use crate::store::Settings;
+use crate::update::{UpdateState, status_text};
 
 /// Width of the settings column, in points.
 const COLUMN_WIDTH: f32 = 680.0;
@@ -33,13 +34,8 @@ pub(super) fn show(app: &mut ClientApp, ui: &mut Ui) {
             incoming_card(app, ui);
             password_card(app, ui);
             saved_passwords_card(app, ui);
+            updates_card(app, ui);
             advanced_card(app, ui);
-            ui.vertical_centered(|ui| {
-                ui.label(
-                    widgets::muted(ui, format!("surf-rac {}", env!("CARGO_PKG_VERSION")))
-                        .size(12.0),
-                );
-            });
         });
     });
 }
@@ -361,6 +357,46 @@ fn saved_passwords_card(app: &mut ClientApp, ui: &mut Ui) {
                     }
                 });
             }
+        },
+    );
+}
+
+/// Draws the Updates card: the running version with the updater's status,
+/// and Restart to update once an update is ready, otherwise Check for updates.
+fn updates_card(app: &mut ClientApp, ui: &mut Ui) {
+    let state = app.update.clone();
+    let title = format!("surf-rac {}", env!("CARGO_PKG_VERSION"));
+    section(
+        ui,
+        "Updates",
+        |_| {},
+        |ui| {
+            setting_row(ui, true, &title, &status_text(&state), |ui| {
+                if matches!(state, UpdateState::Ready(_)) {
+                    if ui
+                        .add(widgets::btn(ui, Kind::Primary, None, "Restart to update"))
+                        .clicked()
+                    {
+                        app.restart_to_update(ui.ctx());
+                    }
+                } else {
+                    let busy = matches!(state, UpdateState::Checking | UpdateState::Downloading(_));
+                    if ui
+                        .add_enabled(
+                            !busy,
+                            widgets::btn(
+                                ui,
+                                Kind::Secondary,
+                                Some(icons::REFRESH),
+                                "Check for updates",
+                            ),
+                        )
+                        .clicked()
+                    {
+                        app.updater.check_now();
+                    }
+                }
+            });
         },
     );
 }

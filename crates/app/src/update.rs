@@ -369,6 +369,187 @@ async fn download_inner(
     receiver.finish(&manifest.sha256)
 }
 
+/// Where the updater stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateState {
+    /// No check has run yet.
+    Idle,
+    /// Asking GitHub for the latest release.
+    Checking,
+    /// This build is the latest release.
+    UpToDate,
+    /// Downloading a newer release.
+    Downloading(Version),
+    /// A newer release is downloaded, verified and waits for a restart.
+    Ready(Version),
+    /// The last check, download or installation failed; the text says why.
+    Failed(String),
+}
+
+/// Returns the line the Settings card shows for `state`.
+pub fn status_text(state: &UpdateState) -> String {
+    match state {
+        UpdateState::Idle => "Not checked yet".into(),
+        UpdateState::Checking => "Checking for updates\u{2026}".into(),
+        UpdateState::UpToDate => "surf-rac is up to date".into(),
+        UpdateState::Downloading(v) => format!("Downloading version {v}\u{2026}"),
+        UpdateState::Ready(v) => format!("Version {v} is ready to install"),
+        UpdateState::Failed(why) => format!("Update failed: {why}"),
+    }
+}
+
+/// Shared parts of the updater.
+struct Shared {
+    /// The current state.
+    state: std::sync::Mutex<UpdateState>,
+    /// Wakes the check loop for an immediate check.
+    wake: tokio::sync::Notify,
+    /// Asks the UI to redraw.
+    repaint: crate::runtime::Repaint,
+}
+
+impl Shared {
+    /// Returns a copy of the current state.
+    fn get(&self) -> UpdateState {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Replaces the state and asks for a redraw.
+    fn set(&self, state: UpdateState) {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = state;
+        (self.repaint)();
+    }
+}
+
+/// Checks for, downloads and installs updates in the background.
+#[derive(Clone)]
+pub struct Updater {
+    /// State shared with the check loop.
+    shared: std::sync::Arc<Shared>,
+}
+
+impl Updater {
+    /// Starts the check loop on `handle`: the first check runs after
+    /// [`CHECK_DELAY`], then every [`CHECK_INTERVAL`] or when
+    /// [`Updater::check_now`] is called. `repaint` runs after every change.
+    pub fn start(handle: &tokio::runtime::Handle, repaint: crate::runtime::Repaint) -> Updater {
+        let shared = std::sync::Arc::new(Shared {
+            state: std::sync::Mutex::new(UpdateState::Idle),
+            wake: tokio::sync::Notify::new(),
+            repaint,
+        });
+        handle.spawn(check_loop(std::sync::Arc::clone(&shared)));
+        Updater { shared }
+    }
+
+    /// Returns the current state.
+    pub fn state(&self) -> UpdateState {
+        self.shared.get()
+    }
+
+    /// Asks for a check right away; ignored while a check or download runs.
+    pub fn check_now(&self) {
+        self.shared.wake.notify_one();
+    }
+
+    /// Installs the downloaded update and starts it.
+    ///
+    /// On success the caller must close the app so the new process can take
+    /// over; the new process waits for this one to exit.
+    ///
+    /// # Errors
+    ///
+    /// Fails when no update is ready, the executable cannot be replaced or
+    /// the new process cannot be started. A failed swap leaves the running
+    /// executable in place; the state becomes [`UpdateState::Failed`].
+    pub fn apply(&self) -> Result<(), String> {
+        let UpdateState::Ready(version) = self.state() else {
+            return Err("no update is ready".into());
+        };
+        let result = install();
+        match &result {
+            Ok(()) => tracing::info!(%version, "update installed; restarting"),
+            Err(e) => {
+                tracing::warn!(%version, error = %e, "update not installed");
+                self.shared.set(UpdateState::Failed(e.clone()));
+            }
+        }
+        result
+    }
+}
+
+/// Swaps the staged executable into place and starts it with
+/// `--after-update <this pid>`, putting the old executable back if the new
+/// one cannot be started.
+fn install() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("executable path unknown: {e}"))?;
+    swap(&exe).map_err(|e| format!("cannot replace {}: {e}", exe.display()))?;
+    let spawned = std::process::Command::new(&exe)
+        .arg(AFTER_UPDATE_FLAG)
+        .arg(std::process::id().to_string())
+        .spawn();
+    if let Err(e) = spawned {
+        let _ = std::fs::rename(&exe, staged_path(&exe));
+        let _ = std::fs::rename(old_path(&exe), &exe);
+        return Err(format!("cannot start the new version: {e}"));
+    }
+    Ok(())
+}
+
+/// Runs checks forever: after the start delay, then on every interval or wake-up.
+async fn check_loop(shared: std::sync::Arc<Shared>) {
+    let feed = feed_client();
+    let downloads = download_client();
+    tokio::select! {
+        () = tokio::time::sleep(CHECK_DELAY) => {}
+        () = shared.wake.notified() => {}
+    }
+    loop {
+        if !matches!(shared.get(), UpdateState::Ready(_)) {
+            check_once(&shared, &feed, &downloads).await;
+        }
+        tokio::select! {
+            () = tokio::time::sleep(CHECK_INTERVAL) => {}
+            () = shared.wake.notified() => {}
+        }
+    }
+}
+
+/// Runs one check and, when a newer release exists, downloads it to `<exe>.new`.
+async fn check_once(shared: &Shared, feed: &reqwest::Client, downloads: &reqwest::Client) {
+    shared.set(UpdateState::Checking);
+    let (manifest, version, url) = match fetch_update(feed).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return shared.set(UpdateState::UpToDate),
+        Err(e) => {
+            tracing::info!(error = %e, "update check failed");
+            return shared.set(UpdateState::Failed(e));
+        }
+    };
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => return shared.set(UpdateState::Failed(format!("executable path unknown: {e}"))),
+    };
+    tracing::info!(%version, "downloading update");
+    shared.set(UpdateState::Downloading(version));
+    match download(downloads, &url, &staged_path(&exe), &manifest).await {
+        Ok(()) => {
+            tracing::info!(%version, "update downloaded and verified");
+            shared.set(UpdateState::Ready(version));
+        }
+        Err(e) => {
+            tracing::warn!(%version, error = %e, "update download failed");
+            shared.set(UpdateState::Failed(e));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use ed25519_dalek::{Signer, SigningKey};
@@ -543,6 +724,22 @@ mod tests {
             parse_after_update(args(&["surf-rac.exe", "--after-update", "0"])),
             None
         );
+    }
+
+    /// Every state has a status line naming its version or reason where it has one.
+    #[test]
+    fn every_state_has_a_status_line() {
+        let v: Version = "1.4.0".parse().unwrap();
+        assert!(status_text(&UpdateState::Ready(v)).contains("1.4.0"));
+        assert!(status_text(&UpdateState::Downloading(v)).contains("1.4.0"));
+        assert!(status_text(&UpdateState::Failed("offline".into())).contains("offline"));
+        for s in [
+            UpdateState::Idle,
+            UpdateState::Checking,
+            UpdateState::UpToDate,
+        ] {
+            assert!(!status_text(&s).is_empty());
+        }
     }
 
     /// A download is accepted only with the announced size and hash.

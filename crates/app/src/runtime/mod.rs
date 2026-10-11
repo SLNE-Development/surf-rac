@@ -442,6 +442,11 @@ impl Runtime {
         Commands(self.commands.clone())
     }
 
+    /// Returns a handle to the tokio runtime for background tasks that stop with it.
+    pub fn handle(&self) -> tokio::runtime::Handle {
+        self.rt.handle().clone()
+    }
+
     /// Returns the latest snapshot.
     pub fn snapshot(&self) -> Snapshot {
         lock(&self.snapshot).clone()

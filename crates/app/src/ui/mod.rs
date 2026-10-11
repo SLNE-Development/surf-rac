@@ -17,6 +17,7 @@ use eframe::egui;
 
 use crate::runtime::{Command, Commands, Runtime, Snapshot};
 use crate::store::Settings;
+use crate::update::{UpdateState, Updater};
 use crate::viewmap;
 
 /// Which tab of the main window is open.
@@ -121,6 +122,12 @@ pub struct ClientApp {
     prompt_shown: HashMap<String, std::time::Instant>,
     /// The keyboard hook, when it could be installed.
     _hook: Option<crate::keyhook::KeyHook>,
+    /// Checks for and installs client updates.
+    updater: Updater,
+    /// The updater's state drawn this frame.
+    update: UpdateState,
+    /// Whether a check was already triggered by the server refusing this version.
+    update_required_checked: bool,
 }
 
 impl ClientApp {
@@ -135,7 +142,15 @@ impl ClientApp {
                 None
             }
         };
+        let repaint_ctx = ctx.clone();
+        let updater = Updater::start(
+            &runtime.handle(),
+            std::sync::Arc::new(move || repaint_ctx.request_repaint()),
+        );
         ClientApp {
+            updater,
+            update: UpdateState::Idle,
+            update_required_checked: false,
             commands: runtime.commands(),
             snap: runtime.snapshot(),
             runtime: Some(runtime),
@@ -151,6 +166,27 @@ impl ClientApp {
     /// Sends a command to the runtime.
     fn send(&self, command: Command) {
         self.commands.send(command);
+    }
+
+    /// Reads the updater's state and asks for one immediate check the first
+    /// time the server refuses this version.
+    fn poll_updater(&mut self) {
+        if self.snap.connection == crate::runtime::Connection::UpdateRequired
+            && !self.update_required_checked
+        {
+            self.update_required_checked = true;
+            self.updater.check_now();
+        }
+        self.update = self.updater.state();
+    }
+
+    /// Installs the downloaded update and closes the app so the new version
+    /// takes over; on failure the updater's state carries the reason.
+    fn restart_to_update(&mut self, ctx: &egui::Context) {
+        if self.updater.apply().is_ok() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        self.update = self.updater.state();
     }
 
     /// Opens the sign-in dialog with no message from an earlier attempt.
@@ -201,6 +237,7 @@ impl eframe::App for ClientApp {
         if let Some(runtime) = &self.runtime {
             self.snap = runtime.snapshot();
         }
+        self.poll_updater();
         let ctx = ui.ctx().clone();
         main_window::show(self, ui);
         self.show_prompts(&ctx);

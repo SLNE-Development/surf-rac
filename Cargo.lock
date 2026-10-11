@@ -4787,6 +4787,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "surf-rac-release"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "clap",
+ "ed25519-dalek",
+ "hex",
+ "rand 0.8.8",
+ "serde_json",
+ "sha2",
+ "surf-rac-protocol",
+]
+
+[[package]]
 name = "surf-rac-server"
 version = "0.1.0"
 dependencies = [

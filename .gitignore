@@ -1,3 +1,4 @@
 .superpowers/
 .claude/settings.local.json
 /target
+.env

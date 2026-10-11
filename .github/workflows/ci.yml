@@ -37,10 +37,12 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      # Tag builds are signed with the release key, so they start from a clean target directory.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: github.ref_type != 'tag'
       - name: Read the client version
         id: version
         shell: pwsh

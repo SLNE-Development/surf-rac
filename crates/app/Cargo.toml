@@ -19,6 +19,7 @@ argon2.workspace = true
 base64.workspace = true
 chrono.workspace = true
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+hex.workspace = true
 tracing-appender = "0.2"
 tracing-subscriber.workspace = true
 png = "0.17"

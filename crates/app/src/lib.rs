@@ -15,5 +15,6 @@ pub mod runtime;
 pub mod single_instance;
 pub mod store;
 pub mod ui;
+pub mod update;
 pub mod viewmap;
 pub mod yuv;

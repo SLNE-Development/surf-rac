@@ -235,10 +235,10 @@ impl MfEncoder {
         let kind = unsafe { event.GetType()? } as i32;
         if kind == METransformNeedInput.0 {
             self.need_input += 1;
-        } else if kind == METransformHaveOutput.0 {
-            if let Some(au) = self.take_output()? {
-                out.push(au);
-            }
+        } else if kind == METransformHaveOutput.0
+            && let Some(au) = self.take_output()?
+        {
+            out.push(au);
         }
         Ok(true)
     }

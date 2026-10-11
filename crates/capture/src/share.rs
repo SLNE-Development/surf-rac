@@ -702,10 +702,10 @@ impl<K: VideoSink + Clone> ShareLoop<K> {
         if let Some(err) = self.worker.as_ref().and_then(HwWorker::failure) {
             self.fall_back(err, (w, h));
         }
-        if self.worker.is_none() {
-            if let Some(factory) = self.hardware.take() {
-                self.worker = Some(HwWorker::start(factory, self.sink.clone()));
-            }
+        if self.worker.is_none()
+            && let Some(factory) = self.hardware.take()
+        {
+            self.worker = Some(HwWorker::start(factory, self.sink.clone()));
         }
         if let Some(worker) = &self.worker {
             if let Some(rate) = self.sink.take_rate_request() {
@@ -749,10 +749,10 @@ impl<K: VideoSink + Clone> ShareLoop<K> {
     fn fall_back(&mut self, err: EncodeError, (w, h): (u32, u32)) {
         self.worker = None;
         self.hardware = None;
-        if self.sink.video_input() != VideoInput::Raw {
-            if let Err(e) = self.sink.switch_input(VideoInput::Raw, w, h) {
-                tracing::warn!(error = %e, "switching the track to raw frames failed");
-            }
+        if self.sink.video_input() != VideoInput::Raw
+            && let Err(e) = self.sink.switch_input(VideoInput::Raw, w, h)
+        {
+            tracing::warn!(error = %e, "switching the track to raw frames failed");
         }
         if err == EncodeError::NoHardware {
             tracing::info!("encoder: software (no hardware H.264 encoder)");

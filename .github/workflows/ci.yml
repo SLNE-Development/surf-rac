@@ -1,0 +1,113 @@
+# Tests every push and pull request, builds and signs the Windows client, and
+# publishes a GitHub Release with the client and its update.json for v* tags.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test suite (Docker harness)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the workspace tests against Postgres and LiveKit
+        run: docker compose -f compose.test.yaml run --rm test
+      - name: Stop the harness
+        if: always()
+        run: docker compose -f compose.test.yaml down -v
+
+  windows:
+    name: Windows build
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Read the client version
+        id: version
+        shell: pwsh
+        run: |
+          $meta = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($meta.packages | Where-Object name -eq 'surf-rac-app').version
+          "version=$version" >> $env:GITHUB_OUTPUT
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
+            Write-Error "tag $env:GITHUB_REF_NAME does not match crate version $version"
+            exit 1
+          }
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Unit tests of the release tooling
+        run: cargo test -p surf-rac-protocol -p surf-rac-release
+      - name: Build the client and release tool
+        run: cargo build --release -p surf-rac-app -p surf-rac-release
+      - name: Sign with the release key
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          SURF_RAC_RELEASE_KEY: ${{ secrets.SURF_RAC_RELEASE_KEY }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if (-not $env:SURF_RAC_RELEASE_KEY) { Write-Error "SURF_RAC_RELEASE_KEY is not set"; exit 1 }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $exe = "dist/surf-rac-$env:VERSION-windows-x86_64.exe"
+          Copy-Item target/release/surf-rac.exe $exe
+          target/release/surf-rac-release.exe sign --key-env SURF_RAC_RELEASE_KEY --version $env:VERSION --file $exe --out dist/update.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Sign with a throwaway key
+        if: github.ref_type != 'tag'
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $env:EPHEMERAL_KEY = (target/release/surf-rac-release.exe keygen 2>$null)
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $exe = "dist/surf-rac-$env:VERSION-windows-x86_64.exe"
+          Copy-Item target/release/surf-rac.exe $exe
+          target/release/surf-rac-release.exe sign --key-env EPHEMERAL_KEY --version $env:VERSION --file $exe --out dist/update.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: surf-rac-windows
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish release
+    if: github.ref_type == 'tag'
+    needs: [test, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: surf-rac-windows
+          path: dist
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "surf-rac ${GITHUB_REF_NAME#v}" \
+            --generate-notes \
+            --verify-tag

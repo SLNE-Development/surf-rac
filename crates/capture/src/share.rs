@@ -1168,7 +1168,8 @@ mod tests {
         let (mut lp, _, rec, _, t0) = setup();
         let log = FakeLog::default();
         lp.hardware = Some(fake_factory(u32::MAX, log.clone()));
-        *log.delay.lock().unwrap() = Duration::from_millis(200);
+        // Long enough that the two ticks below never outlast it; resetting the delay ends it early.
+        *log.delay.lock().unwrap() = Duration::from_secs(10);
         lp.tick(t0);
         wait_for(|| log.forced.lock().unwrap().len() == 1);
         lp.tick(t0);

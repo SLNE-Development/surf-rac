@@ -4,6 +4,7 @@
 //! `type` field. Device IDs travel as 9-character decimal strings.
 
 pub mod data;
+pub mod update;
 
 use std::fmt;
 use std::str::FromStr;
